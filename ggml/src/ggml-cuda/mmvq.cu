@@ -473,6 +473,10 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
                 return 1;
         }
     }
+    if (table_id == MMVQ_PARAMETERS_RDNA4) {
+        // EXP2: 2 rows/block for decode (ncols_dst==1) -> more independent weight loads in flight (MLP).
+        return ncols_dst == 1 ? 2 : 1;
+    }
     return 1;
 }
 
