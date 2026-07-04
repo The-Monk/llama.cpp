@@ -848,6 +848,22 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
 
 #define VDR_F8E4M3_Q8_1_MMVQ 2
 
+// T73 (small-batch decode fix): a SECOND, wider VDR variant used only for
+// batched decode (ncols_dst > 1, e.g. MTP verify's ~4-token batch). ISA
+// inspection (roc-obj/llvm-objdump on the mmvq.cu code object) showed VDR=2
+// already compiles to a single global_load_b64 per call (not two 32-bit
+// loads), so raising VDR isn't about load width per se -- it's about fewer,
+// bigger vec_dot calls (more independent decode+FMA chains in flight,
+// fewer kbx-loop iterations). Benched (batched-bench proxy, BS 1-8 sweep):
+// VDR=4 gains +4-17% at BS 2-8 but COSTS -3.7% at BS=1 (18.34 -> 17.66) --
+// unacceptable given the no-BS=1-regression guardrail if applied uniformly.
+// Since ncols_dst is a compile-time template parameter of the enclosing
+// mul_mat_vec_q kernel, dispatch VDR=2 at ncols_dst==1 (preserves the T68
+// win) and VDR=4 at ncols_dst>1 (gets the batch-scaling win) -- both are
+// separate kernel instantiations already, so this is a free, zero-runtime-
+// cost split, not a runtime branch.
+#define VDR_F8E4M3_Q8_1_MMVQ_WIDE 4
+
 // F8E4M3 (Path X, Phase 2a) mmvq decode dot product -- the bandwidth-bound
 // bs=1 counterpart to the mmq/WMMA prefill path in mmq.cuh. block_f8e4m3 is
 // byte-for-byte block_q8_0-shaped (1 fp16 scale + 32 packed bytes), but the
@@ -860,7 +876,11 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
 // so it factors out of the per-byte loop and is applied once at the end
 // alongside the weight's per-block scale (mirrors vec_dot_q2_K_q8_1's
 // pattern of a plain float accumulate against an int8-quantized activation).
-static __device__ __forceinline__ float vec_dot_f8e4m3_q8_1(
+//
+// Templated on VDR so the BS=1 (vdr=2) and batched (vdr=4, T73) variants
+// share one implementation -- only the loop trip count differs.
+template <int vdr>
+static __device__ __forceinline__ float vec_dot_f8e4m3_q8_1_impl(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
     const block_f8e4m3 * bq8 = (const block_f8e4m3 *) vbq + kbx;
@@ -868,7 +888,7 @@ static __device__ __forceinline__ float vec_dot_f8e4m3_q8_1(
     float sumf = 0.0f;
 
 #pragma unroll
-    for (int i = 0; i < VDR_F8E4M3_Q8_1_MMVQ; ++i) {
+    for (int i = 0; i < vdr; ++i) {
         const int vi = get_int_b2(bq8->qs, iqs + i);
         const int ui = get_int_b4(bq8_1->qs, iqs + i);
 
@@ -881,6 +901,16 @@ static __device__ __forceinline__ float vec_dot_f8e4m3_q8_1(
     }
 
     return sumf * (float) bq8->d * __low2float(bq8_1->ds);
+}
+
+static __device__ __forceinline__ float vec_dot_f8e4m3_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_f8e4m3_q8_1_impl<VDR_F8E4M3_Q8_1_MMVQ>(vbq, bq8_1, kbx, iqs);
+}
+
+static __device__ __forceinline__ float vec_dot_f8e4m3_q8_1_wide(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_f8e4m3_q8_1_impl<VDR_F8E4M3_Q8_1_MMVQ_WIDE>(vbq, bq8_1, kbx, iqs);
 }
 
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
