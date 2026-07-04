@@ -32,6 +32,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_NVFP4:
             mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, args, stream);
             break;
+        case GGML_TYPE_F8E4M3:
+            mul_mat_q_case<GGML_TYPE_F8E4M3>(ctx, args, stream);
+            break;
         case GGML_TYPE_Q2_K:
             mul_mat_q_case<GGML_TYPE_Q2_K>(ctx, args, stream);
             break;
@@ -126,6 +129,11 @@ void ggml_cuda_mul_mat_q(
 
     // TODO: tighter pool buffer size vs q8 path
     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
+    // F8E4M3 (Path X, Phase 1b): the WMMA fp8 fragment is fp8xfp8, so the
+    // activation (src1) must also be quantized to e4m3, not int8 Q8_1. The
+    // output container is still block_q8_1_mmq-shaped (same byte size/stride
+    // math below is unaffected), only the kernel that fills it differs.
+    const bool use_native_f8e4m3 = src0->type == GGML_TYPE_F8E4M3;
 
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
@@ -141,6 +149,9 @@ void ggml_cuda_mul_mat_q(
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
+            } else if (use_native_f8e4m3) {
+                quantize_mmq_f8e4m3_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                                       ne11, ne12, ne13, stream);
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
@@ -202,6 +213,9 @@ void ggml_cuda_mul_mat_q(
         if (use_native_fp4) {
             quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                     ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+        } else if (use_native_f8e4m3) {
+            quantize_mmq_f8e4m3_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+                                   ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         } else {
             quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
@@ -297,6 +311,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_F8E4M3:
             mmq_supported = true;
             break;
         default:
@@ -306,6 +321,15 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 
     if (!mmq_supported) {
         return false;
+    }
+
+    // F8E4M3 (Path X, Phase 1b): the mmq path for this type is a native fp8
+    // WMMA kernel with NO dp4a fallback (see vec_dot_f8e4m3_f8e4m3_dp4a,
+    // mmq.cuh) -- it only works on RDNA4/gfx1201. Everywhere else (including
+    // RDNA3, which has AMD_WMMA_AVAILABLE but no fp8 WMMA instruction) must
+    // fall back to the dequant->f16/hipBLAS path (the Phase 1a baseline).
+    if (type == GGML_TYPE_F8E4M3) {
+        return GGML_CUDA_CC_IS_RDNA4(cc);
     }
 
     if (turing_mma_available(cc)) {
