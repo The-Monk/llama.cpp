@@ -872,6 +872,63 @@ static __device__ __forceinline__ float ggml_cuda_e4m3_to_fp32(uint8_t x) {
     return sign ? -raw : raw;
 }
 
+// Signed E4M3 (OCP e4m3fn) encoder -- mirrors ggml_fp32_to_e4m3 (ggml-impl.h)
+// bit-for-bit. Needed for Phase 1b online activation quantization (the fp8
+// WMMA fragment is fp8xfp8: BOTH operands must be e4m3, so src1 activations
+// are quantized to this format on the fly, same role quantize_mmq_q8_1 plays
+// for the int8 MMQ path). Portable closed-form bit manipulation, no hardware
+// fp8 instruction dependency.
+static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_e4m3(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    const int sign = (bits >> 31) & 1;
+
+    if (x != x) { // NaN in -> NaN out
+        return (uint8_t) ((sign << 7) | 0x7F);
+    }
+
+    float ax = fabsf(x);
+    if (ax > 448.0f) {
+        ax = 448.0f; // clamp, e4m3fn has no infinity
+    }
+    if (!(ax > 0.0f)) {
+        return (uint8_t) (sign << 7); // +-0
+    }
+
+    memcpy(&bits, &ax, 4);
+    int fp32_exp = ((bits >> 23) & 0xFF) - 127;
+    int fp32_man = (bits >> 20) & 0x7;
+    int e4_exp   = fp32_exp + 7;
+
+    if (e4_exp <= 0) {
+        // subnormal: value = man * 2^-9, man = round(ax * 2^9)
+        int man = (int) (ax * 512.0f + 0.5f);
+        if (man > 7) {
+            man = 7;
+        }
+        if (man < 1) {
+            return (uint8_t) (sign << 7);
+        }
+        return (uint8_t) ((sign << 7) | man);
+    }
+
+    const int round_bit = (bits >> 19) & 1;
+    int e4_man = fp32_man + round_bit;
+    if (e4_man > 7) {
+        e4_man = 0;
+        e4_exp++;
+    }
+    if (e4_exp >= 15 && e4_man == 7) {
+        // never emit the NaN pattern (S.1111.111) from rounding: clamp to max finite
+        e4_exp = 15;
+        e4_man = 6;
+    } else if (e4_exp > 15) {
+        e4_exp = 15;
+        e4_man = 6;
+    }
+    return (uint8_t) ((sign << 7) | (e4_exp << 3) | e4_man);
+}
+
 static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
 #if defined(BLACKWELL_MMA_AVAILABLE) // This is used for NVFP4 subblock scale quantizations only
     if (!(x > 0.0f)) {
@@ -1035,6 +1092,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
     static constexpr int qk = QK_NVFP4;
     static constexpr int qr = QR_NVFP4;
     static constexpr int qi = QI_NVFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_F8E4M3> {
+    static constexpr int qk = QK_F8E4M3;
+    static constexpr int qr = QR_F8E4M3;
+    static constexpr int qi = QI_F8E4M3;
 };
 
 template<>

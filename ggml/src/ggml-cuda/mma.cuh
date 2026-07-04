@@ -1336,6 +1336,31 @@ namespace ggml_cuda_mma {
 #endif // AMD_MFMA_AVAILABLE
     }
 
+    // Native fp8_e4m3 x fp8_e4m3 -> f32 WMMA (RDNA4/gfx12 only). Used by the
+    // F8E4M3 (Path X) MMQ vec_dot (Phase 1b). Unlike the iu8 int8 overload
+    // above, the hardware interprets the raw bytes as e4m3 floats and
+    // accumulates the true dot product directly in fp32 -- no post-hoc
+    // integer->float rescale, just the usual per-block (dA, dB) scale
+    // multiply applied by the caller after accumulation. Tile shapes mirror
+    // the iu8 (16,8,int) overload exactly (same 1-byte-per-value packing),
+    // two accumulating builtin calls per mma() to cover K=32.
+    template <data_layout dl_d, data_layout dl_ab>
+    static __device__ __forceinline__ void mma(
+            tile<16, 16, float, dl_d> & D, const tile<16, 8, int, dl_ab> & A, const tile<16, 8, int, dl_ab> & B) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+        using float8_t  = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+        using int32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+        float8_t          * acc   = (float8_t *) D.x;
+        const int32x2_t   * a_vec = (const int32x2_t *) A.x;
+        const int32x2_t   * b_vec = (const int32x2_t *) B.x;
+        acc[0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_vec[0], b_vec[0], acc[0]);
+        acc[0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_vec[1], b_vec[1], acc[0]);
+#else
+        GGML_UNUSED_VARS(D, A, B);
+        NO_DEVICE_CODE;
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+    }
+
     static __device__ __forceinline__ void mma(
             tile<32, 32, int> & D, const tile<32, 4, int> & A, const tile<32, 4, int> & B) {
 #if defined(AMD_MFMA_AVAILABLE)
