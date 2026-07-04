@@ -2505,11 +2505,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
-    // F8E4M3 (Path X, Phase 1a) has no vec_dot/mmvq kernel yet -- dequant path only.
-    if (src0->type == GGML_TYPE_F8E4M3) {
-        return false;
-    }
-
+    // F8E4M3 (Path X, Phase 2a): mmvq decode kernel now exists (see
+    // ggml_cuda_should_use_mmvq, mmvq.cu) -- let the general checks below
+    // decide, same as every other quantized type.
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;

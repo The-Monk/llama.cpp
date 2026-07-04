@@ -328,6 +328,17 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     // mmq.cuh) -- it only works on RDNA4/gfx1201. Everywhere else (including
     // RDNA3, which has AMD_WMMA_AVAILABLE but no fp8 WMMA instruction) must
     // fall back to the dequant->f16/hipBLAS path (the Phase 1a baseline).
+    //
+    // No explicit batch-size gate here (unlike a naive port might expect):
+    // this mirrors GGML_TYPE_Q8_0 exactly, which also returns unconditional
+    // `true` for RDNA4 a few lines down. The decode/prefill split does not
+    // live in should_use_mmq -- it lives in ggml_cuda_should_use_mmvq()
+    // (mmvq.cu) plus the dispatch order in ggml_cuda_mul_mat() (ggml-cuda.cu),
+    // which always prefers mul_mat_vec_q over mul_mat_q when both report
+    // true. As of Phase 2a, should_use_mmvq(F8E4M3) is true for RDNA4 and
+    // ne11 <= MMVQ_MAX_BATCH_SIZE (8) -- so decode (ne11==1) and small
+    // multi-slot batches route to the new mmvq kernel, and everything above
+    // that batch size (prefill, ne11==512+) falls through to this WMMA path.
     if (type == GGML_TYPE_F8E4M3) {
         return GGML_CUDA_CC_IS_RDNA4(cc);
     }

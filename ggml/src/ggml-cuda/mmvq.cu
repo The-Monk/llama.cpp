@@ -16,6 +16,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
         case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
         case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
+        case GGML_TYPE_F8E4M3:  return vec_dot_f8e4m3_q8_1;
         case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
@@ -45,6 +46,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ;
         case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
         case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
+        case GGML_TYPE_F8E4M3:  return VDR_F8E4M3_Q8_1_MMVQ;
         case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
         case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
         case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
@@ -247,7 +249,12 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 
 // Host function: returns the max batch size for the current arch+type at runtime.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
-    // F8E4M3 (Path X, Phase 1a) has no vec_dot/mmvq kernel yet -- dequant path only.
+    // F8E4M3 (Path X): the dense mul_mat mmvq decode path exists as of Phase
+    // 2a (see ggml_cuda_should_use_mmvq), but MUL_MAT_ID (MoE routing) is a
+    // separate call path with its own per-arch batch tables below, none of
+    // which have an F8E4M3 entry, and no MoE F8E4M3 model has been validated
+    // yet. Keep MUL_MAT_ID on the Phase 1a dequant fallback until that's
+    // tested; this does not affect the dense-model decode win.
     if (type == GGML_TYPE_F8E4M3) {
         return 0;
     }
@@ -284,11 +291,20 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
-    // F8E4M3 (Path X, Phase 1a) has no vec_dot/mmvq kernel yet -- dequant+cuBLAS
-    // fallback only (see ggml_get_to_fp16_cuda in convert.cu). Phase 1b adds the
-    // fp8 WMMA fast path; do not route here until that lands.
+    // F8E4M3 (Path X, Phase 2a): dedicated mmvq decode kernel now exists
+    // (vec_dot_f8e4m3_q8_1, vecdotq.cuh) -- closes the batch-size gap left by
+    // Phase 1b, where should_use_mmq() has no bs=1 split for this type and
+    // decode was forced through the tile/WMMA prefill kernel. mul_mat_vec_q
+    // is preferred over mul_mat_q whenever both are true (ggml-cuda.cu
+    // dispatch order), so this is the actual decode/prefill split point --
+    // mirrors Q8_0, which relies on the same precedence rather than an
+    // explicit batch check in should_use_mmq. RDNA4-only: the vec_dot itself
+    // is portable (software e4m3 decode, no HW dependency), but F8E4M3
+    // tensors are only produced/loaded for gfx1201 today (Phase 1b's WMMA
+    // prefill path is RDNA4-gated) -- keep other archs on the Phase 1a
+    // dequant fallback until that's validated too.
     if (type == GGML_TYPE_F8E4M3) {
-        return false;
+        return GGML_CUDA_CC_IS_RDNA4(cc) && ne11 <= MMVQ_MAX_BATCH_SIZE;
     }
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
@@ -402,6 +418,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_Q5_0:
                 case GGML_TYPE_Q5_1:
                 case GGML_TYPE_Q8_0:
+                case GGML_TYPE_F8E4M3:
                 case GGML_TYPE_Q2_K:
                 case GGML_TYPE_Q4_K:
                 case GGML_TYPE_Q5_K:
@@ -1043,6 +1060,12 @@ static void mul_mat_vec_q_switch_type(
             break;
         case GGML_TYPE_Q8_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_F8E4M3:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_F8E4M3>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
