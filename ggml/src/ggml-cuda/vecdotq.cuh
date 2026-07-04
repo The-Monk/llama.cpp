@@ -846,6 +846,43 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
     return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(bq8_1->ds));
 }
 
+#define VDR_F8E4M3_Q8_1_MMVQ 2
+
+// F8E4M3 (Path X, Phase 2a) mmvq decode dot product -- the bandwidth-bound
+// bs=1 counterpart to the mmq/WMMA prefill path in mmq.cuh. block_f8e4m3 is
+// byte-for-byte block_q8_0-shaped (1 fp16 scale + 32 packed bytes), but the
+// weight bytes are signed e4m3 floats, not int8: they are NOT linear in the
+// integer bit pattern, so unlike vec_dot_q8_0_q8_1 this cannot feed dp4a
+// directly. Each weight byte is decoded to fp32 with the portable software
+// e4m3 decoder (ggml_cuda_e4m3_to_fp32, common.cuh -- same decoder Phase 1a
+// uses, no hardware fp8 dependency) and multiplied against the raw signed
+// int8 activation byte; the q8_1 activation's own per-block scale is linear,
+// so it factors out of the per-byte loop and is applied once at the end
+// alongside the weight's per-block scale (mirrors vec_dot_q2_K_q8_1's
+// pattern of a plain float accumulate against an int8-quantized activation).
+static __device__ __forceinline__ float vec_dot_f8e4m3_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_f8e4m3 * bq8 = (const block_f8e4m3 *) vbq + kbx;
+
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < VDR_F8E4M3_Q8_1_MMVQ; ++i) {
+        const int vi = get_int_b2(bq8->qs, iqs + i);
+        const int ui = get_int_b4(bq8_1->qs, iqs + i);
+
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint8_t wv = (uint8_t) (vi >> (8*j));
+            const int8_t  av = (int8_t)  (ui >> (8*j));
+            sumf += ggml_cuda_e4m3_to_fp32(wv) * (float) av;
+        }
+    }
+
+    return sumf * (float) bq8->d * __low2float(bq8_1->ds);
+}
+
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
