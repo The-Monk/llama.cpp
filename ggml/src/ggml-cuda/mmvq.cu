@@ -399,6 +399,11 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_IQ4_NL:
                 case GGML_TYPE_IQ4_XS:
                     return 8;
+                case GGML_TYPE_MXFP4:
+                    // Dispatch entry (arch=RDNA4, type=MXFP4): swept 1-8 on Qwen3.6-35B-A3B MoE
+                    // decode. Confirmed on a clean paired re-test: baseline(1) 74.2 -> 3: 76.5
+                    // t/s (+3.2%), tight variance, no pp512 impact.
+                    return 3;
                 default:
                     return 1;
             }
