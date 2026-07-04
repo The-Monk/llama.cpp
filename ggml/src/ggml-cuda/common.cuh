@@ -856,6 +856,22 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
 #endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
 }
 
+// Signed E4M3 (OCP e4m3fn): 1 sign, 4 exp bits (bias=7), 3 mantissa bits.
+// Used for GGML_TYPE_F8E4M3 weight values (Path X). Portable software decode
+// (no hardware fp8 instruction) -- Phase 1a is dequant-only, no WMMA.
+static __device__ __forceinline__ float ggml_cuda_e4m3_to_fp32(uint8_t x) {
+    const int sign = (x >> 7) & 1;
+    const int exp  = (x >> 3) & 0xF;
+    const int man  = x & 0x7;
+    float raw;
+    if (exp == 0) {
+        raw = ldexpf((float) man, -9); // subnormal: man * 2^-9
+    } else {
+        raw = ldexpf(1.0f + (float) man / 8.0f, exp - 7); // NaN pattern (exp=15,man=7) decodes as a large finite value here; never produced by our own quantizer
+    }
+    return sign ? -raw : raw;
+}
+
 static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
 #if defined(BLACKWELL_MMA_AVAILABLE) // This is used for NVFP4 subblock scale quantizations only
     if (!(x > 0.0f)) {
