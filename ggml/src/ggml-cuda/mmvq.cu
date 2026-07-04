@@ -247,6 +247,10 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 
 // Host function: returns the max batch size for the current arch+type at runtime.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+    // F8E4M3 (Path X, Phase 1a) has no vec_dot/mmvq kernel yet -- dequant path only.
+    if (type == GGML_TYPE_F8E4M3) {
+        return 0;
+    }
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
@@ -280,6 +284,12 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+    // F8E4M3 (Path X, Phase 1a) has no vec_dot/mmvq kernel yet -- dequant+cuBLAS
+    // fallback only (see ggml_get_to_fp16_cuda in convert.cu). Phase 1b adds the
+    // fp8 WMMA fast path; do not route here until that lands.
+    if (type == GGML_TYPE_F8E4M3) {
+        return false;
+    }
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
             switch (type) {

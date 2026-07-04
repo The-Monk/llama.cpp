@@ -552,6 +552,76 @@ static inline uint8_t ggml_fp32_to_ue4m3(float x) {
     return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
 }
 
+// E4M3 (signed, OCP e4m3fn): 1 sign, 4 exp bits (bias=7), 3 mantissa bits.
+// No infinities; S.1111.111 (0x7F / 0xFF) is the sole NaN encoding.
+// Used for GGML_TYPE_F8E4M3 weight values (Path X, ggml-common.h:block_f8e4m3).
+static inline float ggml_e4m3_to_fp32(uint8_t x) {
+    const int sign = (x >> 7) & 1;
+    const int exp  = (x >> 3) & 0xF;
+    const int man  = x & 0x7;
+    if (exp == 0xF && man == 0x7) {
+        return sign ? -NAN : NAN;
+    }
+    float raw;
+    if (exp == 0) {
+        raw = ldexpf((float) man, -9); // subnormal: man * 2^-9
+    } else {
+        raw = ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    }
+    return sign ? -raw : raw;
+}
+
+static inline uint8_t ggml_fp32_to_e4m3(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    const int sign = (bits >> 31) & 1;
+
+    if (x != x) { // NaN in -> NaN out
+        return (uint8_t) ((sign << 7) | 0x7F);
+    }
+
+    float ax = fabsf(x);
+    if (ax > 448.0f) {
+        ax = 448.0f; // clamp, e4m3fn has no infinity
+    }
+    if (!(ax > 0.0f)) {
+        return (uint8_t) (sign << 7); // +-0
+    }
+
+    memcpy(&bits, &ax, 4);
+    int fp32_exp = ((bits >> 23) & 0xFF) - 127;
+    int fp32_man = (bits >> 20) & 0x7;
+    int e4_exp   = fp32_exp + 7;
+
+    if (e4_exp <= 0) {
+        // subnormal: value = man * 2^-9, man = round(ax * 2^9)
+        int man = (int) (ax * 512.0f + 0.5f);
+        if (man > 7) {
+            man = 7;
+        }
+        if (man < 1) {
+            return (uint8_t) (sign << 7);
+        }
+        return (uint8_t) ((sign << 7) | man);
+    }
+
+    int round_bit = (bits >> 19) & 1;
+    int e4_man = fp32_man + round_bit;
+    if (e4_man > 7) {
+        e4_man = 0;
+        e4_exp++;
+    }
+    if (e4_exp >= 15 && e4_man == 7) {
+        // never emit the NaN pattern (S.1111.111) from rounding: clamp to max finite
+        e4_exp = 15;
+        e4_man = 6;
+    } else if (e4_exp > 15) {
+        e4_exp = 15;
+        e4_man = 6;
+    }
+    return (uint8_t) ((sign << 7) | (e4_exp << 3) | e4_man);
+}
+
 /**
  * Converts brain16 to float32.
  *
