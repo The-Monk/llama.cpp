@@ -80,6 +80,18 @@ static __device__ __forceinline__ float vec_dot_f8e4m3_q8_1_simd_dispatch(
     return vec_dot_f8e4m3_q8_1_simd_impl<VDR_F8E4M3_Q8_1_MMVQ_SIMD>(vbq, bq8_1, kbx, iqs);
 }
 
+// T79: pure V_DOT4_F32_FP8_FP8 path (both operands native e4m3 -- see
+// vec_dot_f8e4m3_f8e4m3_impl, vecdotq.cuh, for the full design/accuracy-
+// disclosure comment). VDR sweep lever, same cheap-rebuild-only convention
+// T77 established (plain #define here, NOT in vecdotq.cuh). JM-directed
+// sweep: 2, 4, 6, 8.
+#define VDR_F8E4M3_F8E4M3_MMVQ_DOT4 2
+
+static __device__ __forceinline__ float vec_dot_f8e4m3_f8e4m3_dispatch(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_f8e4m3_f8e4m3_impl<VDR_F8E4M3_F8E4M3_MMVQ_DOT4>(vbq, bq8_1, kbx, iqs);
+}
+
 // T73 (small-batch decode fix): F8E4M3-only, batch-size-aware VDR/vec_dot
 // selection, used ONLY by the main mul_mat_vec_q kernel (ncols_dst is a real
 // compile-time template parameter there, so this is a free, zero-runtime-
@@ -91,17 +103,31 @@ static __device__ __forceinline__ float vec_dot_f8e4m3_q8_1_simd_dispatch(
 // verify) now gets the T77 hardware-dot2 SIMD path (VDR_F8E4M3_Q8_1_MMVQ_SIMD
 // above) instead of the T73 scalar-VDR=4 "wide" path -- see T77 KB for the
 // A/B that justified the swap.
+// T79: the pure dot4 path (both operands native e4m3) is not an ILP/batch
+// lever the way T73/T77's split was -- it's a strictly cheaper way to do
+// the SAME per-term work at every batch size (per the ISA audit, backlog
+// item 1c: T77's technique should also win at BS=1). So F8E4M3 now always
+// takes vec_dot_f8e4m3_f8e4m3_dispatch here, superseding the old
+// ncols_dst>1-gated T77 hardware-dot2 (int8-activation) split entirely --
+// that path is left defined above (dead code on this dispatch, still used
+// nowhere else) rather than deleted, so a revert is a one-line diff if the
+// BS=1 A/B below doesn't hold. REQUIRES the matching activation-quantize
+// swap at the ggml_cuda_mul_mat_vec_q call site (this file) -- the two
+// changes are correctness-coupled, see the accuracy-disclosure comment on
+// vec_dot_f8e4m3_f8e4m3_impl (vecdotq.cuh).
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_decode(ggml_type type, int ncols_dst) {
-    if (type == GGML_TYPE_F8E4M3 && ncols_dst > 1) {
-        return vec_dot_f8e4m3_q8_1_simd_dispatch;
+    if (type == GGML_TYPE_F8E4M3) {
+        return vec_dot_f8e4m3_f8e4m3_dispatch;
     }
+    GGML_UNUSED(ncols_dst);
     return get_vec_dot_q_cuda(type);
 }
 
 static constexpr __host__ __device__ int get_vdr_mmvq_decode(ggml_type type, int ncols_dst) {
-    if (type == GGML_TYPE_F8E4M3 && ncols_dst > 1) {
-        return VDR_F8E4M3_Q8_1_MMVQ_SIMD;
+    if (type == GGML_TYPE_F8E4M3) {
+        return VDR_F8E4M3_F8E4M3_MMVQ_DOT4;
     }
+    GGML_UNUSED(ncols_dst);
     return get_vdr_mmvq(type);
 }
 
@@ -1280,7 +1306,20 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        // T79: F8E4M3 decode activations are quantized to native e4m3 (not
+        // int8 q8_1) so vec_dot_f8e4m3_f8e4m3_dispatch (mmvq.cu dispatch
+        // table above) can feed both operands directly to
+        // __builtin_amdgcn_dot4_f32_fp8_fp8. Correctness-coupled with the
+        // get_vec_dot_q_cuda_decode swap above -- see the accuracy-
+        // disclosure comment on vec_dot_f8e4m3_f8e4m3_impl (vecdotq.cuh).
+        // Reachable only when ggml_cuda_should_use_mmvq already gated
+        // F8E4M3 to RDNA4 (mmvq.cu, should_use_mmvq), so no separate cc
+        // check is needed here.
+        if (src0->type == GGML_TYPE_F8E4M3) {
+            quantize_row_f8e4m3_for_mmvq_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        } else {
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
