@@ -2625,7 +2625,17 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     } else if (use_mul_mat_vec_f) {
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_f, nullptr);
     } else if (use_mul_mat_vec_q) {
-        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_q, quantize_row_q8_1_cuda);
+        // T79: this is the split (multi-GPU tensor-parallel) path -- must
+        // pick the SAME activation-quantize function the non-split
+        // ggml_cuda_mul_mat_vec_q fast path (mmvq.cu) uses for F8E4M3, or
+        // mul_mat_vec_q_switch_type's vec_dot_f8e4m3_f8e4m3_dispatch would
+        // silently reinterpret int8 q8_1 bytes as e4m3 -- a correctness bug,
+        // not just a missed perf win. Not benched (no F8E4M3 split-mode
+        // model validated; our guardrail is single-GPU only) but must not be
+        // left silently wrong.
+        const quantize_cuda_t quantize_src1 = src0->type == GGML_TYPE_F8E4M3 ?
+            quantize_row_f8e4m3_for_mmvq_cuda : quantize_row_q8_1_cuda;
+        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_q, quantize_src1);
     } else if (use_mul_mat_q) {
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
     } else {

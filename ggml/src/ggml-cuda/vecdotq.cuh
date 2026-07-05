@@ -958,6 +958,68 @@ static __device__ __forceinline__ float vec_dot_f8e4m3_q8_1_simd_impl(
 // needs to touch this file (vecdotq.cuh is widely included -> full template-
 // recompile, minutes) after this one-time addition.
 
+// T79: pure V_DOT4_F32_FP8_FP8 decode dot. Where T77's hardware-dot2 path
+// still detours the ACTIVATION through int8 (q8_1) and only accelerates the
+// WEIGHT-side decode (2 terms / 3 hardware instructions: cvt_pk_f32_fp8 +
+// cvt_pkrtz + fdot2), this path requires BOTH operands to already be native
+// e4m3 -- the activation buffer must come from quantize_row_f8e4m3_for_mmvq_cuda
+// (quantize.cu, T79), not the standard int8 quantize_row_q8_1_cuda, so this
+// is only reachable via the dedicated F8E4M3-only dispatch branch in mmvq.cu
+// (both the vec_dot AND the activation-quantize call are swapped together;
+// mixing this vec_dot with a q8_1-quantized activation buffer would silently
+// misinterpret int8 bytes as e4m3 bit patterns -- a correctness bug, not
+// just a slowdown, so the two call sites are co-located and commented
+// accordingly in mmvq.cu).
+//
+// Per-term instruction cost: 1 hardware instruction covers 4 terms (vs
+// T77's 1.5 instr/term) -- the ISA-maximal case for this data format, per
+// the RDNA4 ISA audit (wiki T61-audit, finding 1b) and compile-verified
+// (`__builtin_amdgcn_dot4_f32_fp8_fp8` -> exactly `v_dot4_f32_fp8_fp8`,
+// llvm-objdump --mcpu=gfx1201, single VOP3P instruction, T79 session).
+//
+// ACCURACY DISCLOSURE (T79, mandatory -- see wiki T79): quantizing
+// ACTIVATIONS to e4m3 is NOT lossless the way T77's int8->f16 repack is
+// (e4m3 has only 3 mantissa bits vs int8's 8-bit linear code within the
+// per-block dynamic range). Measured impact (Qwen3.6-27B F8E4M3, README.md
+// corpus, 6 chunks, GPU0 fresh-isolated, perplexity is bit-deterministic so
+// this is a REAL reproducible effect, not run noise -- resampled the
+// baseline twice, identical to the bit): int8-activation baseline (T77,
+// -ub 4 forcing mmvq) PPL 2.4423 +/- 0.1236 (matches prior-session 2.4340
+// +/- 0.1229 within noise) vs e4m3-activation (-ub 512 forcing the existing
+// Phase-1b WMMA activation quantizer, the same numerics this vec_dot
+// consumes) PPL 2.4707 +/- 0.1261 -- a real, small, +1.2-1.5% relative
+// increase. Judged within the directed 1-2% tolerance band; disclose this
+// on every future accuracy claim for this path, do not silently drop it.
+template <int vdr>
+static __device__ __forceinline__ float vec_dot_f8e4m3_f8e4m3_impl(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_f8e4m3 * bq8 = (const block_f8e4m3 *) vbq + kbx;
+
+#if defined(GGML_CUDA_F8E4M3_HAS_NATIVE_DOT2)
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+        const uint32_t vi = (uint32_t) get_int_b2(bq8->qs, iqs + i);
+        const uint32_t ui = (uint32_t) get_int_b4(bq8_1->qs, iqs + i);
+        sumf = __builtin_amdgcn_dot4_f32_fp8_fp8(vi, ui, sumf);
+    }
+
+    return sumf * (float) bq8->d * __low2float(bq8_1->ds);
+#else
+    // Portable fallback: no native dot4 available off RDNA4/gfx12 -- reuse
+    // the T77 dot2 (or T73 scalar) impl. NOTE this reads bq8_1 as int8 q8_1
+    // activations, which is WRONG if the caller already swapped the
+    // quantize function to the e4m3 buffer -- this branch is dead code on
+    // any target this dispatch is actually reachable from (F8E4M3 decode is
+    // gated GGML_CUDA_CC_IS_RDNA4 at the mmvq.cu call site, same gate this
+    // macro expands under), kept only so the translation unit still
+    // compiles portably.
+    return vec_dot_f8e4m3_q8_1_impl<vdr>(vbq, bq8_1, kbx, iqs);
+#endif
+}
+
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
