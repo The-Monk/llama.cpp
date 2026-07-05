@@ -65,6 +65,21 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     }
 }
 
+// T77 (wide-SIMD decode): VDR/ILP for the batched (ncols_dst>1) hardware-
+// dot2 path (vec_dot_f8e4m3_q8_1_simd_impl, vecdotq.cuh). Sweep lever --
+// intentionally a plain #define in mmvq.cu (NOT vecdotq.cuh) so the sweep
+// only pays the cheap mmvq.cu-only rebuild (ccache ~30-60s), never the full
+// template-instance recompile. JM-directed sweep: 2, 4, 6, 8 (T75 showed ILP
+// is the real lever, not load width; T68 showed VDR/nwarps sweeps are NOT
+// monotonic -- occupancy/register-pressure cliffs are real and reproducible,
+// so every value here must be benched, not assumed).
+#define VDR_F8E4M3_Q8_1_MMVQ_SIMD 8
+
+static __device__ __forceinline__ float vec_dot_f8e4m3_q8_1_simd_dispatch(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_f8e4m3_q8_1_simd_impl<VDR_F8E4M3_Q8_1_MMVQ_SIMD>(vbq, bq8_1, kbx, iqs);
+}
+
 // T73 (small-batch decode fix): F8E4M3-only, batch-size-aware VDR/vec_dot
 // selection, used ONLY by the main mul_mat_vec_q kernel (ncols_dst is a real
 // compile-time template parameter there, so this is a free, zero-runtime-
@@ -73,18 +88,19 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
 // MoE has no validated F8E4M3 model yet, per T68, and small_k's heuristic
 // staleness here is a minor perf-only risk, not a correctness one). BS=1
 // keeps VDR=2 (the T68-validated decode kernel, unchanged); BS>1 (e.g. MTP
-// verify) gets VDR=4 (benched: +4-17% at BS 2-8, see T73 KB), which alone
-// would regress BS=1 (-3.7%) if applied uniformly -- hence the split.
+// verify) now gets the T77 hardware-dot2 SIMD path (VDR_F8E4M3_Q8_1_MMVQ_SIMD
+// above) instead of the T73 scalar-VDR=4 "wide" path -- see T77 KB for the
+// A/B that justified the swap.
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_decode(ggml_type type, int ncols_dst) {
     if (type == GGML_TYPE_F8E4M3 && ncols_dst > 1) {
-        return vec_dot_f8e4m3_q8_1_wide;
+        return vec_dot_f8e4m3_q8_1_simd_dispatch;
     }
     return get_vec_dot_q_cuda(type);
 }
 
 static constexpr __host__ __device__ int get_vdr_mmvq_decode(ggml_type type, int ncols_dst) {
     if (type == GGML_TYPE_F8E4M3 && ncols_dst > 1) {
-        return VDR_F8E4M3_Q8_1_MMVQ_WIDE;
+        return VDR_F8E4M3_Q8_1_MMVQ_SIMD;
     }
     return get_vdr_mmvq(type);
 }

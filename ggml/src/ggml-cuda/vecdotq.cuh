@@ -913,6 +913,51 @@ static __device__ __forceinline__ float vec_dot_f8e4m3_q8_1_wide(
     return vec_dot_f8e4m3_q8_1_impl<VDR_F8E4M3_Q8_1_MMVQ_WIDE>(vbq, bq8_1, kbx, iqs);
 }
 
+// T77 (wide-SIMD decode): batched-decode (ncols_dst>1) variant that replaces
+// the scalar ldexp/cndmask/bfe software e4m3 decode with the RDNA4 hardware
+// path (ggml_cuda_dot2_e4m3_q8, common.cuh -- v_cvt_pk_f32_fp8 + v_cvt_pk_
+// rtz_f16_f32 + v_dot2_f32_f16, see that comment for the ISA verification
+// and the lossless-repack precision argument). Falls back to the T73 scalar
+// impl (bit-identical result, just slower) when the hardware path isn't
+// available (non-RDNA4 HIP arch, or a CUDA/MUSA build) so this stays
+// portable. `vdr` keeps the same meaning as VDR_F8E4M3_Q8_1_MMVQ(_WIDE)
+// above: number of int32 (4-byte/4-weight) chunks processed per call; each
+// chunk is done as 2 dot2 calls (2 weights each).
+template <int vdr>
+static __device__ __forceinline__ float vec_dot_f8e4m3_q8_1_simd_impl(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_f8e4m3 * bq8 = (const block_f8e4m3 *) vbq + kbx;
+
+#if defined(GGML_CUDA_F8E4M3_HAS_NATIVE_DOT2)
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+        const int vi = get_int_b2(bq8->qs, iqs + i);
+        const int ui = get_int_b4(bq8_1->qs, iqs + i);
+
+        const int8_t a0 = (int8_t) (ui >>  0);
+        const int8_t a1 = (int8_t) (ui >>  8);
+        const int8_t a2 = (int8_t) (ui >> 16);
+        const int8_t a3 = (int8_t) (ui >> 24);
+
+        sumf = ggml_cuda_dot2_e4m3_q8((uint32_t) vi        & 0xFFFF, a0, a1, sumf);
+        sumf = ggml_cuda_dot2_e4m3_q8(((uint32_t) vi >> 16) & 0xFFFF, a2, a3, sumf);
+    }
+
+    return sumf * (float) bq8->d * __low2float(bq8_1->ds);
+#else
+    return vec_dot_f8e4m3_q8_1_impl<vdr>(vbq, bq8_1, kbx, iqs);
+#endif
+}
+
+// Note: no fixed-VDR non-template wrapper here on purpose. mmvq.cu (cheap,
+// ccache ~30-60s rebuild) instantiates vec_dot_f8e4m3_q8_1_simd_impl<N>
+// directly for whichever N the sweep is testing, so the VDR/ILP sweep never
+// needs to touch this file (vecdotq.cuh is widely included -> full template-
+// recompile, minutes) after this one-time addition.
+
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
