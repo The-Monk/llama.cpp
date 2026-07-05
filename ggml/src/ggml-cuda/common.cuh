@@ -929,6 +929,51 @@ static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_e4m3(float x) {
     return (uint8_t) ((sign << 7) | (e4_exp << 3) | e4_man);
 }
 
+// T77 (wide-SIMD decode): RDNA4 has NATIVE hardware fp8(e4m3)<->fp32 convert
+// instructions (V_CVT_F32_FP8 / V_CVT_PK_F32_FP8, ISA doc "RDNA4" Instruction
+// Set Architecture Reference Guide (70651) sec. 7.6/7.7) and a packed fp16
+// dot-with-fp32-accumulate instruction (V_DOT2_F32_F16). gfx1201/gfx1200
+// implement the OCP (not FNUZ) E4M3 variant (HIP_FP8_TYPE_OCP=1 in
+// amd_hip_fp8.h for __gfx1200__/__gfx1201__/__gfx950__) -- sign(1)/exp(4,
+// bias=7)/man(3), no infinities -- bit-for-bit the same layout as the
+// software ggml_cuda_e4m3_to_fp32/ggml_cuda_fp32_to_e4m3 codec above, so
+// these are a drop-in ISA-level accelerant for the existing quantized
+// format, not a new quantization scheme. ISA-verified (roc-obj + llvm-
+// objdump --mcpu=gfx1201 on a standalone HIP test kernel): each of these
+// compiles to exactly the single named instruction:
+//   __builtin_amdgcn_cvt_pk_f32_fp8(u32, false)      -> v_cvt_pk_f32_fp8_e32   (2x fp8 -> 2x f32)
+//   __builtin_amdgcn_cvt_f32_fp8(u32, 0)              -> v_cvt_f32_fp8_e64     (1x fp8 -> 1x f32)
+//   __builtin_amdgcn_cvt_pkrtz(f32,f32)               -> v_cvt_pk_rtz_f16_f32  (2x f32 -> 2x f16, packed)
+//   __builtin_amdgcn_fdot2(h2,h2,f32,false)            -> v_dot2_f32_f16       (a.x*b.x + a.y*b.y + acc, FP32 accumulate)
+// Precision argument for the fp16 detour: e4m3 has only a 3-bit mantissa and
+// q8_1 activations are int8 (both exactly representable in fp16's 10-bit
+// mantissa within fp16's dynamic range for the values these formats can
+// hold), so f32->f16 packing of an already-decoded e4m3 value or an int8
+// activation is LOSSLESS -- this reassociates the existing math (2 terms/
+// instruction, fp32 accumulate throughout) rather than introducing new
+// quantization error. See wiki T77 for the analysis and validation.
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+#define GGML_CUDA_F8E4M3_HAS_NATIVE_DOT2 1
+
+typedef __fp16 ggml_cuda_fp16x2_t __attribute__((ext_vector_type(2)));
+typedef float  ggml_cuda_fp32x2_t __attribute__((ext_vector_type(2)));
+
+// Decode 2 packed e4m3 bytes (low 16 bits of `fp8_pair`) directly to f32 with
+// ONE hardware instruction (v_cvt_pk_f32_fp8_e32), then compute
+// acc + w0*a0 + w1*a1 with ONE hardware instruction (v_dot2_f32_f16,
+// fp32-accumulate) via an fp16 repack (v_cvt_pk_rtz_f16_f32, lossless per
+// the note above). 4 hardware instructions total cover 2 weight*activation
+// terms, vs. ~15-20 software instructions/term for the ldexp/cndmask/bfe
+// scalar decoder above.
+static __device__ __forceinline__ float ggml_cuda_dot2_e4m3_q8(
+        const uint32_t fp8_pair, const int8_t a0, const int8_t a1, const float acc) {
+    ggml_cuda_fp32x2_t wf = __builtin_amdgcn_cvt_pk_f32_fp8(fp8_pair, false);
+    ggml_cuda_fp16x2_t wh = __builtin_amdgcn_cvt_pkrtz(wf[0], wf[1]);
+    ggml_cuda_fp16x2_t ah = __builtin_amdgcn_cvt_pkrtz((float) a0, (float) a1);
+    return __builtin_amdgcn_fdot2(wh, ah, acc, false);
+}
+#endif // defined(GGML_USE_HIP) && defined(RDNA4)
+
 static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
 #if defined(BLACKWELL_MMA_AVAILABLE) // This is used for NVFP4 subblock scale quantizations only
     if (!(x > 0.0f)) {
