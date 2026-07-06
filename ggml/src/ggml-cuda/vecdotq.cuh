@@ -958,6 +958,79 @@ static __device__ __forceinline__ float vec_dot_f8e4m3_q8_1_simd_impl(
 // needs to touch this file (vecdotq.cuh is widely included -> full template-
 // recompile, minutes) after this one-time addition.
 
+// T97: F8E5M2 (OCP bf8) decode dot products. Mirrors the F8E4M3 T73 (scalar,
+// portable) and T77 (hardware-dot2) tiers above; deliberately does NOT mirror
+// T79 (bf8xbf8 V_DOT4, requiring bf8-quantized activations) -- see the
+// dispatch-site comment in mmvq.cu for the rationale. block_f8e5m2 is
+// byte-for-byte block_q8_0-shaped, same as block_f8e4m3, so the same
+// get_int_b2/get_int_b4 byte-packing applies unchanged.
+#define VDR_F8E5M2_Q8_1_MMVQ 2
+
+// T97 scalar/portable path: same structure as vec_dot_f8e4m3_q8_1_impl,
+// decodes each weight byte with the software e5m2 decoder (no hardware
+// dependency, correct on every backend/arch).
+template <int vdr>
+static __device__ __forceinline__ float vec_dot_f8e5m2_q8_1_impl(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_f8e5m2 * bq8 = (const block_f8e5m2 *) vbq + kbx;
+
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+        const int vi = get_int_b2(bq8->qs, iqs + i);
+        const int ui = get_int_b4(bq8_1->qs, iqs + i);
+
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint8_t wv = (uint8_t) (vi >> (8*j));
+            const int8_t  av = (int8_t)  (ui >> (8*j));
+            sumf += ggml_cuda_e5m2_to_fp32(wv) * (float) av;
+        }
+    }
+
+    return sumf * (float) bq8->d * __low2float(bq8_1->ds);
+}
+
+static __device__ __forceinline__ float vec_dot_f8e5m2_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_f8e5m2_q8_1_impl<VDR_F8E5M2_Q8_1_MMVQ>(vbq, bq8_1, kbx, iqs);
+}
+
+// T97 hardware-dot2 path (RDNA4 bf8 native decode, T77-equivalent). Falls
+// back to the portable scalar impl (bit-identical result, just slower) when
+// GGML_CUDA_F8E5M2_HAS_NATIVE_DOT2 isn't defined (non-RDNA4 HIP arch, or a
+// CUDA/MUSA build), same portability contract as vec_dot_f8e4m3_q8_1_simd_impl.
+template <int vdr>
+static __device__ __forceinline__ float vec_dot_f8e5m2_q8_1_simd_impl(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_f8e5m2 * bq8 = (const block_f8e5m2 *) vbq + kbx;
+
+#if defined(GGML_CUDA_F8E5M2_HAS_NATIVE_DOT2)
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+        const int vi = get_int_b2(bq8->qs, iqs + i);
+        const int ui = get_int_b4(bq8_1->qs, iqs + i);
+
+        const int8_t a0 = (int8_t) (ui >>  0);
+        const int8_t a1 = (int8_t) (ui >>  8);
+        const int8_t a2 = (int8_t) (ui >> 16);
+        const int8_t a3 = (int8_t) (ui >> 24);
+
+        sumf = ggml_cuda_dot2_bf8_q8((uint32_t) vi        & 0xFFFF, a0, a1, sumf);
+        sumf = ggml_cuda_dot2_bf8_q8(((uint32_t) vi >> 16) & 0xFFFF, a2, a3, sumf);
+    }
+
+    return sumf * (float) bq8->d * __low2float(bq8_1->ds);
+#else
+    return vec_dot_f8e5m2_q8_1_impl<vdr>(vbq, bq8_1, kbx, iqs);
+#endif
+}
+
 // T79: pure V_DOT4_F32_FP8_FP8 decode dot. Where T77's hardware-dot2 path
 // still detours the ACTIVATION through int8 (q8_1) and only accelerates the
 // WEIGHT-side decode (2 terms / 3 hardware instructions: cvt_pk_f32_fp8 +
