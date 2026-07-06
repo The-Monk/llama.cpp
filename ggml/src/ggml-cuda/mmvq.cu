@@ -315,14 +315,24 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 
 // Host function: returns the max batch size for the current arch+type at runtime.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
-    // F8E4M3 (Path X): the dense mul_mat mmvq decode path exists as of Phase
-    // 2a (see ggml_cuda_should_use_mmvq), but MUL_MAT_ID (MoE routing) is a
-    // separate call path with its own per-arch batch tables below, none of
-    // which have an F8E4M3 entry, and no MoE F8E4M3 model has been validated
-    // yet. Keep MUL_MAT_ID on the Phase 1a dequant fallback until that's
-    // tested; this does not affect the dense-model decode win.
+    // F8E4M3 MUL_MAT_ID (T81, fp8-moe branch, completes the deferred MoE
+    // path T79 left open): mul_mat_vec_q_moe now dispatches F8E4M3 through
+    // get_vec_dot_q_cuda_decode/get_vdr_mmvq_decode (see that kernel, above),
+    // which correctly matches the native-e4m3 activation quantization
+    // ggml_cuda_mul_mat_vec_q always performs for this type (regardless of
+    // whether `ids` is set) -- fixed alongside this gate opening; before that
+    // fix, opening this gate would have fed e4m3 activation bytes to the
+    // int8-q8_1 dot (vec_dot_f8e4m3_q8_1) and produced silently wrong output.
+    // RDNA4-gated explicitly here (unlike most entries in this function,
+    // which gate by arch via the table dispatch below): this function's own
+    // call site (ggml_cuda_mul_mat_id, ggml-cuda.cu) has no separate cc check
+    // before calling ggml_cuda_mul_mat_vec_q, unlike the dense MUL_MAT path
+    // where ggml_cuda_should_use_mmvq() itself gates on GGML_CUDA_CC_IS_RDNA4
+    // before that function is ever invoked -- so the gate has to live here.
+    // Cap = MMVQ_MAX_BATCH_SIZE (no per-type tuning entry yet, that's a
+    // Phase-2/perf sweep, not a completeness requirement).
     if (type == GGML_TYPE_F8E4M3) {
-        return 0;
+        return GGML_CUDA_CC_IS_AMD(cc) && GGML_CUDA_CC_IS_RDNA4(cc) ? MMVQ_MAX_BATCH_SIZE : 0;
     }
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
@@ -800,10 +810,31 @@ static __global__ void mul_mat_vec_q_moe(
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
+    // T81 (MoE completeness, fp8-moe): use the *_decode dispatch here too, not
+    // the bare get_vdr_mmvq/get_vec_dot_q_cuda. ggml_cuda_mul_mat_vec_q (the
+    // sole caller that fills vy for this kernel) quantizes F8E4M3 activations
+    // to native e4m3 UNCONDITIONALLY -- regardless of whether `ids` is set --
+    // via quantize_row_f8e4m3_for_mmvq_cuda (see that function, this file).
+    // The bare get_vdr_mmvq/get_vec_dot_q_cuda(F8E4M3) return the Phase-2a
+    // int8-q8_1-activation dot (vec_dot_f8e4m3_q8_1), which would silently
+    // reinterpret e4m3 activation bytes as int8 q8_1 -- garbage output. This
+    // was a latent bug: unreachable today only because get_mmvq_mmid_max_batch
+    // returns 0 for F8E4M3 (see below), so mul_mat_vec_q_moe is compiled but
+    // never actually launched for F8E4M3 -- until that gate is opened for the
+    // MoE decode path, at which point this mismatch would fire on real
+    // output. The literal `1` passed as ncols_dst is intentionally a dummy:
+    // get_vec_dot_q_cuda_decode/get_vdr_mmvq_decode for F8E4M3 ignore ncols_dst
+    // entirely (always return the fp8xfp8 dot, per T79) and for every OTHER
+    // type they fall straight back to get_vec_dot_q_cuda/get_vdr_mmvq
+    // unchanged -- so this swap is a no-op for all non-F8E4M3 MoE types
+    // (Q4_K, Q6_K, MXFP4, etc.) and only changes F8E4M3 behavior. Must stay a
+    // compile-time literal (not a runtime ncols_dst) so `vdr` below can stay
+    // constexpr (ncols_dst is a real runtime kernel arg in this kernel, unlike
+    // the ncols_dst-templated mul_mat_vec_q above).
+    constexpr int vdr = get_vdr_mmvq_decode(type, 1);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda_decode(type, 1);
 
     const uint32_t token_idx   = threadIdx.y;
     const int      row0        = c_rows_per_block*blockIdx.x;
