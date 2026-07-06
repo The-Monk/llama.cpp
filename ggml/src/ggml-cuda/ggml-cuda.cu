@@ -47,6 +47,7 @@
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
+#include "ggml-cuda/swmmac24.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
 #include "ggml-cuda/top-k.cuh"
@@ -5754,6 +5755,17 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
             iu4_w4a4_selftest_ran = true;
             const bool ok = ggml_cuda_iu4_w4a4_selftest();
             GGML_LOG_INFO("%s: GGML_HIP_IU4_W4A4_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // RDNA4 2:4-structured-sparse SWMMAC driver-completeness self-test (swmmac24.cu).
+    // Dormant capability, opt-in only, no model/quant path routes through it -- see
+    // swmmac24.cuh for the doctrine rationale. Runs at most once per process.
+    if (getenv("GGML_HIP_SWMMAC24_SELFTEST") != nullptr) {
+        static bool swmmac24_selftest_ran = false;
+        if (!swmmac24_selftest_ran) {
+            swmmac24_selftest_ran = true;
+            const bool ok = ggml_cuda_swmmac24_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_SWMMAC24_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
         }
     }
 
