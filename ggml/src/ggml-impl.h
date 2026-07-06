@@ -622,6 +622,82 @@ static inline uint8_t ggml_fp32_to_e4m3(float x) {
     return (uint8_t) ((sign << 7) | (e4_exp << 3) | e4_man);
 }
 
+// E5M2 (signed, OCP bf8): 1 sign, 5 exp bits (bias=15), 2 mantissa bits.
+// Unlike e4m3fn, standard OCP e5m2 DOES have real infinities: exp==0x1F,
+// man==0 -> +-Inf; exp==0x1F, man!=0 -> NaN. Wider dynamic range than e4m3
+// (max finite ~57344 vs 448), fewer mantissa bits (2 vs 3) -- less precision,
+// more headroom before overflow. gfx1201/gfx1200 implement OCP (not FNUZ)
+// bf8 (HIP_FP8_TYPE_OCP=1 in amd_hip_fp8.h), so this layout is bit-for-bit
+// what the RDNA4 hardware v_cvt_*_bf8 instructions consume/produce (T97
+// ISA-verified, see ggml-cuda/common.cuh).
+// Used for GGML_TYPE_F8E5M2 weight values (ggml-common.h:block_f8e5m2).
+static inline float ggml_e5m2_to_fp32(uint8_t x) {
+    const int sign = (x >> 7) & 1;
+    const int exp  = (x >> 2) & 0x1F;
+    const int man  = x & 0x3;
+    if (exp == 0x1F) {
+        if (man == 0) {
+            return sign ? -INFINITY : INFINITY;
+        }
+        return sign ? -NAN : NAN;
+    }
+    float raw;
+    if (exp == 0) {
+        raw = ldexpf((float) man, -16); // subnormal: man * 2^-16
+    } else {
+        raw = ldexpf(1.0f + (float) man / 4.0f, exp - 15);
+    }
+    return sign ? -raw : raw;
+}
+
+static inline uint8_t ggml_fp32_to_e5m2(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    const int sign = (bits >> 31) & 1;
+
+    if (x != x) { // NaN in -> NaN out
+        return (uint8_t) ((sign << 7) | 0x7F);
+    }
+
+    float ax = fabsf(x);
+    if (!(ax > 0.0f)) {
+        return (uint8_t) (sign << 7); // +-0
+    }
+
+    memcpy(&bits, &ax, 4);
+    int fp32_exp = ((bits >> 23) & 0xFF) - 127;
+    int fp32_man = (bits >> 21) & 0x3;
+    int e5_exp   = fp32_exp + 15;
+
+    if (e5_exp <= 0) {
+        // subnormal: value = man * 2^-16, man = round(ax * 2^16)
+        int man = (int) (ax * 65536.0f + 0.5f);
+        if (man > 3) {
+            man = 3;
+        }
+        if (man < 1) {
+            return (uint8_t) (sign << 7);
+        }
+        return (uint8_t) ((sign << 7) | man);
+    }
+    if (e5_exp >= 31) {
+        // overflow (includes +-Inf input, whose fp32_exp is huge): OCP e5m2
+        // has real infinities, unlike e4m3fn, so round up rather than clamp.
+        return (uint8_t) ((sign << 7) | 0x7C);
+    }
+
+    const int round_bit = (bits >> 20) & 1;
+    int e5_man = fp32_man + round_bit;
+    if (e5_man > 3) {
+        e5_man = 0;
+        e5_exp++;
+    }
+    if (e5_exp >= 31) {
+        return (uint8_t) ((sign << 7) | 0x7C); // rounds up into +-Inf
+    }
+    return (uint8_t) ((sign << 7) | (e5_exp << 2) | e5_man);
+}
+
 /**
  * Converts brain16 to float32.
  *

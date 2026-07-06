@@ -59,3 +59,12 @@ void quantize_mmq_f8e4m3_cuda(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream);
+
+// T97: online activation quantization to signed e5m2, D4-layout (single
+// float scale per 32-value block), written into the same block_q8_1_mmq
+// container the int8 MMQ path and F8E4M3's quantizer both use. Required
+// because the bf8 WMMA fragment is bf8xbf8 -- both operands must be e5m2.
+void quantize_mmq_f8e5m2_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream);

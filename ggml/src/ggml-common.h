@@ -115,6 +115,9 @@ typedef sycl::half2 ggml_half2;
 #define QI_F8E4M3 (QK_F8E4M3 / (4 * QR_F8E4M3))
 #define QR_F8E4M3 1
 
+#define QI_F8E5M2 (QK_F8E5M2 / (4 * QR_F8E5M2))
+#define QR_F8E5M2 1
+
 #define QI5_0 (QK5_0 / (4 * QR5_0))
 #define QR5_0 2
 
@@ -238,6 +241,24 @@ typedef struct {
     uint8_t   qs[QK_F8E4M3];   // signed e4m3 (OCP e4m3fn) raw bytes, 1 per value
 } block_f8e4m3;
 static_assert(sizeof(block_f8e4m3) == sizeof(ggml_half) + QK_F8E4M3, "wrong f8e4m3 block size/padding");
+
+// F8E5M2 (T97, OCP bf8): signed e5m2 weights (1 byte/value) + one fp16 scale
+// per block. Same 8.5 bpw block layout as block_f8e4m3/block_q8_0 (mirrors
+// on purpose -- every generic q8_0-shaped code path (get_int_b2 byte packing,
+// MMQ_DP4A_TXS_Q8_0 tile sizing, etc.) is reusable without a new layout).
+// Unlike e4m3fn, OCP e5m2 has real +-Inf and a NaN encoding (5 exponent bits,
+// bias 15); the per-block scale still keeps every stored value well inside
+// the finite range in practice (quantizer maps block amax -> 57344, the
+// largest finite e5m2 magnitude), so Inf is never produced by our own
+// quantizer, only decodable if malformed/foreign data is loaded (validate_row_data
+// simply range-checks the same D_F16 pattern as every other d-scaled type --
+// the qs bytes are unrestricted, mirrors block_q8_0).
+#define QK_F8E5M2 32
+typedef struct {
+    ggml_half d;               // per-block scale (fp16)
+    uint8_t   qs[QK_F8E5M2];   // signed e5m2 (OCP bf8) raw bytes, 1 per value
+} block_f8e5m2;
+static_assert(sizeof(block_f8e5m2) == sizeof(ggml_half) + QK_F8E5M2, "wrong f8e5m2 block size/padding");
 
 #define QK5_0 32
 typedef struct {

@@ -1361,6 +1361,41 @@ namespace ggml_cuda_mma {
 #endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
     }
 
+    // T97: Native bf8_e5m2 x bf8_e5m2 -> f32 WMMA (RDNA4/gfx12 only). Used by
+    // the F8E5M2 MMQ vec_dot (native prefill, completing the E5M2 format --
+    // decode already had the T77-style hardware bf8 convert-instruction
+    // path). Compile+disasm ISA-verified (llvm-objdump --mcpu=gfx1201 on a
+    // standalone HIP test kernel, T97 WMMA session): the RDNA4 WMMA cross
+    // matrix genuinely has 4 independent instructions --
+    // v_wmma_f32_16x16x16_{fp8,bf8}_{fp8,bf8} -- confirmed
+    // __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12 compiles to
+    // exactly v_wmma_f32_16x16x16_bf8_bf8 (distinct opcode from the fp8_fp8
+    // one above). NOTE: this is named `mma_bf8`, NOT an overload of `mma()`,
+    // because the fp8_e4m3 overload directly above already claims the exact
+    // same C++ signature (tile<16,16,float,dl_d>, tile<16,8,int,dl_ab> x2) --
+    // two mma() overloads with identical parameter types but different
+    // builtin bodies would be an ODR/redefinition conflict, not legal
+    // overload resolution (overload picking here is by TILE SHAPE/element
+    // type, not by ggml_type, and F8E4M3 already occupies this shape). Callers
+    // (vec_dot_f8e5m2_f8e5m2_mma, mmq.cuh) invoke mma_bf8() directly instead
+    // of going through the generic mma() dispatcher.
+    template <data_layout dl_d, data_layout dl_ab>
+    static __device__ __forceinline__ void mma_bf8(
+            tile<16, 16, float, dl_d> & D, const tile<16, 8, int, dl_ab> & A, const tile<16, 8, int, dl_ab> & B) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+        using float8_t  = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+        using int32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+        float8_t          * acc   = (float8_t *) D.x;
+        const int32x2_t   * a_vec = (const int32x2_t *) A.x;
+        const int32x2_t   * b_vec = (const int32x2_t *) B.x;
+        acc[0] = __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12(a_vec[0], b_vec[0], acc[0]);
+        acc[0] = __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12(a_vec[1], b_vec[1], acc[0]);
+#else
+        GGML_UNUSED_VARS(D, A, B);
+        NO_DEVICE_CODE;
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+    }
+
     static __device__ __forceinline__ void mma(
             tile<32, 32, int> & D, const tile<32, 4, int> & A, const tile<32, 4, int> & B) {
 #if defined(AMD_MFMA_AVAILABLE)
