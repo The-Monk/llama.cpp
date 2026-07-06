@@ -34,6 +34,7 @@ struct quant_option {
 static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q1_0",     LLAMA_FTYPE_MOSTLY_Q1_0,     " 1.125 bpw quantization",           },
     { "F8E4M3",   LLAMA_FTYPE_MOSTLY_F8E4M3,   " 8.5 bpw, signed e4m3 + fp16 block scale (Path X)", },
+    { "F8E5M2",   LLAMA_FTYPE_MOSTLY_F8E5M2,   " 8.5 bpw, signed e5m2/bf8 + fp16 block scale (T97)", },
     { "Q4_0",     LLAMA_FTYPE_MOSTLY_Q4_0,     " 4.34G, +0.4685 ppl @ Llama-3-8B",  },
     { "Q4_1",     LLAMA_FTYPE_MOSTLY_Q4_1,     " 4.78G, +0.4511 ppl @ Llama-3-8B",  },
     { "MXFP4_MOE",LLAMA_FTYPE_MOSTLY_MXFP4_MOE," MXFP4 MoE",  },

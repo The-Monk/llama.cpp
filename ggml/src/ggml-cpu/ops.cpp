@@ -4968,6 +4968,7 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_F8E4M3:
+        case GGML_TYPE_F8E5M2:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
             } break;
