@@ -65,6 +65,7 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/iu4_w4a4.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -5740,6 +5741,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
         /* .context = */ ctx,
     };
+
+    // T89: native iu4 x iu4 (W4A4) RDNA4 WMMA driver-completeness self-test
+    // (iu4_w4a4.cu). Dormant capability, opt-in only, no model/quant path
+    // routes through it -- see iu4_w4a4.cuh / wiki/tech/int4-iu4-notes.md for
+    // the doctrine rationale (accuracy gate on naive W4A4 activation
+    // quantization did not clear the bar for an ACTIVE default path). Runs at
+    // most once per process. Same pattern as GGML_HIP_SWMMAC24_SELFTEST.
+    if (getenv("GGML_HIP_IU4_W4A4_SELFTEST") != nullptr) {
+        static bool iu4_w4a4_selftest_ran = false;
+        if (!iu4_w4a4_selftest_ran) {
+            iu4_w4a4_selftest_ran = true;
+            const bool ok = ggml_cuda_iu4_w4a4_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_IU4_W4A4_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
 
     return cuda_backend;
 }
