@@ -1,0 +1,7 @@
+{
+  "bf16_reference": 90.37617492675781,
+  "q4_weight_int8_act": 104.19702911376953,
+  "q4_weight_int4_act": 138.17469787597656,
+  "q4_weight_int4_act_hadamard": 114.7095718383789,
+  "q4_weight_noact_quant": 104.07546997070312
+}
