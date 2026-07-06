@@ -328,6 +328,56 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
     return sum;
 }
 
+// T80: F8E4M3 KV-cache K-side (QK^T) dot for the FA vec (decode, ncols==1)
+// kernel. type_K quantized (!= F16/BF16) so Q_q8_1==true upstream -- Q is
+// already pre-quantized to int8 q8_1 in shared mem (Q_q8/Q_ds_v), same
+// calling convention as vec_dot_fattn_vec_KQ_q8_0 above. block_f8e4m3 is
+// byte-identical in size/layout to block_q8_0 (QK_F8E4M3==QK8_0==32,
+// QI_F8E4M3==QI8_0==8) so the block-index/iqs arithmetic is unchanged; the
+// only difference is decoding K's raw byte through ggml_cuda_e4m3_to_fp32
+// instead of reading it as a signed int8 -- this is the exact
+// weight(fp8)*activation(int8) pattern vec_dot_f8e4m3_q8_1_impl already
+// uses for the mmvq decode path (vecdotq.cuh), just re-laid-out for FA's
+// per-thread strided loop instead of a per-row loop. Portable (no native
+// dot4/dot2 dependency) -- correctness-first; see wiki T80 for the ISA-
+// speed hypothesis (dp4a's int8 4-wide is not obviously beaten by this).
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f8e4m3(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_f8e4m3 * K_f8 = (const block_f8e4m3 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int ib  = k_KQ / QI_F8E4M3;
+        const int iqs = k_KQ % QI_F8E4M3;
+
+        int v;
+        ggml_cuda_memcpy_1<sizeof(v), 2>(&v, K_f8[ib].qs + 4*iqs);
+        const int u = Q_q8[k_KQ_0/nthreads];
+
+        const float2 * Q_ds = (const float2 *) Q_ds_v;
+        const float Q_d = Q_ds[k_KQ_0/nthreads].x;
+
+        float partial = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint8_t wv = (uint8_t) (v >> (8*j));
+            const int8_t  av = (int8_t)  (u >> (8*j));
+            partial += ggml_cuda_e4m3_to_fp32(wv) * (float) av;
+        }
+
+        sum += partial * (float) K_f8[ib].d * Q_d;
+    }
+
+    return sum;
+}
+
 template <typename Tds, int ni>
 static __device__ __forceinline__ void quantize_q8_1_to_shared(
     const float * __restrict__ x, const float scale, int * __restrict__ yq32, void * __restrict__ yds) {
@@ -617,6 +667,52 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+// T80: F8E4M3 KV-cache V-side dequant for the FA vec kernel. V is ALWAYS
+// dequantized before the softmax-weighted accumulate regardless of KV type
+// (even for q8_0 above) -- the accumulate happens against float softmax
+// probabilities, not another quantized operand, so there is no analogue of
+// the K-side's int8 dp4a fast path here for ANY quant type. Portable decode
+// via the shared ggml_cuda_e4m3_to_fp32 codec (same one dequantize_f8e4m3
+// in dequantize.cuh uses); a hardware-cvt variant (v_cvt_pk_f32_fp8_e32,
+// T77) is a possible follow-up but the honest-value-gate read is that this
+// is already ~the same instruction count as q8_0's cvt+FMA above (see
+// wiki T80), so start with the correctness-first portable version and only
+// chase the hardware cvt if the benchmark shows daylight.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_f8e4m3(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_f8e4m3 * x = (const block_f8e4m3 *) vx;
+
+    const int64_t ib  = i0 / QK_F8E4M3;
+    const int     iqs = i0 % QK_F8E4M3;
+
+    static_assert(ne % 2 == 0, "bad ne");
+    uint8_t qs[ne];
+    ggml_cuda_memcpy_1<ne, 2>(qs, x[ib].qs + iqs);
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same<T, half>::value) {
+        const float d = x[ib].d;
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = make_half2(
+                ggml_cuda_e4m3_to_fp32(qs[l0 + 0]) * d,
+                ggml_cuda_e4m3_to_fp32(qs[l0 + 1]) * d);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same<T, float>::value) {
+        const float d = x[ib].d;
+
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = ggml_cuda_e4m3_to_fp32(qs[l]) * d;
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -633,6 +729,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_F8E4M3) {
+        return vec_dot_fattn_vec_KQ_f8e4m3<D, nthreads>; // T80
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -655,6 +753,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
+    } else if constexpr (type_V == GGML_TYPE_F8E4M3) {
+        return dequantize_V_f8e4m3<T, ne>; // T80
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

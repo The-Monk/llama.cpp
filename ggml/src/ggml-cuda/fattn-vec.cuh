@@ -609,3 +609,12 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
+
+// T80: F8E4M3 KV cache -- only the symmetric K==V==F8E4M3 case is wired
+// (matches the honest-value-gate scope: KV-cache experiment, not a general
+// FA-quant sweep), so declared standalone rather than via
+// EXTERN_DECL_FATTN_VEC_CASES (which would pull in F8E4M3 as a type_V for
+// every other type_K too, none of which have an instance file).
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F8E4M3, GGML_TYPE_F8E4M3);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_F8E4M3, GGML_TYPE_F8E4M3);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_F8E4M3, GGML_TYPE_F8E4M3);
