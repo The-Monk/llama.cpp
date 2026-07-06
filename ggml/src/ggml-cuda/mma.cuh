@@ -1478,4 +1478,50 @@ namespace ggml_cuda_mma {
         NO_DEVICE_CODE;
 #endif // AMD_WMMA_AVAILABLE
     }
+
+    // --- T89: native iu4 (int4 x int4 -> int32) W4A4 WMMA, RDNA4-only ---------
+    // Mirrors the iu8 K=16 dense overload directly above: SAME tile<16,4,int>
+    // operand shape (ne=2, i.e. one int32x2 register/lane = 8 bytes/lane), but
+    // calls the native `V_WMMA_I32_16X16X32_IU4` builtin (2 int4 nibbles packed
+    // per byte) instead of iu8's K=16 form. At IDENTICAL register footprint
+    // this gets DOUBLE the reduction depth (K=32 instead of K=16) in a SINGLE
+    // instruction -- matches a Q4_0-style 32-element quant block exactly, and
+    // matches the measured ~2.23x raw-throughput finding
+    // (`wiki/tech/phase2-lever-validation.md`: iu4_dense_k32/iu8_dense_k16 =
+    // 2.228 +/- 0.070, confirmed via `__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12`
+    // disasm to `v_wmma_i32_16x16x32_iu4`).
+    //
+    // Named `mma_iu4` (NOT an `mma()` overload) on purpose: iu4 and iu8 both
+    // accumulate to `int` with the textually IDENTICAL tile<16,4,int> operand
+    // shape, so there is no type-safe way to overload purely on "byte packing
+    // convention" here without threading a new tile element-type tag through
+    // this header (which is included by every translation unit in the CUDA/HIP
+    // backend). Since this is a correctness-only, self-test-gated capability
+    // (T89 disposition: DORMANT -- see ggml/src/ggml-cuda/iu4_w4a4.cu and
+    // wiki/tech/int4-iu4-notes.md) and NOT wired into the production mmq
+    // dispatch, a distinctly-named function keeps the change minimal and
+    // zero-risk to every existing kernel that includes this file.
+    //
+    // A/B pack 32 signed int4 values (range [-8,7]) as 16 bytes = 4 int32
+    // words per THREAD's tile (ne=2 per the tile<16,4,int> shape only covers
+    // half of that -- the remaining reduction depth comes from the wave-wide
+    // WMMA fabric exactly as it does for the existing iu8/fp8 overloads in
+    // this file; see the ISA doc, doc 70651, Table 41 / SS7.12).
+    template <data_layout dl_d, data_layout dl_ab>
+    static __device__ __forceinline__ void mma_iu4(
+            tile<16, 16, int, dl_d> & D, const tile<16, 4, int, dl_ab> & A, const tile<16, 4, int, dl_ab> & B) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+        using int32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
+        using int32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+        int32x8_t * acc = (int32x8_t *) D.x;
+        const int32x2_t * a_vec = (const int32x2_t *) A.x;
+        const int32x2_t * b_vec = (const int32x2_t *) B.x;
+        acc[0] = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true, a_vec[0], true, b_vec[0], acc[0], true);
+#else
+        GGML_UNUSED(D);
+        GGML_UNUSED(A);
+        GGML_UNUSED(B);
+        NO_DEVICE_CODE;
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+    }
 }
