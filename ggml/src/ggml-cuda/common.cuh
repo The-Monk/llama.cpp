@@ -929,6 +929,81 @@ static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_e4m3(float x) {
     return (uint8_t) ((sign << 7) | (e4_exp << 3) | e4_man);
 }
 
+// T97: Signed E5M2 (OCP bf8): 1 sign, 5 exp bits (bias=15), 2 mantissa bits.
+// Mirrors ggml_e5m2_to_fp32/ggml_fp32_to_e5m2 (ggml-impl.h) bit-for-bit --
+// portable software fallback, used off RDNA4 (or if GGML_CUDA_F8E5M2_HAS_NATIVE_DOT2
+// isn't defined). Unlike e4m3fn this format has real +-Inf (exp=0x1F,man=0);
+// our own quantizer never emits Inf (block scale maps amax->57344, the max
+// finite magnitude) but a value that decodes to Inf here is still handled
+// correctly (propagates as +-inf, not silently wrong).
+static __device__ __forceinline__ float ggml_cuda_e5m2_to_fp32(uint8_t x) {
+    const int sign = (x >> 7) & 1;
+    const int exp  = (x >> 2) & 0x1F;
+    const int man  = x & 0x3;
+    if (exp == 0x1F) {
+        if (man == 0) {
+            return sign ? -INFINITY : INFINITY;
+        }
+        return sign ? -NAN : NAN;
+    }
+    float raw;
+    if (exp == 0) {
+        raw = ldexpf((float) man, -16); // subnormal: man * 2^-16
+    } else {
+        raw = ldexpf(1.0f + (float) man / 4.0f, exp - 15);
+    }
+    return sign ? -raw : raw;
+}
+
+// T97: Signed E5M2 (OCP bf8) encoder -- mirrors ggml_fp32_to_e5m2 (ggml-impl.h)
+// bit-for-bit. Portable closed-form bit manipulation, no hardware fp8
+// instruction dependency (parallels ggml_cuda_fp32_to_e4m3 above).
+static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_e5m2(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    const int sign = (bits >> 31) & 1;
+
+    if (x != x) { // NaN in -> NaN out
+        return (uint8_t) ((sign << 7) | 0x7F);
+    }
+
+    float ax = fabsf(x);
+    if (!(ax > 0.0f)) {
+        return (uint8_t) (sign << 7); // +-0
+    }
+
+    memcpy(&bits, &ax, 4);
+    int fp32_exp = ((bits >> 23) & 0xFF) - 127;
+    int fp32_man = (bits >> 21) & 0x3;
+    int e5_exp   = fp32_exp + 15;
+
+    if (e5_exp <= 0) {
+        // subnormal: value = man * 2^-16, man = round(ax * 2^16)
+        int man = (int) (ax * 65536.0f + 0.5f);
+        if (man > 3) {
+            man = 3;
+        }
+        if (man < 1) {
+            return (uint8_t) (sign << 7);
+        }
+        return (uint8_t) ((sign << 7) | man);
+    }
+    if (e5_exp >= 31) {
+        return (uint8_t) ((sign << 7) | 0x7C); // overflow -> +-Inf (OCP e5m2 has real Inf)
+    }
+
+    const int round_bit = (bits >> 20) & 1;
+    int e5_man = fp32_man + round_bit;
+    if (e5_man > 3) {
+        e5_man = 0;
+        e5_exp++;
+    }
+    if (e5_exp >= 31) {
+        return (uint8_t) ((sign << 7) | 0x7C); // rounds up into +-Inf
+    }
+    return (uint8_t) ((sign << 7) | (e5_exp << 2) | e5_man);
+}
+
 // T77 (wide-SIMD decode): RDNA4 has NATIVE hardware fp8(e4m3)<->fp32 convert
 // instructions (V_CVT_F32_FP8 / V_CVT_PK_F32_FP8, ISA doc "RDNA4" Instruction
 // Set Architecture Reference Guide (70651) sec. 7.6/7.7) and a packed fp16
@@ -972,6 +1047,29 @@ static __device__ __forceinline__ float ggml_cuda_dot2_e4m3_q8(
     ggml_cuda_fp16x2_t ah = __builtin_amdgcn_cvt_pkrtz((float) a0, (float) a1);
     return __builtin_amdgcn_fdot2(wh, ah, acc, false);
 }
+
+// T97: bf8 (OCP E5M2) twin of ggml_cuda_dot2_e4m3_q8 above. RDNA4 has a
+// dedicated hardware bf8<->f32 convert instruction distinct from the fp8
+// (e4m3) one -- compile-verified (llvm-objdump --mcpu=gfx1201 on a
+// standalone HIP test kernel, T97 session):
+//   __builtin_amdgcn_cvt_f32_bf8(u32, 0)      -> v_cvt_f32_bf8_e32     (1x bf8 -> 1x f32)
+//   __builtin_amdgcn_cvt_pk_f32_bf8(u32, false) -> v_cvt_pk_f32_bf8_e32 (2x bf8 -> 2x f32)
+// Same lossless fp16-repack argument as T77 applies here: e5m2 has only 2
+// mantissa bits and int8 q8_1 activations are both exactly representable in
+// fp16's 10-bit mantissa, so this reassociates existing math rather than
+// adding quantization error. Activations stay native int8 (q8_1) -- NOT
+// requantized to bf8 -- the safer, lower-effort choice of the two viable
+// hardware paths (the alternative being a full bf8xbf8 V_DOT4 path mirroring
+// T79, which requires its own activation quantizer and its own accuracy
+// re-validation; not built here, see wiki T97 "next lever").
+static __device__ __forceinline__ float ggml_cuda_dot2_bf8_q8(
+        const uint32_t bf8_pair, const int8_t a0, const int8_t a1, const float acc) {
+    ggml_cuda_fp32x2_t wf = __builtin_amdgcn_cvt_pk_f32_bf8(bf8_pair, false);
+    ggml_cuda_fp16x2_t wh = __builtin_amdgcn_cvt_pkrtz(wf[0], wf[1]);
+    ggml_cuda_fp16x2_t ah = __builtin_amdgcn_cvt_pkrtz((float) a0, (float) a1);
+    return __builtin_amdgcn_fdot2(wh, ah, acc, false);
+}
+#define GGML_CUDA_F8E5M2_HAS_NATIVE_DOT2 1
 #endif // defined(GGML_USE_HIP) && defined(RDNA4)
 
 static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
@@ -1144,6 +1242,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_F8E4M3> {
     static constexpr int qk = QK_F8E4M3;
     static constexpr int qr = QR_F8E4M3;
     static constexpr int qi = QI_F8E4M3;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_F8E5M2> {
+    static constexpr int qk = QK_F8E5M2;
+    static constexpr int qr = QR_F8E5M2;
+    static constexpr int qi = QI_F8E5M2;
 };
 
 template<>

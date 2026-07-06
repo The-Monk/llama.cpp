@@ -17,6 +17,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
         case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
         case GGML_TYPE_F8E4M3:  return vec_dot_f8e4m3_q8_1;
+        case GGML_TYPE_F8E5M2:  return vec_dot_f8e5m2_q8_1;
         case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
@@ -47,6 +48,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
         case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
         case GGML_TYPE_F8E4M3:  return VDR_F8E4M3_Q8_1_MMVQ;
+        case GGML_TYPE_F8E5M2:  return VDR_F8E5M2_Q8_1_MMVQ;
         case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
         case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
         case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
@@ -92,6 +94,25 @@ static __device__ __forceinline__ float vec_dot_f8e4m3_f8e4m3_dispatch(
     return vec_dot_f8e4m3_f8e4m3_impl<VDR_F8E4M3_F8E4M3_MMVQ_DOT4>(vbq, bq8_1, kbx, iqs);
 }
 
+// T97: F8E5M2 decode dispatch. Deliberately mirrors T77 (hardware-dot2,
+// activations stay native int8 q8_1), NOT T79 (pure bf8xbf8 V_DOT4) -- the
+// dot4 path would require its own online bf8 activation quantizer (a new
+// quantize.cu kernel) and its own accuracy re-validation (e5m2 activations
+// have only 2 mantissa bits, so the quantization error would likely be
+// larger than T79's already-disclosed +1.2-1.5% e4m3-activation hit). Given
+// the doctrine for this type (correctness + completeness gate, not required
+// to beat E4M3's speed), the lower-risk int8-activation hardware-dot2 path
+// is the right default; a future bf8xbf8 dot4 path is a valid next lever
+// (see wiki T97), not built this session.
+// VDR value inherited from T77's e4m3 finding (8), NOT independently swept
+// for bf8 -- flag this if it ever becomes the speed-critical path.
+#define VDR_F8E5M2_Q8_1_MMVQ_SIMD 8
+
+static __device__ __forceinline__ float vec_dot_f8e5m2_q8_1_simd_dispatch(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_f8e5m2_q8_1_simd_impl<VDR_F8E5M2_Q8_1_MMVQ_SIMD>(vbq, bq8_1, kbx, iqs);
+}
+
 // T73 (small-batch decode fix): F8E4M3-only, batch-size-aware VDR/vec_dot
 // selection, used ONLY by the main mul_mat_vec_q kernel (ncols_dst is a real
 // compile-time template parameter there, so this is a free, zero-runtime-
@@ -119,6 +140,13 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_decode(ggml_type
     if (type == GGML_TYPE_F8E4M3) {
         return vec_dot_f8e4m3_f8e4m3_dispatch;
     }
+    // T97: unconditional dispatch, same as F8E4M3 above -- the fallback to
+    // the portable scalar impl lives INSIDE vec_dot_f8e5m2_q8_1_simd_impl
+    // (vecdotq.cuh, #if defined(GGML_CUDA_F8E5M2_HAS_NATIVE_DOT2)/#else), not
+    // here, so this stays correct even on non-RDNA4 HIP/CUDA/MUSA builds.
+    if (type == GGML_TYPE_F8E5M2) {
+        return vec_dot_f8e5m2_q8_1_simd_dispatch;
+    }
     GGML_UNUSED(ncols_dst);
     return get_vec_dot_q_cuda(type);
 }
@@ -126,6 +154,9 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_decode(ggml_type
 static constexpr __host__ __device__ int get_vdr_mmvq_decode(ggml_type type, int ncols_dst) {
     if (type == GGML_TYPE_F8E4M3) {
         return VDR_F8E4M3_F8E4M3_MMVQ_DOT4;
+    }
+    if (type == GGML_TYPE_F8E5M2) {
+        return VDR_F8E5M2_Q8_1_MMVQ_SIMD;
     }
     GGML_UNUSED(ncols_dst);
     return get_vdr_mmvq(type);
@@ -334,6 +365,11 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     if (type == GGML_TYPE_F8E4M3) {
         return GGML_CUDA_CC_IS_AMD(cc) && GGML_CUDA_CC_IS_RDNA4(cc) ? MMVQ_MAX_BATCH_SIZE : 0;
     }
+    // T97: same reasoning as F8E4M3 above -- no MoE F8E5M2 model exists to
+    // validate against, keep MUL_MAT_ID on the dequant fallback.
+    if (type == GGML_TYPE_F8E5M2) {
+        return 0;
+    }
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
@@ -380,6 +416,15 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     // prefill path is RDNA4-gated) -- keep other archs on the Phase 1a
     // dequant fallback until that's validated too.
     if (type == GGML_TYPE_F8E4M3) {
+        return GGML_CUDA_CC_IS_RDNA4(cc) && ne11 <= MMVQ_MAX_BATCH_SIZE;
+    }
+    // T97: same RDNA4-only gate as F8E4M3 above -- no F8E5M2 tensors are
+    // produced/loaded off gfx1201 today (this type has no WMMA/mmq prefill
+    // kernel at all yet, unlike F8E4M3's Phase 1b -- prefill for F8E5M2
+    // correctly falls back to the generic cuBLAS dequant path,
+    // ggml_cuda_op_mul_mat_cublas via ggml_get_to_fp16_cuda, whenever mmvq
+    // isn't applicable, e.g. ne11 > MMVQ_MAX_BATCH_SIZE).
+    if (type == GGML_TYPE_F8E5M2) {
         return GGML_CUDA_CC_IS_RDNA4(cc) && ne11 <= MMVQ_MAX_BATCH_SIZE;
     }
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -495,6 +540,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_Q5_1:
                 case GGML_TYPE_Q8_0:
                 case GGML_TYPE_F8E4M3:
+                case GGML_TYPE_F8E5M2:
                 case GGML_TYPE_Q2_K:
                 case GGML_TYPE_Q4_K:
                 case GGML_TYPE_Q5_K:
@@ -1163,6 +1209,12 @@ static void mul_mat_vec_q_switch_type(
             break;
         case GGML_TYPE_F8E4M3:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_F8E4M3>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_F8E5M2:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_F8E5M2>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);

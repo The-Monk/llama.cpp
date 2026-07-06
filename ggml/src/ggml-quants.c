@@ -651,6 +651,49 @@ void dequantize_row_f8e4m3(const block_f8e4m3 * GGML_RESTRICT x, float * GGML_RE
     }
 }
 
+// T97: reference implementation for deterministic creation of model files
+void quantize_row_f8e5m2_ref(const float * GGML_RESTRICT x, block_f8e5m2 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_F8E5M2;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            amax = MAX(amax, fabsf(v));
+        }
+
+        // e5m2 max finite magnitude is 57344; scale so the block's amax maps onto it
+        const float d = amax / 57344.0f;
+        const float id = d ? 1.0f/d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        for (int j = 0; j < qk; ++j) {
+            const float x0 = x[i*qk + j]*id;
+            y[i].qs[j] = ggml_fp32_to_e5m2(x0);
+        }
+    }
+}
+
+void dequantize_row_f8e5m2(const block_f8e5m2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_F8E5M2;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = ggml_e5m2_to_fp32(x[i].qs[j]) * d;
+        }
+    }
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
@@ -2341,6 +2384,12 @@ size_t quantize_f8e4m3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
     GGML_UNUSED(quant_weights);
     quantize_row_f8e4m3_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_F8E4M3, n_per_row);
+}
+
+size_t quantize_f8e5m2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_f8e5m2_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_F8E5M2, n_per_row);
 }
 
 // ====================== Ternary (de)-quantization (BitNet b1.58 and TriLMs)
@@ -5588,6 +5637,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_F8E4M3:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_f8e4m3, data, nb);
+            } break;
+        case GGML_TYPE_F8E5M2:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_f8e5m2, data, nb);
             } break;
         case GGML_TYPE_MXFP4:
             {
