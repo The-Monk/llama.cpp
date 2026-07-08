@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 #include <utility>
+#include <thread>
+#include <cstdlib>
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
@@ -158,8 +160,114 @@ int main(int argc, char ** argv) {
 
     const auto t_enc_end = ggml_time_us();
 
+    // T112: async overlap of target-verify and draft-reeval on separate streams.
+    // These two llama_decode calls consume the same batch_tgt but are mutually
+    // independent (distinct contexts, neither reads the other's output; the accept
+    // step reads only ctx_tgt). Running them concurrently on their per-context
+    // non-blocking CUDA streams hides the smaller draft-reeval behind the target
+    // verify. Gated by env so a single binary can A/B sequential vs async.
+    // 0 = sequential baseline, 1 = overlap verify||reeval, 2 = pipeline (draft-gen[N+1] || verify[N])
+    const int spec_mode = [] {
+        const char * e = getenv("LLAMA_SPEC_ASYNC");
+        return e ? atoi(e) : 0;
+    }();
+    LOG_INF("T112 spec-async mode: %d (%s)\n", spec_mode,
+            spec_mode == 2 ? "PIPELINE" : spec_mode == 1 ? "verify||reeval" : "sequential");
+
     const auto t_dec_start = ggml_time_us();
 
+    if (spec_mode == 2) {
+        // ===== T112 PIPELINE: overlap draft-gen[N+1] (ctx_dft) with verify[N] (ctx_tgt) =====
+        // The draft over-generates by one: the extra token is a *guess* for the target's bonus
+        // token. Block N is kept in ctx_dft KV, so while the target verifies block N the draft
+        // speculatively generates block N+1 seeded from that bonus-guess at its confirmed
+        // position. On a hit (full accept && bonus == guess) ctx_dft KV already equals the
+        // confirmed state -> reuse it, no reeval. On a miss, roll ctx_dft/ctx_tgt back to the
+        // confirmed prefix and regenerate. Output is identical to sequential in every case.
+        // Only needs suffix seq_rm (always available), not FULL-checkpoint support.
+
+        auto gen = [&](llama_token seed, int past, llama_tokens & out) {
+            out.clear();
+            common_speculative_get_draft_params(spec, seq_id) = {
+                /* .drafting = */ true,
+                /* .n_max    = */ -1,
+                /* .n_past   = */ past,
+                /* .id_last  = */ seed,
+                /* .prompt   = */ &prompt_tgt,
+                /* .result   = */ &out,
+            };
+            common_speculative_draft(spec);
+        };
+        auto split_guess = [](llama_tokens & blk) -> llama_token {
+            if ((int) blk.size() >= 2) { llama_token g = blk.back(); blk.pop_back(); return g; }
+            return LLAMA_TOKEN_NULL;
+        };
+        auto trim = [&](llama_context * c, int pos) {
+            llama_memory_seq_rm(llama_get_memory(c), seq_id, pos, -1);
+        };
+
+        // block 0 (sequential; nothing to overlap yet). Keep its ctx_dft KV.
+        gen(id_last, n_past, draft);
+        llama_token bonus_guess = split_guess(draft);
+
+        while (true) {
+            const int p0 = n_past;
+
+            common_batch_clear(batch_tgt);
+            common_batch_add(batch_tgt, id_last, p0, { seq_id }, true);
+            for (size_t i = 0; i < draft.size(); ++i) {
+                common_batch_add(batch_tgt, draft[i], p0 + 1 + (int) i, { seq_id }, true);
+            }
+
+            const int  spec_past = p0 + (int) draft.size() + 1;   // the bonus position
+            const bool can_spec  = (bonus_guess != LLAMA_TOKEN_NULL) && !draft.empty();
+
+            llama_tokens spec_next;
+            std::thread th_dft;
+            if (can_spec) {
+                th_dft = std::thread([&] { gen(bonus_guess, spec_past, spec_next); });
+            }
+            llama_decode(ctx_tgt, batch_tgt);
+            if (can_spec) th_dft.join();
+
+            auto ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
+            GGML_ASSERT(ids.size() > 0);
+
+            const bool         full_accept = (ids.size() - 1 == draft.size());
+            const llama_token  bonus       = ids.back();
+            const bool         hit         = full_accept && can_spec && (bonus == bonus_guess);
+
+            common_speculative_accept(spec, seq_id, ids.size() - 1);
+
+            bool stop = false;
+            for (size_t i = 0; i < ids.size(); ++i) {
+                prompt_tgt.push_back(id_last);
+                id_last = ids[i];
+                if (llama_vocab_is_eog(vocab, id_last)) { has_eos = true; stop = true; break; }
+                LOG("%s", common_token_to_piece(ctx_tgt, id_last).c_str());
+            }
+            n_past    += (int) ids.size();
+            n_drafted += (int) draft.size();
+            n_accept  += (int) ids.size() - 1;
+            n_predict += (int) ids.size();
+
+            trim(ctx_tgt, n_past);   // drop any rejected verify positions
+
+            if (stop || (params.n_predict >= 0 && n_predict > params.n_predict)) break;
+
+            if (hit) {
+                // ctx_dft already holds block N+1 (+ its bonus guess) at confirmed positions.
+                draft = std::move(spec_next);
+                bonus_guess = split_guess(draft);
+            } else {
+                // miss/partial: discard the speculative draft, roll ctx_dft back to the
+                // confirmed prefix, and regenerate the next block from the true id_last.
+                trim(ctx_dft.get(), n_past);
+                gen(id_last, n_past, draft);
+                bonus_guess = split_guess(draft);
+            }
+        }
+    } else
     while (true) {
         // generate or reuse draft tokens
         //
@@ -216,20 +324,27 @@ int main(int argc, char ** argv) {
         common_batch_clear(batch_tgt);
         common_batch_add  (batch_tgt, id_last, n_past++, { seq_id }, true);
 
-        // evaluate the target model on [id_last, draft0, draft1, ..., draftN-1]
-        {
-            for (size_t i = 0; i < draft.size(); ++i) {
-                common_batch_add(batch_tgt, draft[i], n_past + i, { seq_id }, true);
-            }
-
-            //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
-
-            llama_decode(ctx_tgt, batch_tgt);
+        // build the verify batch: [id_last, draft0, draft1, ..., draftN-1]
+        for (size_t i = 0; i < draft.size(); ++i) {
+            common_batch_add(batch_tgt, draft[i], n_past + i, { seq_id }, true);
         }
 
-        // evaluate the same batch with the draft model
-        {
-            // TODO: extend to support MTP, Eagle, etc. See server code for reference
+        //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
+
+        if (spec_mode == 1) {
+            // T112: run draft-reeval concurrently with target-verify on a separate
+            // thread → separate per-context stream → GPU overlaps the two graphs.
+            // batch_tgt is read-only to both decodes, so shared access is safe.
+            std::thread th_dft([&] {
+                // NOTE: extend to support MTP, Eagle, etc. See server code for reference
+                llama_decode(ctx_dft.get(), batch_tgt);
+            });
+            llama_decode(ctx_tgt, batch_tgt);
+            th_dft.join();
+        } else {
+            // evaluate the target model, then the draft model (sequential baseline)
+            llama_decode(ctx_tgt, batch_tgt);
+            // NOTE: extend to support MTP, Eagle, etc. See server code for reference
             llama_decode(ctx_dft.get(), batch_tgt);
         }
 
