@@ -360,8 +360,16 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     // before calling ggml_cuda_mul_mat_vec_q, unlike the dense MUL_MAT path
     // where ggml_cuda_should_use_mmvq() itself gates on GGML_CUDA_CC_IS_RDNA4
     // before that function is ever invoked -- so the gate has to live here.
-    // Cap = MMVQ_MAX_BATCH_SIZE (no per-type tuning entry yet, that's a
-    // Phase-2/perf sweep, not a completeness requirement).
+    // Cap = MMVQ_MAX_BATCH_SIZE. Phase-2 perf sweep DONE (2026-07-10): the flat
+    // cap is CONFIRMED correct on RDNA4 (gfx1201) for F8E4M3 MoE -- drift-
+    // controlled interleaved A/B on Qwen3.6-35B-A3B-F8E4M3, mmvq(dp4a) beats
+    // mmq(WMMA) at M=8 by ~8% (257 vs 238 t/s, 4/4 pairs). Crossover is >8 (same
+    // as the dense path, measured 1-16), so mmvq for M<=8 / mmq for M>8 is
+    // optimal; no per-type lowering needed. NOTE: MoE tokens scatter across
+    // experts under top-k routing at small M, so no cache reuse -> bandwidth-
+    // bound like dense -> the crossover does NOT slide below 8 as cache-residency
+    // alone would suggest. (Interleaving is required to measure this: separate
+    // 2-GPU tensor-split invocations jitter +/-30% and gave a false WMMA-wins-at-8.)
     if (type == GGML_TYPE_F8E4M3) {
         return GGML_CUDA_CC_IS_AMD(cc) && GGML_CUDA_CC_IS_RDNA4(cc) ? MMVQ_MAX_BATCH_SIZE : 0;
     }
