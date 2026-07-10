@@ -610,7 +610,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
         switch (ncols_dst) {
             case 1:
@@ -628,8 +628,20 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
         }
     }
     if (table_id == MMVQ_PARAMETERS_RDNA4) {
-        // EXP2: 2 rows/block for decode (ncols_dst==1) -> more independent weight loads in flight (MLP).
-        return ncols_dst == 1 ? 2 : 1;
+        if (ncols_dst == 1) {
+            // Quant-aware rows/block for decode (gfx1201). Decode is memory-bound; rows/block sets
+            // the number of independent weight-row load streams per block (memory-level parallelism),
+            // but the concurrent rows are row_stride bytes apart, so the choice also interacts with
+            // GDDR6 channel aliasing. Measured 2026-07-10:
+            //   fp8 (8-bit, ~4x the per-row byte stride): rpb=3 = +6.5% over rpb=2 (UMC 75% vs 70%).
+            //   Q2_0 (2-bit, tiny stride): rpb=2 optimal; rpb=4 channel-aliases (-13.4% pothole).
+            // Split fp8 -> 3; everything else keeps the validated 2.
+            if (type == GGML_TYPE_F8E4M3 || type == GGML_TYPE_F8E5M2) {
+                return 3;
+            }
+            return 2;
+        }
+        return 1;
     }
     return 1;
 }
@@ -653,7 +665,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq_decode(type, ncols_dst); // T73: F8E4M3 batch-aware (see def)
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda_decode(type, ncols_dst); // T73
@@ -932,7 +944,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
