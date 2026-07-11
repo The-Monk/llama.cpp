@@ -5717,6 +5717,16 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp4, data, nb);
             } break;
+        case GGML_TYPE_MXFP8:
+            {
+                // Same e8m0 shared-scale validation as MXFP4 -- block_mxfp8's
+                // scale field is also named `e`, so the macro applies unchanged.
+                // The e4m3 qs[] bytes need no separate validation (unlike
+                // block_f8e4m3's fp16 `d`, e4m3 payload bytes have no NaN/Inf
+                // encoding relevant here -- same rationale NVFP4 documents above
+                // for its own uint8 payload).
+                VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp8, data, nb);
+            } break;
         case GGML_TYPE_NVFP4:
             {
                 // UE4M3 scales are uint8_t — all byte values are valid

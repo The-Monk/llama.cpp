@@ -157,6 +157,9 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_F8E4M3        = 41, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_F8E5M2        = 42, // except 1d tensors (T97)
+        // NOTE: 43 (LLAMA_FTYPE_MOSTLY_2OF4_FP8) claimed on roc8-sparse-fp8 (not yet
+        // merged) -- MXFP8 skips it and takes 44, same rationale as GGML_TYPE_MXFP8.
+        LLAMA_FTYPE_MOSTLY_MXFP8         = 44, // except 1d tensors (ROC8)
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
