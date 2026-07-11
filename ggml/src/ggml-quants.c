@@ -651,6 +651,107 @@ void dequantize_row_f8e4m3(const block_f8e4m3 * GGML_RESTRICT x, float * GGML_RE
     }
 }
 
+// RDNA4 2:4-structured-sparse SWMMAC driver-completeness run: per 4-element
+// group, keep the (up to) 2 largest-magnitude values (ties broken by lower
+// index winning "first"), record their in-group positions (idx0 < idx1) as
+// 2-bit metadata, and e4m3-encode just the 16 kept values under one
+// per-block (32-elem) scale. Groups with <2 nonzero values still emit a
+// valid (idx0,idx1) pair (default 0,1) with 0.0 e4m3-encoded (exact) at
+// whichever of those positions is actually zero -- the sparse format always
+// carries exactly 2 kept slots per group of 4, by hardware contract.
+// Groups with >2 nonzero values (not cleanly 2:4 -- see
+// tensor_is_2of4_sparse() in llama-quant.cpp, which gates which tensors
+// reach this quantizer at all) silently drop the smallest-magnitude extras;
+// this is a lossy fallback for the rare non-conforming group, not the
+// common case.
+void quantize_row_2of4_fp8_ref(const float * GGML_RESTRICT x, block_2of4_fp8 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_2OF4_FP8;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float   kept_vals[QK_2OF4_FP8/2];
+        uint8_t idx0[QK_2OF4_FP8/4];
+        uint8_t idx1[QK_2OF4_FP8/4];
+
+        for (int g = 0; g < QK_2OF4_FP8/4; ++g) {
+            const float * grp = x + i*qk + g*4;
+
+            int   best0 = -1, best1 = -1;
+            float best0v = -1.0f, best1v = -1.0f;
+            for (int j = 0; j < 4; ++j) {
+                const float av = fabsf(grp[j]);
+                if (av > best0v) {
+                    best1v = best0v; best1 = best0;
+                    best0v = av;     best0 = j;
+                } else if (av > best1v) {
+                    best1v = av; best1 = j;
+                }
+            }
+            if (best0 < 0) { best0 = 0; }
+            if (best1 < 0) { best1 = (best0 == 0) ? 1 : 0; }
+
+            const int lo = best0 < best1 ? best0 : best1;
+            const int hi = best0 < best1 ? best1 : best0;
+
+            idx0[g] = (uint8_t) lo;
+            idx1[g] = (uint8_t) hi;
+            kept_vals[2*g + 0] = grp[lo];
+            kept_vals[2*g + 1] = grp[hi];
+        }
+
+        float amax = 0.0f;
+        for (int j = 0; j < QK_2OF4_FP8/2; ++j) {
+            amax = MAX(amax, fabsf(kept_vals[j]));
+        }
+
+        // e4m3 max finite magnitude is 448; scale so the block's amax maps onto it
+        const float d  = amax / 448.0f;
+        const float id = d ? 1.0f/d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        for (int j = 0; j < QK_2OF4_FP8/2; ++j) {
+            y[i].qs[j] = ggml_fp32_to_e4m3(kept_vals[j]*id);
+        }
+
+        for (int g = 0; g < QK_2OF4_FP8/4; ++g) {
+            const uint8_t nib = (uint8_t) ((idx0[g] & 0x3) | ((idx1[g] & 0x3) << 2));
+            if ((g & 1) == 0) {
+                y[i].meta[g/2] = nib;
+            } else {
+                y[i].meta[g/2] = (uint8_t) (y[i].meta[g/2] | (nib << 4));
+            }
+        }
+    }
+}
+
+void dequantize_row_2of4_fp8(const block_2of4_fp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_2OF4_FP8;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = 0.0f;
+        }
+
+        for (int g = 0; g < QK_2OF4_FP8/4; ++g) {
+            const uint8_t byte = x[i].meta[g/2];
+            const uint8_t nib  = ((g & 1) == 0) ? (uint8_t) (byte & 0x0F) : (uint8_t) (byte >> 4);
+            const int idx0 = nib & 0x3;
+            const int idx1 = (nib >> 2) & 0x3;
+
+            y[i*qk + g*4 + idx0] = ggml_e4m3_to_fp32(x[i].qs[2*g + 0]) * d;
+            y[i*qk + g*4 + idx1] = ggml_e4m3_to_fp32(x[i].qs[2*g + 1]) * d;
+        }
+    }
+}
+
 // T97: reference implementation for deterministic creation of model files
 void quantize_row_f8e5m2_ref(const float * GGML_RESTRICT x, block_f8e5m2 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_F8E5M2;
@@ -2390,6 +2491,12 @@ size_t quantize_f8e5m2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
     GGML_UNUSED(quant_weights);
     quantize_row_f8e5m2_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_F8E5M2, n_per_row);
+}
+
+size_t quantize_2of4_fp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_2of4_fp8_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_2OF4_FP8, n_per_row);
 }
 
 // ====================== Ternary (de)-quantization (BitNet b1.58 and TriLMs)
@@ -5641,6 +5748,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_F8E5M2:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_f8e5m2, data, nb);
+            } break;
+        case GGML_TYPE_2OF4_FP8:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_2of4_fp8, data, nb);
             } break;
         case GGML_TYPE_MXFP4:
             {
