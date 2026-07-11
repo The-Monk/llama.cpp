@@ -591,7 +591,12 @@ void quantize_mmq_f8e4m3_cuda(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
-    GGML_ASSERT(type_src0 == GGML_TYPE_F8E4M3);
+    // ROC8: MXFP8's WMMA fragment is the same fp8xfp8 shape as F8E4M3 (raw
+    // e4m3 weight bytes; only the weight-side SCALE representation differs,
+    // irrelevant here since this quantizer only touches the activation/src1
+    // side) -- broadened to accept both types, see the mmq.cu call-site
+    // comment for the correctness-coupling note.
+    GGML_ASSERT(type_src0 == GGML_TYPE_F8E4M3 || type_src0 == GGML_TYPE_MXFP8);
     GGML_ASSERT(ne00 % 4 == 0);
     GGML_ASSERT(ne0 % (4*QK8_1) == 0);
 

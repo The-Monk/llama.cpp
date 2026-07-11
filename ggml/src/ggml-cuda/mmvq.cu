@@ -18,6 +18,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
         case GGML_TYPE_F8E4M3:  return vec_dot_f8e4m3_q8_1;
         case GGML_TYPE_F8E5M2:  return vec_dot_f8e5m2_q8_1;
+        case GGML_TYPE_MXFP8:   return vec_dot_mxfp8_q8_1;
         case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
@@ -49,6 +50,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
         case GGML_TYPE_F8E4M3:  return VDR_F8E4M3_Q8_1_MMVQ;
         case GGML_TYPE_F8E5M2:  return VDR_F8E5M2_Q8_1_MMVQ;
+        case GGML_TYPE_MXFP8:   return VDR_MXFP8_Q8_1_MMVQ;
         case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
         case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
         case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
@@ -378,6 +380,12 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     if (type == GGML_TYPE_F8E5M2) {
         return 0;
     }
+    // ROC8: Qwen3.6-27B-MXFP8-MTP (the validated target model) is dense, not
+    // MoE -- no MUL_MAT_ID path exists to test against, same conservative
+    // "keep on the dequant fallback" stance as F8E5M2 above.
+    if (type == GGML_TYPE_MXFP8) {
+        return 0;
+    }
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
@@ -433,6 +441,14 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     // ggml_cuda_op_mul_mat_cublas via ggml_get_to_fp16_cuda, whenever mmvq
     // isn't applicable, e.g. ne11 > MMVQ_MAX_BATCH_SIZE).
     if (type == GGML_TYPE_F8E5M2) {
+        return GGML_CUDA_CC_IS_RDNA4(cc) && ne11 <= MMVQ_MAX_BATCH_SIZE;
+    }
+    // ROC8: MXFP8 decode kernel (vec_dot_mxfp8_q8_1, vecdotq.cuh) is portable
+    // (software e4m3/e8m0 decode, no HW dependency), but -- same rationale as
+    // F8E4M3/F8E5M2 above -- MXFP8 tensors are only produced/loaded for
+    // gfx1201 today (the WMMA prefill path below is RDNA4-gated), so keep
+    // other archs on the dequant fallback until validated there too.
+    if (type == GGML_TYPE_MXFP8) {
         return GGML_CUDA_CC_IS_RDNA4(cc) && ne11 <= MMVQ_MAX_BATCH_SIZE;
     }
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -549,6 +565,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_Q8_0:
                 case GGML_TYPE_F8E4M3:
                 case GGML_TYPE_F8E5M2:
+                case GGML_TYPE_MXFP8:
                 case GGML_TYPE_Q2_K:
                 case GGML_TYPE_Q4_K:
                 case GGML_TYPE_Q5_K:
@@ -1235,6 +1252,12 @@ static void mul_mat_vec_q_switch_type(
             break;
         case GGML_TYPE_F8E5M2:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_F8E5M2>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_MXFP8:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_MXFP8>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);

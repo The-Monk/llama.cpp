@@ -38,6 +38,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_F8E5M2:
             mul_mat_q_case<GGML_TYPE_F8E5M2>(ctx, args, stream);
             break;
+        case GGML_TYPE_MXFP8:
+            mul_mat_q_case<GGML_TYPE_MXFP8>(ctx, args, stream);
+            break;
         case GGML_TYPE_Q2_K:
             mul_mat_q_case<GGML_TYPE_Q2_K>(ctx, args, stream);
             break;
@@ -136,7 +139,13 @@ void ggml_cuda_mul_mat_q(
     // activation (src1) must also be quantized to e4m3, not int8 Q8_1. The
     // output container is still block_q8_1_mmq-shaped (same byte size/stride
     // math below is unaffected), only the kernel that fills it differs.
-    const bool use_native_f8e4m3 = src0->type == GGML_TYPE_F8E4M3;
+    // ROC8: MXFP8's WMMA fragment is the SAME fp8xfp8 shape (its weight bytes
+    // are raw e4m3, identical to F8E4M3 -- only the per-block SCALE source
+    // differs, which lives entirely on the weight/x side, not here) -- so it
+    // reuses this exact activation quantizer unchanged. quantize_mmq_f8e4m3's
+    // own GGML_ASSERT(type_src0 == ...) was broadened to accept MXFP8 too
+    // (quantize.cu) -- the two changes are correctness-coupled.
+    const bool use_native_f8e4m3 = src0->type == GGML_TYPE_F8E4M3 || src0->type == GGML_TYPE_MXFP8;
     // T97: same rationale as F8E4M3 above -- the bf8xbf8 WMMA fragment needs
     // src1 quantized to native e5m2, not int8 Q8_1.
     const bool use_native_f8e5m2 = src0->type == GGML_TYPE_F8E5M2;
@@ -325,6 +334,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_F8E4M3:
         case GGML_TYPE_F8E5M2:
+        case GGML_TYPE_MXFP8:
             mmq_supported = true;
             break;
         default:
@@ -362,6 +372,15 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     // hardware-dot2 mmvq decode path; everything above that falls through to
     // this WMMA prefill path).
     if (type == GGML_TYPE_F8E5M2) {
+        return GGML_CUDA_CC_IS_RDNA4(cc);
+    }
+
+    // ROC8: MXFP8 native fp8 WMMA prefill -- same RDNA4-only gate, no dp4a
+    // fallback (vec_dot_mxfp8_mxfp8_dp4a, mmq.cuh), same decode/prefill split
+    // as F8E4M3 (should_use_mmvq(MXFP8) routes ne11<=8 to the mmvq decode
+    // kernel; everything above that batch size falls through to this WMMA
+    // prefill path).
+    if (type == GGML_TYPE_MXFP8) {
         return GGML_CUDA_CC_IS_RDNA4(cc);
     }
 

@@ -694,6 +694,71 @@ void dequantize_row_f8e5m2(const block_f8e5m2 * GGML_RESTRICT x, float * GGML_RE
     }
 }
 
+// MXFP8 (ROC8): reference implementation for deterministic creation of model
+// files. Mechanical mirror of quantize_row_f8e4m3_ref -- only the scale is
+// different: OCP MX's shared per-block scale is UE8M0 (unsigned 8-bit
+// power-of-2, biased-127), NOT a continuous fp16 delta, so amax is rounded UP
+// to the nearest representable power-of-two exponent that keeps qs within
+// e4m3's finite range (448), rather than mapped exactly like f8e4m3's `d`.
+// This mirrors the real mx.quantize convention (MLX/OCP MX spec): the shared
+// scale is chosen so shifted values are anywhere in-range, never so it
+// exactly saturates amax to 448 (that would require a non-power-of-2 scale).
+void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP8;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            amax = MAX(amax, fabsf(v));
+        }
+
+        // Choose the smallest power-of-two scale d = 2^e such that amax/d <= 448
+        // (e4m3 max finite magnitude), i.e. e = ceil(log2(amax/448)), clamped to
+        // the UE8M0 exponent range [0, 254] (bias 127 -> real exponent [-127, 127]).
+        uint8_t e = 0;
+        float d = 1.0f; // 2^(0-127) folded in below via ggml_e8m0_to_fp32
+        if (amax > 0.0f) {
+            int exp2;
+            const float mant = frexpf(amax / 448.0f, &exp2); // amax/448 = mant * 2^exp2, mant in [0.5,1)
+            // mant == 0.5 exactly means amax/448 is itself already a power of two --
+            // no need to round up a further step (exp2-1 already satisfies amax/d<=448).
+            int biased = (mant <= 0.5f) ? (exp2 - 1 + 127) : (exp2 + 127);
+            if (biased < 0)   biased = 0;
+            if (biased > 254) biased = 254; // keep 0xFF free (not used as a scale value here)
+            e = (uint8_t) biased;
+            d = ggml_e8m0_to_fp32(e);
+        }
+        const float id = d ? 1.0f/d : 0.0f;
+
+        y[i].e = e;
+
+        for (int j = 0; j < qk; ++j) {
+            const float x0 = x[i*qk + j]*id;
+            y[i].qs[j] = ggml_fp32_to_e4m3(x0);
+        }
+    }
+}
+
+void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP8;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_e8m0_to_fp32(x[i].e);
+
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = ggml_e4m3_to_fp32(x[i].qs[j]) * d;
+        }
+    }
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
@@ -2390,6 +2455,12 @@ size_t quantize_f8e5m2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
     GGML_UNUSED(quant_weights);
     quantize_row_f8e5m2_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_F8E5M2, n_per_row);
+}
+
+size_t quantize_mxfp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_mxfp8_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_MXFP8, n_per_row);
 }
 
 // ====================== Ternary (de)-quantization (BitNet b1.58 and TriLMs)

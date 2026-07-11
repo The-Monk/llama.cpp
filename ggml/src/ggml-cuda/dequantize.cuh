@@ -133,3 +133,15 @@ static __device__ __forceinline__ void dequantize_f8e5m2(const void * vx, const 
     v.x = ggml_cuda_e5m2_to_fp32(x[ib].qs[iqs + 0]) * d;
     v.y = ggml_cuda_e5m2_to_fp32(x[ib].qs[iqs + 1]) * d;
 }
+
+// MXFP8 (ROC8): mechanical mirror of dequantize_f8e4m3 above -- same e4m3 leaf
+// decode, only the scale source differs (shared e8m0 byte, not a per-block
+// fp16 half).
+static __device__ __forceinline__ void dequantize_mxfp8(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_mxfp8 * x = (const block_mxfp8 *) vx;
+
+    const float d = ggml_cuda_e8m0_to_fp32(x[ib].e);
+
+    v.x = ggml_cuda_e4m3_to_fp32(x[ib].qs[iqs + 0]) * d;
+    v.y = ggml_cuda_e4m3_to_fp32(x[ib].qs[iqs + 1]) * d;
+}
