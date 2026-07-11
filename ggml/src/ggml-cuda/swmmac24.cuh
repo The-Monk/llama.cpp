@@ -33,7 +33,20 @@
 #include <cstdint>
 #include <vector>
 
-#if defined(GGML_USE_HIP) && defined(RDNA4)
+// T122 fix: this header used to be gated `defined(GGML_USE_HIP) && defined(RDNA4)`
+// in its entirety. `RDNA4` (== `__GFX12__`) is only ever predefined during
+// HIP-clang's DEVICE compilation pass for a gfx12 offload target -- it is
+// NEVER defined during the HOST pass. Since swmmac24.cu's HOST-side trial
+// code (`test_iu4_swmmac_24`/`test_fp8_swmmac_24`) needs the `Loc` type, the
+// per-lane layout functions, and `swmmac24_put_bits` too, wrapping all of it
+// in an `RDNA4`-only guard meant NONE of it was ever visible to the host
+// pass -- the only thing that *could* compile in the host pass was the
+// vacuous `#else` stub in swmmac24.cu. Fix: gate this header on
+// `GGML_USE_HIP` only (true in both passes); the two `__global__` kernels'
+// actual hardware-instruction calls (device-pass-only, gfx12-only) get their
+// own inner `RDNA4` guard below, following the same convention used
+// throughout mma.cuh/common.cuh for arch-gated builtins.
+#if defined(GGML_USE_HIP)
 
 namespace ggml_cuda_swmmac24 {
 
@@ -102,21 +115,43 @@ static inline void swmmac24_put_bits(std::vector<std::vector<uint32_t>>& regs, c
 // 32 threads in a single wave32 launch supplies exactly the registers the ISA doc
 // says that lane should hold).
 // ---------------------------------------------------------------------------
-__global__ void k_swmmac_iu4_24_perlane(const int * __restrict__ a, const v2i * __restrict__ b,
+static __global__ void k_swmmac_iu4_24_perlane(const int * __restrict__ a, const v2i * __restrict__ b,
                                          const unsigned * __restrict__ idx, v8i * __restrict__ dout) {
+#if defined(RDNA4)
     v8i c = {0,0,0,0,0,0,0,0};
     dout[threadIdx.x] = __builtin_amdgcn_swmmac_i32_16x16x32_iu4_w32(1, a[threadIdx.x], 1, b[threadIdx.x], c, idx[threadIdx.x], 0);
+#else
+    // Host pass / non-RDNA4 device pass: the V_SWMMAC_I32_16X16X32_IU4
+    // instruction this targets doesn't exist here. Never actually launched
+    // off RDNA4 (ggml_cuda_swmmac24_selftest() runtime-gates on cc first).
+    GGML_UNUSED(a);
+    GGML_UNUSED(b);
+    GGML_UNUSED(idx);
+    GGML_UNUSED(dout);
+    NO_DEVICE_CODE;
+#endif // defined(RDNA4)
 }
 
-__global__ void k_swmmac_fp8_24_perlane(const v2i * __restrict__ a, const v4i * __restrict__ b,
+static __global__ void k_swmmac_fp8_24_perlane(const v2i * __restrict__ a, const v4i * __restrict__ b,
                                          const unsigned * __restrict__ idx, v8f * __restrict__ dout) {
+#if defined(RDNA4)
     v8f c = {0,0,0,0,0,0,0,0};
     dout[threadIdx.x] = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(a[threadIdx.x], b[threadIdx.x], c, idx[threadIdx.x]);
+#else
+    // Host pass / non-RDNA4 device pass: the V_SWMMAC_F32_16X16X32_FP8_FP8
+    // instruction this targets doesn't exist here. Never actually launched
+    // off RDNA4 (ggml_cuda_swmmac24_selftest() runtime-gates on cc first).
+    GGML_UNUSED(a);
+    GGML_UNUSED(b);
+    GGML_UNUSED(idx);
+    GGML_UNUSED(dout);
+    NO_DEVICE_CODE;
+#endif // defined(RDNA4)
 }
 
 } // namespace ggml_cuda_swmmac24
 
-#endif // defined(GGML_USE_HIP) && defined(RDNA4)
+#endif // defined(GGML_USE_HIP)
 
 // Reachable regardless of arch (no-op / not-applicable off RDNA4): returns true if
 // either (a) not RDNA4 (nothing to test, vacuously fine) or (b) RDNA4 and the
