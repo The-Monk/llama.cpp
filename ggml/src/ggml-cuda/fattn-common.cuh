@@ -695,9 +695,17 @@ static __device__ __forceinline__ void dequantize_V_f8e4m3(const void * __restri
 
 #pragma unroll
         for (int l0 = 0; l0 < ne; l0 += 2) {
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+            // decode 2 e4m3 -> 2 f32 with one hw instruction (v_cvt_pk_f32_fp8),
+            // vs 2x the ~15-op software e4m3 decoder. fp8-KV flash-attn read path.
+            const uint32_t pair = (uint32_t)(uint8_t) qs[l0 + 0] | ((uint32_t)(uint8_t) qs[l0 + 1] << 8);
+            const ggml_cuda_fp32x2_t wf = __builtin_amdgcn_cvt_pk_f32_fp8(pair, false);
+            ((half2 *) dst)[l0/2] = make_half2(wf[0] * d, wf[1] * d);
+#else
             ((half2 *) dst)[l0/2] = make_half2(
                 ggml_cuda_e4m3_to_fp32(qs[l0 + 0]) * d,
                 ggml_cuda_e4m3_to_fp32(qs[l0 + 1]) * d);
+#endif
         }
     } else
 #endif // FP16_AVAILABLE
