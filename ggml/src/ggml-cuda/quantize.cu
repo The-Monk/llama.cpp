@@ -556,15 +556,27 @@ static __global__ void quantize_mmq_f8e4m3(
 
     const float d_inv = amax > 0.0f ? 448.0f / amax : 0.0f; // 448.0 = e4m3fn max finite magnitude
 
+    // Encode 4 activations -> 4 raw e4m3 bytes. On RDNA4 use the hardware packed
+    // converter V_CVT_PK_FP8_F32 (2 fp32 -> 2 e4m3 per instruction, 2 instructions
+    // total) instead of 4x the ~15-op software e4m3 codec; hw rounds RNE to e4m3fn,
+    // ppl-neutral. word_sel=false writes bytes 0,1; true writes bytes 2,3 (mirrors
+    // the cvt_pk_f32_fp8 decode-side byte order).
+    uint32_t packed;
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+    packed = __builtin_amdgcn_cvt_pk_fp8_f32(xi.x*d_inv, xi.y*d_inv, 0u,     false);
+    packed = __builtin_amdgcn_cvt_pk_fp8_f32(xi.z*d_inv, xi.w*d_inv, packed, true);
+#else
     uint8_t q4[4];
     q4[0] = ggml_cuda_fp32_to_e4m3(xi.x*d_inv);
     q4[1] = ggml_cuda_fp32_to_e4m3(xi.y*d_inv);
     q4[2] = ggml_cuda_fp32_to_e4m3(xi.z*d_inv);
     q4[3] = ggml_cuda_fp32_to_e4m3(xi.w*d_inv);
+    memcpy(&packed, q4, 4);
+#endif
 
     // Write back 4 raw e4m3 bytes as a single 32 bit value for better memory bandwidth:
     uint32_t * yqs4 = (uint32_t *) y[ib].qs;
-    memcpy(&yqs4[iqs/4], q4, 4);
+    yqs4[iqs/4] = packed;
 
     if (iqs % 32 != 0) {
         return;
@@ -640,15 +652,26 @@ static __global__ void quantize_mmq_f8e5m2(
 
     const float d_inv = amax > 0.0f ? 57344.0f / amax : 0.0f; // 57344.0 = e5m2 max finite magnitude
 
+    // Encode 4 activations -> 4 raw e5m2 (OCP bf8) bytes. On RDNA4 use the hardware
+    // packed converter V_CVT_PK_BF8_F32 (2 fp32 -> 2 bf8 per instruction) instead of
+    // 4x the software bf8 codec; mirrors the e4m3 path above and the cvt_pk_f32_bf8
+    // decode-side byte order (word_sel=false -> bytes 0,1; true -> bytes 2,3).
+    uint32_t packed;
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+    packed = __builtin_amdgcn_cvt_pk_bf8_f32(xi.x*d_inv, xi.y*d_inv, 0u,     false);
+    packed = __builtin_amdgcn_cvt_pk_bf8_f32(xi.z*d_inv, xi.w*d_inv, packed, true);
+#else
     uint8_t q4[4];
     q4[0] = ggml_cuda_fp32_to_e5m2(xi.x*d_inv);
     q4[1] = ggml_cuda_fp32_to_e5m2(xi.y*d_inv);
     q4[2] = ggml_cuda_fp32_to_e5m2(xi.z*d_inv);
     q4[3] = ggml_cuda_fp32_to_e5m2(xi.w*d_inv);
+    memcpy(&packed, q4, 4);
+#endif
 
     // Write back 4 raw e5m2 bytes as a single 32 bit value for better memory bandwidth:
     uint32_t * yqs4 = (uint32_t *) y[ib].qs;
-    memcpy(&yqs4[iqs/4], q4, 4);
+    yqs4[iqs/4] = packed;
 
     if (iqs % 32 != 0) {
         return;
