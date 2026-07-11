@@ -806,6 +806,12 @@ class ModelBase:
         for name in list(self.model_tensors.keys()):
             if not name.endswith(".weight"):
                 continue
+            # Skip weights that the model's modify_tensors splits/transposes into
+            # differently-named tensors -- raw preserve would bypass that and leave
+            # the split targets missing. Known case: DeepSeek MLA splits kv_b_proj
+            # into k_b_proj/v_b_proj (k_b transposed). Let these dequant + split.
+            if name.endswith("kv_b_proj.weight"):
+                continue
             # per-channel/per-tensor scale (.weight_scale) or block-scale (.weight_scale_inv)
             if name + "_scale" in self.model_tensors:
                 scale_name, bdims = name + "_scale", None
