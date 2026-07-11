@@ -48,20 +48,26 @@ def np_roundf(n: np.ndarray) -> np.ndarray:
     return np.sign(n) * b
 
 
-def pack_f8e4m3_preserve(qweight_e4m3_bytes: np.ndarray, scale: np.ndarray) -> np.ndarray:
-    """Re-block a vendor fp8 tensor (Quark / compressed-tensors / modelopt) into
-    ggml block_f8e4m3 WITHOUT dequantizing.
+def pack_f8e4m3_preserve(qweight_e4m3_bytes: np.ndarray, scale: np.ndarray,
+                         block_dims: tuple[int, int] | None = None) -> np.ndarray:
+    """Re-block a vendor fp8 tensor (Quark / compressed-tensors / modelopt /
+    DeepSeek block-scale) into ggml block_f8e4m3 WITHOUT dequantizing.
 
-    Vendor decode:  w = (float)e4m3fn(qs) * scale_channel
+    Vendor decode:  w = (float)e4m3fn(qs) * scale
     block_f8e4m3:   struct { ggml_half d; uint8_t qs[32]; }, decode w = e4m3fn(qs) * d
-    => copy the e4m3fn bytes verbatim and broadcast the vendor scale into each
+    => copy the e4m3fn bytes verbatim and put the covering vendor scale into each
     32-element block's fp16 d. Loss is limited to fp16 rounding of the scale.
 
-    Fully vectorized over arbitrary leading (e.g. MoE expert) dims: the whole
-    [E, rows, cols] stack is packed in one pass, no per-expert Python loop.
+    Fully vectorized over arbitrary leading (e.g. MoE expert) dims.
 
-    qweight_e4m3_bytes: uint8 raw e4m3fn bytes, shape [cols], [rows, cols] or [*lead, rows, cols].
-    scale: per-tensor (scalar / size-1) or per-channel ([rows] or [*lead, rows]).
+    qweight_e4m3_bytes: uint8 raw e4m3fn bytes, [cols], [rows, cols] or [*lead, rows, cols].
+    scale, block_dims:
+      - per-tensor:  scale scalar/size-1,           block_dims=None
+      - per-channel: scale [rows] or [*lead, rows], block_dims=None
+      - block-scale: scale [rows//bs0, cols//bs1] (or [*lead, ...]), block_dims=(bs0, bs1);
+                     bs1 must be a multiple of 32 so each 32-block sits in one column tile
+                     (DeepSeek uses 128x128). Each 32-block b of row r takes the scale of
+                     tile (r//bs0, (b*32)//bs1).
     Returns a uint8 array shaped [*lead, rows, nblk*(2+32)] (row-padded to 32).
     """
     QK = 32
@@ -81,18 +87,26 @@ def pack_f8e4m3_preserve(qweight_e4m3_bytes: np.ndarray, scale: np.ndarray) -> n
         cols = q.shape[-1]
     nblk = cols // QK
 
-    # Normalize scale to per-row fp16 bits, shape [*lead, rows].
-    if s.ndim == 0 or s.size == 1:
-        s_rows = np.full((*lead, rows), float(s.reshape(-1)[0]), dtype=np.float32)
+    # Compute a per-block scale grid s_blk with shape [*lead, rows, nblk].
+    if block_dims is not None:
+        bs0, bs1 = block_dims
+        if bs1 % QK != 0:
+            raise ValueError(f"block col size {bs1} must be a multiple of {QK}")
+        sg = s.reshape(*lead, s.shape[-2], s.shape[-1])                    # [*lead, RT, CT]
+        RT, CT = sg.shape[-2], sg.shape[-1]
+        row_tile = np.minimum(np.arange(rows) // bs0, RT - 1)             # [rows]
+        col_tile = np.minimum((np.arange(nblk) * QK) // bs1, CT - 1)      # [nblk]
+        s_blk = sg[..., row_tile[:, None], col_tile[None, :]]            # [*lead, rows, nblk]
+    elif s.ndim == 0 or s.size == 1:
+        s_blk = np.broadcast_to(np.float32(s.reshape(-1)[0]), (*lead, rows, nblk))
     else:
-        s_rows = s.reshape(*lead, rows).astype(np.float32)
-    s16 = s_rows.astype(np.float16).view(np.uint16)                        # [*lead, rows]
+        s_rows = s.reshape(*lead, rows).astype(np.float32)               # per-channel
+        s_blk = np.broadcast_to(s_rows[..., None], (*lead, rows, nblk))
 
-    # d bytes broadcast to every block: [*lead, rows, nblk, 2]
-    d_bytes = (np.broadcast_to(s16[..., None], (*lead, rows, nblk))
-               .astype("<u2").view(np.uint8).reshape(*lead, rows, nblk, 2))
+    s16 = np.ascontiguousarray(s_blk.astype(np.float16)).view(np.uint16)  # [*lead, rows, nblk]
+    d_bytes = s16.astype("<u2").view(np.uint8).reshape(*lead, rows, nblk, 2)
     qs_blocks = q.reshape(*lead, rows, nblk, QK)
-    blocks = np.concatenate([d_bytes, qs_blocks], axis=-1)                 # [*lead, rows, nblk, 34]
+    blocks = np.concatenate([d_bytes, qs_blocks], axis=-1)                # [*lead, rows, nblk, 34]
     return np.ascontiguousarray(blocks.reshape(*lead, rows, nblk * (2 + QK)))
 
 
