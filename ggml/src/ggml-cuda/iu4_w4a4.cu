@@ -81,7 +81,25 @@ __global__ void k_iu4_dense_test(const int * __restrict__ dA, const int * __rest
     load_generic(A, dA, 4);
     load_generic(B, dB, 4);
 
-    tile<16, 16, int> D;
+    // T123 fix: the WMMA accumulator's PHYSICAL layout on RDNA4 is the
+    // TRANSPOSE of the A/B input layout (see the "matrix C is the
+    // transposed matrix A&B on RDNA4" comment on tile<16,16,...>::get_j,
+    // AMD_WMMA_AVAILABLE branch, this file). Reading it back through the
+    // DEFAULT DATA_LAYOUT_I_MAJOR tile (as this kernel originally did) gives
+    // get_i()/get_j() that are swapped relative to the true (row, col) --
+    // i.e. every readback is silently transposed. That's invisible on the
+    // diagonal (D[i][i] is transpose-invariant) but wrong everywhere else --
+    // exactly the "only the diagonal is correct" failure this self-test
+    // caught. Fix: use DATA_LAYOUT_J_MAJOR for the accumulator, which swaps
+    // get_i()<->get_j() back to the correct orientation -- the SAME
+    // convention the real production caller (mmq.cuh
+    // vec_dot_q8_0_16_q8_1_mma, tile_C = tile<16,16,int,DATA_LAYOUT_J_MAJOR>,
+    // paired with an IDENTICAL tile<16,4,int> A/B shape) already uses. No
+    // change to mma_iu4() itself is needed: it only reinterprets D.x as a
+    // raw int32x8 register file for the builtin call and never calls
+    // get_i()/get_j(), so the data_layout tag is purely a readback-side
+    // correction.
+    tile<16, 16, int, DATA_LAYOUT_J_MAJOR> D;
 #pragma unroll
     for (int l = 0; l < D.ne; ++l) {
         D.x[l] = 0;
