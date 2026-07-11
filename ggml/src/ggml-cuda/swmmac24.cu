@@ -8,7 +8,16 @@
 // killed) -- this only proves the driver's instruction-level support is correct.
 #include "swmmac24.cuh"
 
-#if defined(GGML_USE_HIP) && defined(RDNA4)
+// T122 fix: was gated `defined(GGML_USE_HIP) && defined(RDNA4)`. `RDNA4` is
+// device-pass-only (never defined in HIP-clang's host pass, on any arch) --
+// this file's HOST-callable `ggml_cuda_swmmac24_selftest()` entry always
+// compiled to the vacuous `#else` stub, so `GGML_HIP_SWMMAC24_SELFTEST=1`
+// never actually ran the kernels, on any hardware, ever. Fix: gate the TU on
+// `GGML_USE_HIP` only; the two `__global__` kernels' actual hardware
+// instructions are now internally `RDNA4`-gated (swmmac24.cuh), and the
+// top-level entry point below does a RUNTIME compute-capability check
+// (`GGML_CUDA_CC_IS_RDNA4`, common.cuh) before dispatching to them.
+#if defined(GGML_USE_HIP)
 
 #include <hip/hip_fp8.h>
 #include <random>
@@ -228,7 +237,20 @@ static bool test_fp8_swmmac_24(int n_trials) {
 
 } // namespace ggml_cuda_swmmac24
 
+// Host-pass-compiled, RUNTIME-gated entry point (T122 fix -- see the header
+// comment above). `ggml_cuda_get_device()`/`ggml_cuda_info()` are plain host
+// functions -- safe to call unconditionally here since this function itself
+// has no __device__ qualifier and is therefore only ever compiled for the
+// host target.
 bool ggml_cuda_swmmac24_selftest() {
+    const int device = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (!GGML_CUDA_CC_IS_RDNA4(cc)) {
+        // Not RDNA4 -- nothing to test, vacuously true. The 2:4 SWMMAC
+        // instructions this file targets do not exist on other archs (see
+        // wiki/tech/phase2-lever-validation.md ISA real-vs-mirage table).
+        return true;
+    }
     GGML_LOG_INFO("%s: RDNA4 2:4-sparse SWMMAC driver-completeness self-test starting "
                    "(dormant capability, T99: not used by any model path -- correctness-only gate)\n", __func__);
     const bool ok_iu4 = ggml_cuda_swmmac24::test_iu4_swmmac_24(20);
@@ -238,13 +260,12 @@ bool ggml_cuda_swmmac24_selftest() {
     return ok;
 }
 
-#else // !(defined(GGML_USE_HIP) && defined(RDNA4))
+#else // !defined(GGML_USE_HIP)
 
 bool ggml_cuda_swmmac24_selftest() {
-    // Not RDNA4 (or not HIP) -- nothing to test, vacuously true. The 2:4 SWMMAC
-    // instructions this file targets do not exist on other archs (see
-    // wiki/tech/phase2-lever-validation.md ISA real-vs-mirage table).
+    // Not a HIP build -- nothing to test, vacuously true. The 2:4 SWMMAC
+    // instructions this file targets are AMD/RDNA4-only.
     return true;
 }
 
-#endif // defined(GGML_USE_HIP) && defined(RDNA4)
+#endif // defined(GGML_USE_HIP)

@@ -24,7 +24,27 @@
 // this is a well-defined systolic MAC, not order-sensitive floating point.
 #include "iu4_w4a4.cuh"
 
-#if defined(GGML_USE_HIP) && defined(RDNA4)
+// T122 fix: the outer guard used to be `defined(GGML_USE_HIP) && defined(RDNA4)`.
+// `RDNA4` (== `__GFX12__`) is a target-specific macro that HIP-clang only
+// predefines during the DEVICE compilation pass for a gfx12 offload arch --
+// it is NEVER defined during the HOST compilation pass, on ANY arch. That
+// made the host-callable `ggml_cuda_iu4_w4a4_selftest()` entry point compile
+// to the vacuous `#else` stub (`return true;`) unconditionally, on every
+// build, including on real RDNA4 hardware -- the self-test silently never
+// ran (T89/T101 "20/20 exact" was never actually re-verified under this
+// toolchain). Fix: gate this whole TU on `GGML_USE_HIP` only (true in both
+// host and device passes), and push the actual `RDNA4`-only requirement down
+// to (a) the device-side WMMA builtin, which is already correctly
+// arch-gated inside `ggml_cuda_mma::mma_iu4()` in mma.cuh (falls back to
+// `NO_DEVICE_CODE`, a no-op on host / non-RDNA4 device passes), and (b) a
+// RUNTIME compute-capability check in `ggml_cuda_iu4_w4a4_selftest()` below
+// (mirrors how every other GPU-vs-CPU/arch dispatch in ggml-cuda works --
+// see `ggml_cuda_info().devices[id].cc` + `GGML_CUDA_CC_IS_RDNA4()`,
+// common.cuh). This makes the self-test a real host-pass-compiled function
+// that only executes the RDNA4 device kernel when it is actually running on
+// RDNA4 hardware, instead of a compile-time-only (and always-false-taken)
+// gate.
+#if defined(GGML_USE_HIP)
 
 #include "common.cuh"
 #include "mma.cuh"
@@ -151,16 +171,28 @@ static bool selftest_impl(int n_trials) {
 
 } // namespace ggml_cuda_iu4_w4a4
 
+// Host-pass-compiled, RUNTIME-gated entry point (T122 fix -- see the header
+// comment above). `ggml_cuda_get_device()`/`ggml_cuda_info()` are plain host
+// functions (declared in common.cuh, defined in ggml-cuda.cu) -- safe to
+// call unconditionally here since this function itself has no __device__
+// qualifier and is therefore only ever compiled for the host target.
 bool ggml_cuda_iu4_w4a4_selftest() {
+    const int device = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (!GGML_CUDA_CC_IS_RDNA4(cc)) {
+        // Not RDNA4 -- nothing to test, vacuously true. The native iu4 WMMA
+        // instruction this file targets does not exist on other archs.
+        return true;
+    }
     return ggml_cuda_iu4_w4a4::selftest_impl(20);
 }
 
-#else // !(defined(GGML_USE_HIP) && defined(RDNA4))
+#else // !defined(GGML_USE_HIP)
 
 bool ggml_cuda_iu4_w4a4_selftest() {
-    // Not RDNA4 (or not HIP) -- nothing to test, vacuously true. The native
-    // iu4 WMMA instruction this file targets does not exist on other archs.
+    // Not a HIP build -- nothing to test, vacuously true. The native iu4
+    // WMMA instruction this file targets is AMD/RDNA4-only.
     return true;
 }
 
-#endif // defined(GGML_USE_HIP) && defined(RDNA4)
+#endif // defined(GGML_USE_HIP)
