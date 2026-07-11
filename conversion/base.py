@@ -792,28 +792,41 @@ class ModelBase:
         experts, writes raw via add_tensor(raw_dtype=F8E4M3), and consumes the
         source tensors so dequant_model/the main loop skip them. Non-quantized
         tensors (no .weight_scale) are left untouched for the normal bf16/f16 path."""
-        n_experts = self.find_hparam(["num_local_experts", "num_experts"], optional=True) or 0
-        # per (layer, proj): list of (expert_id, weight_bytes[rows, cols], scale[rows])
+        n_experts = self.find_hparam(["num_local_experts", "num_experts", "n_routed_experts"], optional=True) or 0
+        # per (layer, proj): list of (expert_id, weight_bytes, scale) + shared block_dims
         expert_parts: dict[tuple[int, str], list[tuple[int, np.ndarray, np.ndarray]]] = {}
+        expert_bdims: dict[tuple[int, str], tuple | None] = {}
         consumed: list[str] = []
+
+        # DeepSeek-style block-scale fp8 carries weight_block_size (e.g. [128, 128]).
+        qcfg = self.hparams.get("quantization_config") or {}
+        wbs = qcfg.get("weight_block_size")
+        block_dims_cfg = tuple(wbs) if isinstance(wbs, (list, tuple)) and len(wbs) == 2 else None
 
         for name in list(self.model_tensors.keys()):
             if not name.endswith(".weight"):
                 continue
-            scale_name = name + "_scale"
-            if scale_name not in self.model_tensors:
+            # per-channel/per-tensor scale (.weight_scale) or block-scale (.weight_scale_inv)
+            if name + "_scale" in self.model_tensors:
+                scale_name, bdims = name + "_scale", None
+            elif name + "_scale_inv" in self.model_tensors:
+                scale_name, bdims = name + "_scale_inv", block_dims_cfg
+            else:
                 continue
             weight = LazyTorchTensor.to_eager(self.model_tensors[name]())
             # Only e4m3fn weights belong to us; leave non-fp8 to existing paths.
             if weight.dtype != torch.float8_e4m3fn:
                 continue
             scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
-            # Per-channel fp8 scale is (rows,1) or (rows,); per-tensor is scalar/(1,).
-            # Genuinely block-wise/NVFP4 scale has last dim > 1 -> not ours.
-            if scale.ndim >= 2 and scale.shape[-1] != 1:
-                continue
+            if bdims is None:
+                # per-channel (rows,1)/(rows,) or per-tensor scalar/(1,); genuinely
+                # block-wise/NVFP4 scale (last dim > 1, no weight_block_size) is not ours.
+                if scale.ndim >= 2 and scale.shape[-1] != 1:
+                    continue
+                sarr = scale.reshape(-1).float().cpu().numpy()
+            else:
+                sarr = scale.float().cpu().numpy()                  # 2D block grid [RT, CT]
             wbytes = weight.view(torch.uint8).cpu().numpy()          # raw e4m3fn bytes, verbatim
-            sarr = scale.reshape(-1).float().cpu().numpy()           # per-channel (or size-1)
             consumed += [name, scale_name]
 
             m = re.search(r'\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$', name)
@@ -822,26 +835,28 @@ class ModelBase:
                 bid = int(bid_m.group(1)) if bid_m else 0
                 key = (bid, m.group(2))
                 expert_parts.setdefault(key, []).append((int(m.group(1)), wbytes, sarr))
+                expert_bdims[key] = bdims
                 if len(expert_parts[key]) >= n_experts:
-                    self._flush_fp8_experts(key, expert_parts)
+                    self._flush_fp8_experts(key, expert_parts, expert_bdims)
             else:
                 new_name = self.map_tensor_name(name)
-                raw = gguf.quants.pack_f8e4m3_preserve(wbytes, sarr)
+                raw = gguf.quants.pack_f8e4m3_preserve(wbytes, sarr, block_dims=bdims)
                 self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.F8E4M3)
 
         for key in list(expert_parts.keys()):
-            self._flush_fp8_experts(key, expert_parts)   # fallback flush if n_experts unknown
+            self._flush_fp8_experts(key, expert_parts, expert_bdims)  # fallback flush if n_experts unknown
 
         for name in consumed:
             self.model_tensors.pop(name, None)
 
-    def _flush_fp8_experts(self, key, expert_parts):
+    def _flush_fp8_experts(self, key, expert_parts, expert_bdims):
         bid, proj = key
         parts = expert_parts.pop(key)
+        bdims = expert_bdims.pop(key, None)
         parts.sort(key=lambda x: x[0])                              # order by expert id
         weights = np.stack([p[1] for p in parts], axis=0)          # [n_expert, rows, cols]
-        scales = np.stack([p[2] for p in parts], axis=0)           # [n_expert, rows]
-        raw = gguf.quants.pack_f8e4m3_preserve(weights, scales)    # one vectorized pack for all experts
+        scales = np.stack([p[2] for p in parts], axis=0)           # [n_expert, rows] or [n_expert, RT, CT]
+        raw = gguf.quants.pack_f8e4m3_preserve(weights, scales, block_dims=bdims)  # one vectorized pack
         new_name = self.map_tensor_name(f"model.layers.{bid}.mlp.experts.{proj}.weight")
         logger.info(f"fp8-native: packed {new_name} [{weights.shape[0]} experts] as F8E4M3 (preserved)")
         self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.F8E4M3)
