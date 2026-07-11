@@ -306,6 +306,26 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q8_0_16_q8_1_
 #define VDR_MXFP4_Q8_1_MMVQ 2
 #define VDR_MXFP4_Q8_1_MMQ  4
 
+// NOTE (ROC8 fp4-hw-cvt investigation, gfx1201): this path already avoids a
+// software fp4->f16 dequant -- get_int_from_table_16() is a 4-bit->int8 LUT
+// that feeds ggml_cuda_dp4a() directly (int8 SIMD dot), no f16 conversion
+// step exists here to replace. The RDNA4-native alternative considered was
+// AMD's hardware fp4 decoder, __builtin_amdgcn_cvt_scalef32_pk(8)_fp4_f16
+// (packs 2 or 8 fp4 lanes -> f16 with a scale multiply). CONFIRMED NOT
+// PRESENT on gfx1201/RDNA4 silicon: the RDNA4 ISA manual (doc 70651) defines
+// no FP4 datatype and no CVT_*_FP4 instruction anywhere in its 697 pages
+// (only F8/BF8 conversions exist, see CVT_PK_FP8_F32 etc.); clang requires
+// target feature `fp4-cvt-scale-insts` (2-lane pk_ form) / `gfx1250-insts`
+// (8-lane pk8_ form) for these builtins, and gfx1201 does not carry either
+// by default. Force-enabling `+fp4-cvt-scale-insts` for --offload-arch=
+// gfx1201 crashes the LLVM backend at codegen (SIInstrInfo::getInstSizeIn
+// Bytes assert in BranchRelaxation) -- there is no instruction encoding for
+// gfx12 at all, only for gfx1250 (a distinct, newer target not present in
+// this box's device inventory; same class of finding as the wide-K fp8 WMMA
+// dead end, see wiki/tech/widek-fp8-wmma-notes.md). Do not re-attempt this
+// wiring on gfx1201 without new silicon; the LUT+dp4a path above is already
+// the fast route and was NOT changed. See wiki/tech/rdna4-isa-optimization
+// -audit.md for the full writeup.
 static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -330,6 +350,13 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 #define VDR_NVFP4_Q8_1_MMVQ 4
 #define VDR_NVFP4_Q8_1_MMQ  8
 
+// NOTE (ROC8 fp4-hw-cvt investigation, gfx1201): same finding as
+// vec_dot_mxfp4_q8_1 above -- this path is also LUT(get_int_from_table_16)
+// + dp4a, no f16 dequant to accelerate, and the candidate hardware
+// instruction (cvt_scalef32_pk(8)_fp4_f16) is gfx1250-exclusive, absent on
+// RDNA4/gfx1201 (verified via ISA manual, clang target-feature gate, and an
+// LLVM backend crash when force-enabled -- see the mxfp4 comment above for
+// full detail). Not wired here for the same reason.
 static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
                                         const void * __restrict__ vbq,
                                         const block_q8_1 * __restrict__ bq8_1,
