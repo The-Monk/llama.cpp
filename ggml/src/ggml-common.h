@@ -118,6 +118,9 @@ typedef sycl::half2 ggml_half2;
 #define QI_F8E5M2 (QK_F8E5M2 / (4 * QR_F8E5M2))
 #define QR_F8E5M2 1
 
+#define QI_MXFP8 (QK_MXFP8 / (4 * QR_MXFP8))
+#define QR_MXFP8 1
+
 #define QI5_0 (QK5_0 / (4 * QR5_0))
 #define QR5_0 2
 
@@ -259,6 +262,29 @@ typedef struct {
     uint8_t   qs[QK_F8E5M2];   // signed e5m2 (OCP bf8) raw bytes, 1 per value
 } block_f8e5m2;
 static_assert(sizeof(block_f8e5m2) == sizeof(ggml_half) + QK_F8E5M2, "wrong f8e5m2 block size/padding");
+
+// MXFP8 (OCP Microscaling FP8, ROC8): identical leaf value format to
+// block_f8e4m3 -- signed e4m3 (OCP e4m3fn) weight bytes, 1 per value -- the
+// ONLY structural difference is the scale: OCP MX uses a shared per-32-block
+// UE8M0 (unsigned, power-of-2, biased-127) scale instead of a continuous fp16
+// delta. `OsaurusAI/Qwen3.6-27B-MXFP8-MTP` (config.json: bits=8, group_size=32,
+// mode='mxfp8', backend='mx.quantize') is produced this way -- MLX's
+// mx.quantize packs one e8m0 byte per 32-element group, matching QK=32 1:1.
+// scale = 2^(e-127) (ggml_e8m0_to_fp32 / ggml_cuda_e8m0_to_fp32 -- the SAME
+// helper GGML_TYPE_MXFP4 already uses for its own e8m0 scale, NOT the
+// "_HALF" variant: MXFP4's kvalues are pre-doubled so it needs scale/2, but
+// e4m3 leaf values here are NOT doubled, so plain e8m0->fp32 is correct).
+// Every fp8 compute kernel (WMMA prefill fp8xfp8 fragment, dp4a-style decode
+// dot) is value-format-agnostic to e4m3 bytes regardless of scale source --
+// see mmq.cuh load_tiles_mxfp8/vec_dot_mxfp8_mxfp8_mma and vecdotq.cuh
+// vec_dot_mxfp8_q8_1, both mechanical mirrors of the block_f8e4m3 versions
+// that only change how the per-block scale is decoded.
+#define QK_MXFP8 32
+typedef struct {
+    uint8_t e;               // UE8M0 shared scale (biased-127, power-of-2 only)
+    uint8_t qs[QK_MXFP8];     // signed e4m3 (OCP e4m3fn) raw bytes, 1 per value
+} block_mxfp8;
+static_assert(sizeof(block_mxfp8) == sizeof(uint8_t) + QK_MXFP8, "wrong mxfp8 block size/padding");
 
 #define QK5_0 32
 typedef struct {

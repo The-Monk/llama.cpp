@@ -67,6 +67,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/iu4_w4a4.cuh"
+#include "ggml-cuda/mxfp8_selftest.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -5198,6 +5199,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_F8E4M3:
                     case GGML_TYPE_F8E5M2:
+                    case GGML_TYPE_MXFP8:
                         return true;
                     default:
                         return false;
@@ -5221,6 +5223,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_F8E4M3:
                     case GGML_TYPE_F8E5M2:
+                    case GGML_TYPE_MXFP8:
                         return true;
                     default:
                         return false;
@@ -5766,6 +5769,19 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
             swmmac24_selftest_ran = true;
             const bool ok = ggml_cuda_swmmac24_selftest();
             GGML_LOG_INFO("%s: GGML_HIP_SWMMAC24_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // ROC8: MXFP8 type-plumbing + kernel correctness self-test (mxfp8_selftest.cu).
+    // Synthetic (no model/GGUF needed), opt-in only, no default model/quant
+    // path routes through it -- see mxfp8_selftest.cuh for the doctrine/gating
+    // rationale. Runs at most once per process, same pattern as the two
+    // selftests directly above.
+    if (getenv("GGML_HIP_MXFP8_SELFTEST") != nullptr) {
+        static bool mxfp8_selftest_ran = false;
+        if (!mxfp8_selftest_ran) {
+            mxfp8_selftest_ran = true;
+            const bool ok = ggml_cuda_mxfp8_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_MXFP8_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
         }
     }
 

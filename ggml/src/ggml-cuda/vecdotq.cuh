@@ -1031,6 +1031,53 @@ static __device__ __forceinline__ float vec_dot_f8e5m2_q8_1_simd_impl(
 #endif
 }
 
+// MXFP8 (ROC8) decode dot product. Deliberately mirrors the ORIGINAL,
+// portable F8E4M3 T73 tier (vec_dot_f8e4m3_q8_1_impl above) -- int8 q8_1
+// activations, software e4m3 weight decode -- NOT F8E4M3's later T77/T79
+// evolution (hardware dot2 SIMD / native e4m3xe4m3 V_DOT4, which requires a
+// dedicated e4m3-activation quantizer swapped in at the call site). This is
+// an intentional, explicitly-scoped-down first pass: get a correct,
+// portable, always-available decode kernel in place first; porting the
+// SIMD/native-dot4 speed optimizations to MXFP8's e8m0 scale is a follow-up
+// (see ROC8 KB gotchas), not a correctness requirement. block_mxfp8 is
+// byte-for-byte block_q8_0-shaped except the first field is 1 byte (uint8_t
+// e8m0) instead of 2 (ggml_half) -- get_int_b2 packs 4 raw qs bytes per int
+// exactly like every other 8-bit quant here, addressing is unaffected by the
+// scale field's width since it lives outside `qs[]`.
+#define VDR_MXFP8_Q8_1_MMVQ 2
+
+template <int vdr>
+static __device__ __forceinline__ float vec_dot_mxfp8_q8_1_impl(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_mxfp8 * bq8 = (const block_mxfp8 *) vbq + kbx;
+
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+        const int vi = get_int_b2(bq8->qs, iqs + i);
+        const int ui = get_int_b4(bq8_1->qs, iqs + i);
+
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint8_t wv = (uint8_t) (vi >> (8*j));
+            const int8_t  av = (int8_t)  (ui >> (8*j));
+            sumf += ggml_cuda_e4m3_to_fp32(wv) * (float) av;
+        }
+    }
+
+    // e8m0 (power-of-2) scale, NOT the "_HALF" MXFP4 variant -- qs bytes here
+    // are raw (undoubled) e4m3, same convention as ggml_cuda_e8m0_to_fp32's
+    // other direct caller, dequantize_mxfp8 (dequantize.cuh).
+    return sumf * ggml_cuda_e8m0_to_fp32(bq8->e) * __low2float(bq8_1->ds);
+}
+
+static __device__ __forceinline__ float vec_dot_mxfp8_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_mxfp8_q8_1_impl<VDR_MXFP8_Q8_1_MMVQ>(vbq, bq8_1, kbx, iqs);
+}
+
 // T79: pure V_DOT4_F32_FP8_FP8 decode dot. Where T77's hardware-dot2 path
 // still detours the ACTIVATION through int8 (q8_1) and only accelerates the
 // WEIGHT-side decode (2 terms / 3 hardware instructions: cvt_pk_f32_fp8 +
