@@ -123,7 +123,8 @@ class ModelBase:
                  target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
                  fp8_as_q8: bool = False,
-                 fp8_native: bool = False):
+                 fp8_native: bool = False,
+                 mxfp8_native: bool = False):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -155,6 +156,7 @@ class ModelBase:
         self._is_mxfp4 = False
         self._fp8_as_q8 = fp8_as_q8
         self._fp8_native = fp8_native
+        self._mxfp8_native = mxfp8_native
         self._fp8_dequantized: set[str] = set()
 
         # Apply heuristics to figure out typical tensor encoding based on first tensor's dtype
@@ -867,6 +869,74 @@ class ModelBase:
         logger.info(f"fp8-native: packed {new_name} [{weights.shape[0]} experts] as F8E4M3 (preserved)")
         self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.F8E4M3)
 
+    def _generate_mxfp8_preserve_tensors(self):
+        """ROC8: re-block MLX `mx.quantize(mode="mxfp8")` tensors (group_size=32,
+        OCP Microscaling FP8) straight into ggml block_mxfp8 WITHOUT dequantizing.
+        Sibling of _generate_fp8_preserve_tensors above, but for a structurally
+        different source layout:
+
+          - MLX packs 4 raw e4m3fn bytes per uint32 word: `<name>.weight` is
+            U32/uint32 shaped [rows, cols//4] (cols = in_features).
+          - The shared per-32-block scale is a SEPARATE tensor `<name>.scales`,
+            U8/uint8 shaped [rows, cols//32] -- already exactly one byte per
+            (row, 32-element block), a 1:1 match with the qs block grid (no
+            per-channel/per-tensor/block-tile broadcasting needed, unlike the
+            vendor fp8 formats _generate_fp8_preserve_tensors handles).
+
+        Unlike Quark/compressed-tensors/modelopt fp8 (real torch.float8_e4m3fn
+        dtype, 1 byte/value already), the MLX weight tensor must first be
+        byte-unpacked from uint32 to raw uint8 (`.view(torch.uint8)`, a pure
+        memory reinterpretation -- byte i of the word is element 4*w+i of the
+        row, consistent with how the RDNA4 kernel's get_int_b2 reads qs[]
+        4 bytes at a time, ggml-cuda/mmq.cuh load_tiles_mxfp8). No float math
+        is involved anywhere in this path: both the e4m3 payload bytes and the
+        e8m0 scale byte are copied verbatim from the safetensors file into the
+        ggml block layout.
+
+        MoE experts (`.experts.N.`) are NOT handled here (no MoE MXFP8 model
+        is in scope for this pass, per ROC8's dense-only target) -- fail loud
+        rather than silently mis-stack them, mirroring the MoE-unaware type's
+        actual capability instead of a plausible-looking but wrong shape.
+        """
+        consumed: list[str] = []
+
+        for name in list(self.model_tensors.keys()):
+            if not name.endswith(".weight"):
+                continue
+            scale_name = name[:-len(".weight")] + ".scales"
+            if scale_name not in self.model_tensors:
+                continue
+
+            if re.search(r'\.experts\.\d+\.', name):
+                raise NotImplementedError(
+                    f"_generate_mxfp8_preserve_tensors: MoE expert tensor {name!r} "
+                    "has a .scales sibling but expert-stacking is not implemented for "
+                    "MXFP8 (dense-only pass, ROC8) -- refusing to silently mis-shape it.")
+
+            weight = LazyTorchTensor.to_eager(self.model_tensors[name]())
+            if weight.dtype != torch.uint32:
+                # Not an MLX-mxfp8-packed weight (e.g. some other quant scheme
+                # that also happens to carry a same-named .scales tensor) --
+                # leave it alone for the normal dequant/passthrough path.
+                continue
+            scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
+            if scale.dtype != torch.uint8:
+                continue
+
+            rows, cols_packed = weight.shape[-2], weight.shape[-1]
+            cols = cols_packed * 4
+            wbytes = weight.contiguous().view(torch.uint8).cpu().numpy().reshape(rows, cols)
+            sarr = scale.contiguous().cpu().numpy().reshape(rows, cols // 32)
+
+            consumed += [name, scale_name]
+            new_name = self.map_tensor_name(name)
+            raw = gguf.quants.pack_mxfp8_preserve(wbytes, sarr)
+            logger.info(f"mxfp8-native: packed {new_name} [{rows}, {cols}] as MXFP8 (preserved)")
+            self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.MXFP8)
+
+        for name in consumed:
+            self.model_tensors.pop(name, None)
+
     def prepare_tensors(self):
         # detect NVFP4 quantization (ModelOpt and Compressed-tensors formats)
         quantization_config = self.hparams.get("quantization_config") or {}
@@ -942,6 +1012,19 @@ class ModelBase:
         # so the packed tensors are removed from model_tensors.
         if self._fp8_native and quant_method in ("compressed-tensors", "fp8", "modelopt"):
             self._generate_fp8_preserve_tensors()
+
+        # MXFP8-native (ROC8): MLX `mx.quantize(mode="mxfp8")` sources (e.g.
+        # OsaurusAI's Qwen3.6-MXFP8-MTP bundles) use a nonstandard top-level
+        # "quantization" hparam key (not the generic "quantization_config" key
+        # every other branch above reads), so detect it independently here
+        # rather than folding it into quant_method/quant_algo above.
+        mx_quant_cfg = self.hparams.get("quantization") or {}
+        is_mlx_mxfp8 = (
+            mx_quant_cfg.get("mode") == "mxfp8"
+            or mx_quant_cfg.get("quantization_backend") == "mx.quantize"
+        )
+        if self._mxfp8_native and is_mlx_mxfp8:
+            self._generate_mxfp8_preserve_tensors()
 
         self.dequant_model()
 
@@ -2592,6 +2675,10 @@ class LazyTorchTensor(gguf.LazyBase):
         torch.float32: np.float32,
         torch.uint8: np.uint8,
         torch.int64: np.int64,
+        # ROC8: needed for MLX mx.quantize(mode="mxfp8") sources, which pack
+        # 4 raw e4m3fn bytes per uint32 word (see _dtype_str_map's "U32" entry
+        # below, and _generate_mxfp8_preserve_tensors, conversion/base.py).
+        torch.uint32: np.uint32,
     }
 
     # only used when byteswapping data. Only correct size is needed
@@ -2604,7 +2691,8 @@ class LazyTorchTensor(gguf.LazyBase):
         torch.int64: np.int64,
         # torch.uint64: np.uint64,
         torch.int32: np.int32,
-        # torch.uint32: np.uint32,
+        # ROC8: see _dtype_str_map's "U32" entry above for the rationale.
+        torch.uint32: np.uint32,
         torch.int16: np.int16,
         # torch.uint16: np.uint16,
         torch.int8: np.int8,
@@ -2624,7 +2712,11 @@ class LazyTorchTensor(gguf.LazyBase):
         "F16": torch.float16,
         # "U64": torch.uint64,
         "I64": torch.int64,
-        # "U32": torch.uint32,
+        # ROC8: uncommented for MLX mx.quantize(mode="mxfp8") sources (raw
+        # uint32-packed e4m3fn bytes, 4/word) -- the upstream TODO citing
+        # pytorch/pytorch#58734 no longer applies, torch.uint32 is supported
+        # in the installed torch (2.11.0+); verified locally before enabling.
+        "U32": torch.uint32,
         "I32": torch.int32,
         # "U16": torch.uint16,
         "I16": torch.int16,

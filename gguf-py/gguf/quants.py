@@ -110,6 +110,59 @@ def pack_f8e4m3_preserve(qweight_e4m3_bytes: np.ndarray, scale: np.ndarray,
     return np.ascontiguousarray(blocks.reshape(*lead, rows, nblk * (2 + QK)))
 
 
+def pack_mxfp8_preserve(qweight_e4m3_bytes: np.ndarray, e8m0_scale: np.ndarray) -> np.ndarray:
+    """Re-block an OCP MXFP8 tensor (MLX `mx.quantize(mode="mxfp8")`, group_size=32)
+    into ggml block_mxfp8 WITHOUT dequantizing (ROC8).
+
+    Source decode: w = e4m3fn(qs) * 2^(e8m0 - 127)   (e8m0 already the raw biased
+    exponent byte, one per 32-element group -- MLX's .scales tensor is already
+    shaped [rows, cols//32], a 1:1 match with the qs block grid, unlike
+    pack_f8e4m3_preserve's vendor formats which need per-channel/block-tile
+    broadcasting.)
+    block_mxfp8: struct { uint8_t e; uint8_t qs[32]; }, decode w = e4m3fn(qs) * 2^(e-127)
+    => copy the e4m3fn bytes verbatim and the e8m0 byte verbatim -- both are
+    ALREADY the exact on-disk ggml representation, no rounding/reinterpretation
+    at all (unlike F8E4M3's vendor path, which must round a continuous fp32/fp16
+    vendor scale down into ggml_half). This is a pure re-layout: interleave
+    [e, qs[0..31]] per block, no float math.
+
+    Fully vectorized over arbitrary leading (e.g. MoE expert) dims, mirroring
+    pack_f8e4m3_preserve's shape conventions.
+
+    qweight_e4m3_bytes: uint8 raw e4m3fn bytes, [rows, cols] or [*lead, rows, cols]
+                         (already unpacked from MLX's U32-packed-4-per-word layout
+                         by the caller -- see conversion/base.py _generate_mxfp8_preserve_tensors).
+    e8m0_scale: uint8 raw e8m0 bytes, [rows, cols//32] or [*lead, rows, cols//32].
+    Returns a uint8 array shaped [*lead, rows, nblk*(1+32)] (row-padded to 32).
+    """
+    QK = 32
+    q = np.ascontiguousarray(qweight_e4m3_bytes).astype(np.uint8, copy=False)
+    e = np.ascontiguousarray(e8m0_scale).astype(np.uint8, copy=False)
+
+    if q.ndim == 1:
+        q = q[None, :]
+    if q.ndim < 2:
+        raise ValueError(f"pack_mxfp8_preserve: unsupported ndim {q.ndim}")
+
+    lead = q.shape[:-2]
+    rows, cols = q.shape[-2:]
+    rem = cols % QK
+    if rem:  # row-pad to a block boundary; e4m3 0x00 == +0.0
+        q = np.pad(q, [(0, 0)] * (q.ndim - 1) + [(0, QK - rem)], constant_values=0)
+        cols = q.shape[-1]
+    nblk = cols // QK
+
+    if e.shape[-2:] != (rows, nblk):
+        raise ValueError(
+            f"pack_mxfp8_preserve: e8m0_scale shape {e.shape} does not match "
+            f"[*, {rows}, {nblk}] (rows x cols/{QK}) derived from the weight shape")
+
+    e_bytes = e.reshape(*lead, rows, nblk, 1)
+    qs_blocks = q.reshape(*lead, rows, nblk, QK)
+    blocks = np.concatenate([e_bytes, qs_blocks], axis=-1)                # [*lead, rows, nblk, 33]
+    return np.ascontiguousarray(blocks.reshape(*lead, rows, nblk * (1 + QK)))
+
+
 class QuantError(Exception): ...
 
 

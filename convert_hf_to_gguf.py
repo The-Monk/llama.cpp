@@ -157,6 +157,12 @@ def parse_args() -> argparse.Namespace:
         help="Preserve vendor FP8 (Quark / compressed-tensors / modelopt, e4m3fn) "
              "directly into native F8E4M3 blocks without dequantizing. Sets outtype F8E4M3.",
     )
+    parser.add_argument(
+        "--mxfp8-native", action="store_true",
+        help="Preserve MLX mx.quantize(mode='mxfp8') OCP Microscaling FP8 source weights "
+             "(e.g. OsaurusAI's Qwen3.6-*-MXFP8-MTP bundles) directly into native MXFP8 "
+             "blocks without dequantizing. Sets outtype MXFP8. (ROC8)",
+    )
 
     parser.add_argument(
         "--target-model-dir", type=str, default=None,
@@ -241,6 +247,9 @@ def main() -> None:
         if args.fp8_native:
             # Preserved vendor FP8 is written as native F8E4M3 blocks; advertise it.
             output_type = gguf.LlamaFileType.MOSTLY_F8E4M3
+        if args.mxfp8_native:
+            # Preserved MLX mxfp8 is written as native MXFP8 blocks; advertise it. (ROC8)
+            output_type = gguf.LlamaFileType.MOSTLY_MXFP8
         model_type = ModelType.MMPROJ if args.mmproj else ModelType.TEXT
         hparams = ModelBase.load_hparams(dir_model, is_mistral_format)
         if not is_mistral_format:
@@ -290,6 +299,7 @@ def main() -> None:
                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
                                      fp8_as_q8=args.fp8_as_q8,
                                      fp8_native=args.fp8_native,
+                                     mxfp8_native=args.mxfp8_native,
                                      )
 
         if args.vocab_only:
