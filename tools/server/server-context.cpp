@@ -1,6 +1,7 @@
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include "server-prefix-cache.h" // ROC8 cross-request prefix sharing
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -164,6 +165,9 @@ struct server_slot {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    // ROC8 cross-request prefix sharing (null = feature disabled)
+    server_prefix_cache * pcache = nullptr;
+
     // multimodal
     mtmd_context * mctx = nullptr;
     mtmd::batch_ptr mbatch = nullptr;
@@ -258,6 +262,12 @@ struct server_slot {
         }
 
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
+
+        // ROC8: unregister this seq's prefix before its KV is invalidated, using the
+        // tokens that were registered (still live in prompt.tokens here).
+        if (pcache && !prompt.tokens.has_mtmd && prompt.tokens.size() > 0) {
+            pcache->release(id, prompt.tokens.get_text_tokens());
+        }
 
         common_context_seq_rm(ctx_tgt, id, -1, -1);
         if (ctx_dft) {
@@ -872,8 +882,14 @@ public:
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
+    // ROC8 cross-request prefix sharing (RadixAttention/APC). Env-gated, default off.
+    server_prefix_cache prefix_cache;
+    bool prefix_share = false;
+
     server_context_impl() {
         mtmd_helper_log_set(common_log_default_callback, nullptr);
+        const char * e = getenv("LLAMA_PREFIX_SHARE");
+        prefix_share = (e && atoi(e) != 0);
     }
 
     ~server_context_impl() {
@@ -1328,6 +1344,17 @@ private:
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                 params_base.n_parallel, n_ctx_slot, params_base.kv_unified ? "true" : "false");
 
+        // ROC8 cross-request prefix sharing needs a single unified KV stream so the
+        // partial seq_cp is metadata-only (COW); cross-stream would require a full-
+        // buffer copy and abort on a partial range. Disable if not unified.
+        if (prefix_share && !params_base.kv_unified) {
+            SRV_WRN("%s\n", "LLAMA_PREFIX_SHARE requires unified KV (-kvu); disabling prefix sharing");
+            prefix_share = false;
+        }
+        if (prefix_share) {
+            SRV_INF("%s\n", "ROC8 cross-request prefix sharing enabled");
+        }
+
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
@@ -1359,6 +1386,7 @@ private:
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft.get();
             slot.spec    = spec.get();
+            slot.pcache  = prefix_share ? &prefix_cache : nullptr; // ROC8
             slot.n_ctx   = n_ctx_slot;
 
             slot.mctx                   = mctx;
@@ -3237,6 +3265,46 @@ private:
 
                                     SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
                                 }
+
+                                // ROC8 cross-request prefix sharing: if another resident
+                                // sequence shares a longer prefix than this slot's own
+                                // history, adopt those KV cells zero-copy (same-stream COW,
+                                // fp8-KV-safe) and prefill only the divergent suffix.
+                                if (slot.pcache && can_cache_reuse && !input_tokens.has_mtmd) {
+                                    const auto in_vec = input_tokens.get_text_tokens();
+                                    auto m = slot.pcache->match(in_vec, slot.id);
+                                    // Guard against stale registrations: confirm the owner slot
+                                    // still actually holds the matched prefix (its KV may have been
+                                    // reassigned via a path that bypassed prompt_clear's release).
+                                    if (m.owner >= 0 && m.owner < (int) slots.size()) {
+                                        const auto & op = slots[m.owner].prompt.tokens;
+                                        int ok = 0;
+                                        while (ok < m.len && ok < (int) op.size() && op[ok] == in_vec[ok]) {
+                                            ok++;
+                                        }
+                                        if (ok < m.len) {
+                                            slot.pcache->release(m.owner, op.get_text_tokens()); // prune stale path
+                                            m.len = ok;
+                                        }
+                                    }
+                                    if (m.owner >= 0 && m.len > (int) n_past && m.len <= (int) in_vec.size()) {
+                                        // drop this slot's divergent tail past n_past, then splice
+                                        // in the shared cells [n_past, m.len) from the owner seq.
+                                        common_context_seq_rm(ctx_tgt, slot.id, n_past, -1);
+                                        common_context_seq_cp(ctx_tgt, m.owner, slot.id, n_past, m.len);
+                                        if (ctx_dft) {
+                                            common_context_seq_rm(ctx_dft.get(), slot.id, n_past, -1);
+                                            common_context_seq_cp(ctx_dft.get(), m.owner, slot.id, n_past, m.len);
+                                        }
+                                        // keep slot.prompt.tokens consistent: == input[0, m.len)
+                                        slot.prompt.tokens.keep_first(n_past);
+                                        slot.prompt.tokens.insert(llama_tokens(in_vec.begin() + n_past,
+                                                                               in_vec.begin() + m.len));
+                                        SLT_INF(slot, "ROC8 prefix-share: adopted %d tokens (n_past %d -> %d) from seq %d\n",
+                                                m.len - (int) n_past, (int) n_past, m.len, m.owner);
+                                        n_past = m.len;
+                                    }
+                                }
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
@@ -3530,6 +3598,13 @@ private:
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
+
+                        // ROC8: this slot's full prompt is now resident in KV -> make it
+                        // shareable by later requests. (Prior registration for this seq was
+                        // released in prompt_clear when its old KV was invalidated.)
+                        if (slot.pcache && !slot.prompt.tokens.has_mtmd) {
+                            slot.pcache->insert(slot.id, slot.prompt.tokens.get_text_tokens());
+                        }
 
                         GGML_ASSERT(batch.size() > 0);
 
