@@ -260,6 +260,36 @@ typedef struct {
 } block_f8e5m2;
 static_assert(sizeof(block_f8e5m2) == sizeof(ggml_half) + QK_F8E5M2, "wrong f8e5m2 block size/padding");
 
+// 2OF4_FP8 (RDNA4 2:4-structured-sparse SWMMAC driver-completeness run):
+// per-32-element block, host-side-compressed to the 16 "kept" nonzero
+// e4m3 values (2 per group of 4) + 2-bit-per-index metadata + one fp16
+// scale. This is a GGUF STORAGE layout, distinct from (but designed to
+// trivially re-pack into) the per-lane hardware VGPR layout the
+// V_SWMMAC_F32_16X16X32_FP8_FP8 instruction expects (see swmmac24.cuh);
+// ggml-cuda/mul_mat_2of4_fp8.cu does that re-pack on load.
+//
+//   qs[2*g+0], qs[2*g+1]  -- e4m3 bytes for the two kept values of group g
+//                            (g = 0..7), value order matches ascending
+//                            in-group position (v0 = lower position).
+//   meta[g/2]             -- byte holding 2 groups' worth of 2-bit indices:
+//                            low nibble = group (2*i), high nibble = group
+//                            (2*i+1); each nibble = idx0 | (idx1 << 2),
+//                            idx0 < idx1, both in [0,3] (the kept in-group
+//                            positions, 2 bits each -- exactly the ISA's
+//                            "S=0.5 VGPR/lane" sparsity_idx packing, see
+//                            swmmac24.cuh's GGML_SWMMAC24_IDX_BITS_PER_ENTRY
+//                            block of #defines).
+//
+// 22 bytes / 32 logical values = 5.5 bpw (vs block_f8e4m3's 8.5 bpw dense)
+// -- the whole point of storing only the 50% of weights the 2:4 prune kept.
+#define QK_2OF4_FP8 32
+typedef struct {
+    ggml_half d;                   // per-block scale (fp16), amax of the 16 kept values -> 448.0
+    uint8_t   qs[QK_2OF4_FP8/2];   // 16 kept e4m3 bytes (2 per group of 4, 8 groups)
+    uint8_t   meta[QK_2OF4_FP8/8]; // 4 bytes: packed 2-bit-per-index sparsity metadata
+} block_2of4_fp8;
+static_assert(sizeof(block_2of4_fp8) == sizeof(ggml_half) + QK_2OF4_FP8/2 + QK_2OF4_FP8/8, "wrong 2of4_fp8 block size/padding");
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta
