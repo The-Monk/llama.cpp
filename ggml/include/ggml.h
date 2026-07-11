@@ -432,7 +432,8 @@ extern "C" {
         GGML_TYPE_Q2_0    = 42, // PrismML ternary 2-bit (g128)
         GGML_TYPE_F8E4M3  = 43, // signed e4m3 weights + per-block fp16 scale (Path X)
         GGML_TYPE_F8E5M2  = 44, // signed e5m2 (bf8) weights + per-block fp16 scale (T97)
-        GGML_TYPE_COUNT   = 45,
+        GGML_TYPE_IU4     = 45, // signed int4 x int4 W4A4, native RDNA4 WMMA (T89 driver-completeness)
+        GGML_TYPE_COUNT   = 46,
     };
 
     // precision
@@ -478,6 +479,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_F8E4M3  = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_F8E5M2  = 29, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IU4     = 30, // except 1d tensors
     };
 
     // available tensor operations:

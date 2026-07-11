@@ -67,6 +67,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/iu4_w4a4.cuh"
+#include "ggml-cuda/mul_mat_iu4.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2387,6 +2388,14 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * glu,
                                           const ggml_tensor * ffn_up_bias = nullptr,
                                           const ggml_tensor * ffn_gate_bias = nullptr) {
+    // T89 driver-completeness run: the gate/up/GLU fusion path below calls
+    // straight into the generic mmq/mmvq machinery, which has no GGML_TYPE_IU4
+    // entry -- force these nodes back through the normal per-op MUL_MAT
+    // dispatch (ggml_cuda_mul_mat), which IS hooked for IU4.
+    if (ffn_up->src[0]->type == GGML_TYPE_IU4 || ffn_gate->src[0]->type == GGML_TYPE_IU4) {
+        return false;
+    }
+
     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
 
     if (has_bias && (!ffn_up_bias || !ffn_gate_bias)) {
@@ -2507,6 +2516,15 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    // T89 driver-completeness run: this fusion path calls straight into
+    // ggml_cuda_mul_mat_vec_q (mmvq.cu's generic templated dispatch), which
+    // has no GGML_TYPE_IU4 entry -- IU4 has its own dedicated kernel
+    // (mul_mat_iu4.cu) hooked only at the top of the normal, unfused
+    // ggml_cuda_mul_mat(). Refuse fusion so those nodes take that path.
+    if (src0->type == GGML_TYPE_IU4) {
+        return false;
+    }
+
     // F8E4M3 (Path X, Phase 2a): mmvq decode kernel now exists (see
     // ggml_cuda_should_use_mmvq, mmvq.cu) -- let the general checks below
     // decide, same as every other quantized type.
@@ -2544,6 +2562,17 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // T89 driver-completeness run: GGML_TYPE_IU4 (native int4xint4 W4A4 WMMA)
+    // is NOT wired into the generic mmq/mmvq dispatch below -- it gets its
+    // own small dedicated kernel (mul_mat_iu4.cu), hooked here exactly like
+    // the GGML_HINT_SRC0_IS_HADAMARD intercept further down. Single-GPU only
+    // (no split-buffer handling), MUL_MAT only (no MUL_MAT_ID).
+    if (src0->type == GGML_TYPE_IU4) {
+        const bool ok = ggml_cuda_op_mul_mat_iu4(ctx, src0, src1, dst);
+        GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_iu4 does not support this tensor shape");
+        return;
+    }
+
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -5199,6 +5228,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_F8E4M3:
                     case GGML_TYPE_F8E5M2:
                         return true;
+                    // T89 driver-completeness run: IU4 only has a real kernel for
+                    // plain GGML_OP_MUL_MAT (ggml_cuda_op_mul_mat_iu4, hooked at
+                    // the top of ggml_cuda_mul_mat). MUL_MAT_ID (MoE routing) is
+                    // NOT wired -- fine for this dense-model test, but a future
+                    // MoE user of IU4 would need that path built too.
+                    case GGML_TYPE_IU4:
+                        return op->op == GGML_OP_MUL_MAT;
                     default:
                         return false;
                 }

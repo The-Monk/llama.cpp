@@ -260,6 +260,21 @@ typedef struct {
 } block_f8e5m2;
 static_assert(sizeof(block_f8e5m2) == sizeof(ggml_half) + QK_F8E5M2, "wrong f8e5m2 block size/padding");
 
+// IU4 (T89->driver-completeness run): signed int4 weights (2/byte) + one
+// fp16 scale per block. Q4_0-shaped (18 bytes / 32 values), but the nibble
+// packing convention is DIFFERENT from block_q4_0: byte b's low nibble is
+// element 2*b, high nibble is element 2*b+1 (interleaved pairs), matching
+// EXACTLY the convention ggml_cuda_iu4_w4a4.cu's pack_row_i4() uses for the
+// validated `mma_iu4()` WMMA operand packing (see iu4_w4a4.cu top-of-file
+// comment) -- NOT the split-half convention block_q4_0 uses. Values are
+// symmetric-quantized to [-8,7], no zero-point.
+#define QK_IU4 32
+typedef struct {
+    ggml_half d;             // per-block scale (fp16)
+    uint8_t   qs[QK_IU4/2];  // packed signed int4, low nibble=2*b, high nibble=2*b+1
+} block_iu4;
+static_assert(sizeof(block_iu4) == sizeof(ggml_half) + QK_IU4/2, "wrong iu4 block size/padding");
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta
