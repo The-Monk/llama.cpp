@@ -48,6 +48,54 @@ def np_roundf(n: np.ndarray) -> np.ndarray:
     return np.sign(n) * b
 
 
+def pack_f8e4m3_preserve(qweight_e4m3_bytes: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    """Re-block a vendor fp8 tensor (Quark / compressed-tensors / modelopt) into
+    ggml block_f8e4m3 WITHOUT dequantizing.
+
+    Vendor decode:  w = (float)e4m3fn(qs) * scale_channel
+    block_f8e4m3:   struct { ggml_half d; uint8_t qs[32]; }, decode w = e4m3fn(qs) * d
+    => copy the e4m3fn bytes verbatim and broadcast the vendor scale into each
+    32-element block's fp16 d. Loss is limited to fp16 rounding of the scale.
+
+    Fully vectorized over arbitrary leading (e.g. MoE expert) dims: the whole
+    [E, rows, cols] stack is packed in one pass, no per-expert Python loop.
+
+    qweight_e4m3_bytes: uint8 raw e4m3fn bytes, shape [cols], [rows, cols] or [*lead, rows, cols].
+    scale: per-tensor (scalar / size-1) or per-channel ([rows] or [*lead, rows]).
+    Returns a uint8 array shaped [*lead, rows, nblk*(2+32)] (row-padded to 32).
+    """
+    QK = 32
+    q = np.ascontiguousarray(qweight_e4m3_bytes).astype(np.uint8, copy=False)
+    s = np.asarray(scale, dtype=np.float32)
+
+    if q.ndim == 1:
+        q = q[None, :]
+    if q.ndim < 2:
+        raise ValueError(f"pack_f8e4m3_preserve: unsupported ndim {q.ndim}")
+
+    lead = q.shape[:-2]
+    rows, cols = q.shape[-2:]
+    rem = cols % QK
+    if rem:  # row-pad to a block boundary; e4m3 0x00 == +0.0
+        q = np.pad(q, [(0, 0)] * (q.ndim - 1) + [(0, QK - rem)], constant_values=0)
+        cols = q.shape[-1]
+    nblk = cols // QK
+
+    # Normalize scale to per-row fp16 bits, shape [*lead, rows].
+    if s.ndim == 0 or s.size == 1:
+        s_rows = np.full((*lead, rows), float(s.reshape(-1)[0]), dtype=np.float32)
+    else:
+        s_rows = s.reshape(*lead, rows).astype(np.float32)
+    s16 = s_rows.astype(np.float16).view(np.uint16)                        # [*lead, rows]
+
+    # d bytes broadcast to every block: [*lead, rows, nblk, 2]
+    d_bytes = (np.broadcast_to(s16[..., None], (*lead, rows, nblk))
+               .astype("<u2").view(np.uint8).reshape(*lead, rows, nblk, 2))
+    qs_blocks = q.reshape(*lead, rows, nblk, QK)
+    blocks = np.concatenate([d_bytes, qs_blocks], axis=-1)                 # [*lead, rows, nblk, 34]
+    return np.ascontiguousarray(blocks.reshape(*lead, rows, nblk * (2 + QK)))
+
+
 class QuantError(Exception): ...
 
 

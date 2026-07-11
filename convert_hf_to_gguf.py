@@ -152,6 +152,11 @@ def parse_args() -> argparse.Namespace:
         "--fp8-as-q8", action="store_true",
         help="Store tensors dequantized from FP8 as Q8_0 instead of BF16/F16.",
     )
+    parser.add_argument(
+        "--fp8-native", action="store_true",
+        help="Preserve vendor FP8 (Quark / compressed-tensors / modelopt, e4m3fn) "
+             "directly into native F8E4M3 blocks without dequantizing. Sets outtype F8E4M3.",
+    )
 
     parser.add_argument(
         "--target-model-dir", type=str, default=None,
@@ -233,6 +238,9 @@ def main() -> None:
 
     with torch.inference_mode():
         output_type = ftype_map[args.outtype]
+        if args.fp8_native:
+            # Preserved vendor FP8 is written as native F8E4M3 blocks; advertise it.
+            output_type = gguf.LlamaFileType.MOSTLY_F8E4M3
         model_type = ModelType.MMPROJ if args.mmproj else ModelType.TEXT
         hparams = ModelBase.load_hparams(dir_model, is_mistral_format)
         if not is_mistral_format:
@@ -281,6 +289,7 @@ def main() -> None:
                                      target_model_dir=Path(args.target_model_dir) if args.target_model_dir else None,
                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
                                      fp8_as_q8=args.fp8_as_q8,
+                                     fp8_native=args.fp8_native,
                                      )
 
         if args.vocab_only:

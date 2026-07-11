@@ -122,7 +122,8 @@ class ModelBase:
                  sentence_transformers_dense_modules: bool = False,
                  target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
-                 fp8_as_q8: bool = False):
+                 fp8_as_q8: bool = False,
+                 fp8_native: bool = False):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -153,6 +154,7 @@ class ModelBase:
         self._is_nvfp4 = False
         self._is_mxfp4 = False
         self._fp8_as_q8 = fp8_as_q8
+        self._fp8_native = fp8_native
         self._fp8_dequantized: set[str] = set()
 
         # Apply heuristics to figure out typical tensor encoding based on first tensor's dtype
@@ -782,6 +784,68 @@ class ModelBase:
 
         del experts, merged
 
+    def _generate_fp8_preserve_tensors(self):
+        """Re-block vendor fp8 (Quark / compressed-tensors / modelopt, 1D per-channel
+        or per-tensor scale) straight into block_f8e4m3 WITHOUT dequantizing, so the
+        vendor's calibrated fp8 runs unchanged on the native F8E4M3 kernel.
+        Mirrors _generate_nvfp4_tensors: pairs .weight/.weight_scale, stacks MoE
+        experts, writes raw via add_tensor(raw_dtype=F8E4M3), and consumes the
+        source tensors so dequant_model/the main loop skip them. Non-quantized
+        tensors (no .weight_scale) are left untouched for the normal bf16/f16 path."""
+        n_experts = self.find_hparam(["num_local_experts", "num_experts"], optional=True) or 0
+        # per (layer, proj): list of (expert_id, weight_bytes[rows, cols], scale[rows])
+        expert_parts: dict[tuple[int, str], list[tuple[int, np.ndarray, np.ndarray]]] = {}
+        consumed: list[str] = []
+
+        for name in list(self.model_tensors.keys()):
+            if not name.endswith(".weight"):
+                continue
+            scale_name = name + "_scale"
+            if scale_name not in self.model_tensors:
+                continue
+            weight = LazyTorchTensor.to_eager(self.model_tensors[name]())
+            # Only e4m3fn weights belong to us; leave non-fp8 to existing paths.
+            if weight.dtype != torch.float8_e4m3fn:
+                continue
+            scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
+            # Per-channel fp8 scale is (rows,1) or (rows,); per-tensor is scalar/(1,).
+            # Genuinely block-wise/NVFP4 scale has last dim > 1 -> not ours.
+            if scale.ndim >= 2 and scale.shape[-1] != 1:
+                continue
+            wbytes = weight.view(torch.uint8).cpu().numpy()          # raw e4m3fn bytes, verbatim
+            sarr = scale.reshape(-1).float().cpu().numpy()           # per-channel (or size-1)
+            consumed += [name, scale_name]
+
+            m = re.search(r'\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$', name)
+            if m and n_experts > 0:
+                bid_m = re.search(r'\.layers\.(\d+)\.', name)
+                bid = int(bid_m.group(1)) if bid_m else 0
+                key = (bid, m.group(2))
+                expert_parts.setdefault(key, []).append((int(m.group(1)), wbytes, sarr))
+                if len(expert_parts[key]) >= n_experts:
+                    self._flush_fp8_experts(key, expert_parts)
+            else:
+                new_name = self.map_tensor_name(name)
+                raw = gguf.quants.pack_f8e4m3_preserve(wbytes, sarr)
+                self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.F8E4M3)
+
+        for key in list(expert_parts.keys()):
+            self._flush_fp8_experts(key, expert_parts)   # fallback flush if n_experts unknown
+
+        for name in consumed:
+            self.model_tensors.pop(name, None)
+
+    def _flush_fp8_experts(self, key, expert_parts):
+        bid, proj = key
+        parts = expert_parts.pop(key)
+        parts.sort(key=lambda x: x[0])                              # order by expert id
+        weights = np.stack([p[1] for p in parts], axis=0)          # [n_expert, rows, cols]
+        scales = np.stack([p[2] for p in parts], axis=0)           # [n_expert, rows]
+        raw = gguf.quants.pack_f8e4m3_preserve(weights, scales)    # one vectorized pack for all experts
+        new_name = self.map_tensor_name(f"model.layers.{bid}.mlp.experts.{proj}.weight")
+        logger.info(f"fp8-native: packed {new_name} [{weights.shape[0]} experts] as F8E4M3 (preserved)")
+        self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.F8E4M3)
+
     def prepare_tensors(self):
         # detect NVFP4 quantization (ModelOpt and Compressed-tensors formats)
         quantization_config = self.hparams.get("quantization_config") or {}
@@ -851,6 +915,12 @@ class ModelBase:
                         if input_scale_name not in self.model_tensors:
                             self.model_tensors[input_scale_name] = inverse_scale(self.model_tensors.pop(name))
             self._generate_nvfp4_tensors()
+
+        # FP8-native (Quark bridge): preserve vendor e4m3 into block_f8e4m3 before
+        # dequant_model would otherwise dequantize it. Must run before dequant_model
+        # so the packed tensors are removed from model_tensors.
+        if self._fp8_native and quant_method in ("compressed-tensors", "fp8", "modelopt"):
+            self._generate_fp8_preserve_tensors()
 
         self.dequant_model()
 
@@ -958,6 +1028,11 @@ class ModelBase:
                         data_qtype = gguf.GGMLQuantizationType.TQ1_0
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ2_0:
                         data_qtype = gguf.GGMLQuantizationType.TQ2_0
+                    elif self.ftype == gguf.LlamaFileType.MOSTLY_F8E4M3:
+                        # FP8-native: quantized weights are preserved as F8E4M3 in
+                        # _generate_fp8_preserve_tensors; anything reaching here is a
+                        # non-quantized (vendor 'ignore') tensor -> keep it in F16.
+                        data_qtype = gguf.GGMLQuantizationType.F16
                     else:
                         raise ValueError(f"Unknown file type: {self.ftype.name}")
 
