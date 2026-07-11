@@ -869,6 +869,15 @@ class ModelBase:
         logger.info(f"fp8-native: packed {new_name} [{weights.shape[0]} experts] as F8E4M3 (preserved)")
         self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.F8E4M3)
 
+    def _transform_mxfp8_weight(self, name: str, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor]:
+        """Hook for arch-specific row/col reorders that must be applied to a
+        preserved MXFP8 tensor before packing (ROC8). No-op by default;
+        overridden by _LinearAttentionVReorderBase (conversion/qwen.py) for the
+        GatedDeltaNet linear-attention V-head reorder -- the exact same class of
+        problem _transform_nvfp4_weight already solves for NVFP4, just simpler
+        (MXFP8 is 1 byte/value, no nibble pack/unpack needed)."""
+        return weight, scale
+
     def _generate_mxfp8_preserve_tensors(self):
         """ROC8: re-block MLX `mx.quantize(mode="mxfp8")` tensors (group_size=32,
         OCP Microscaling FP8) straight into ggml block_mxfp8 WITHOUT dequantizing.
@@ -925,8 +934,16 @@ class ModelBase:
 
             rows, cols_packed = weight.shape[-2], weight.shape[-1]
             cols = cols_packed * 4
-            wbytes = weight.contiguous().view(torch.uint8).cpu().numpy().reshape(rows, cols)
-            sarr = scale.contiguous().cpu().numpy().reshape(rows, cols // 32)
+            wbytes_t = weight.contiguous().view(torch.uint8).reshape(rows, cols)
+            sarr_t = scale.contiguous().reshape(rows, cols // 32)
+
+            # Arch-specific reorder hook (e.g. GatedDeltaNet V-head grouped->tiled,
+            # _LinearAttentionVReorderBase) -- MUST run on the raw byte/scale
+            # tensors before packing, since it permutes rows/cols of the actual
+            # weight matrix, not just the container format.
+            wbytes_t, sarr_t = self._transform_mxfp8_weight(name, wbytes_t, sarr_t)
+            wbytes = wbytes_t.cpu().numpy()
+            sarr = sarr_t.cpu().numpy()
 
             consumed += [name, scale_name]
             new_name = self.map_tensor_name(name)
