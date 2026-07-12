@@ -476,6 +476,121 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         weight, scale = self._transform_nvfp4_weight(name, weight, scale)
         super()._repack_nvfp4(name, weight, scale, scale2, input_scale)
 
+    def _transform_fp8_weight(self, name: str, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor]:
+        """F8E4M3-preserve twin of _transform_mxfp8_weight below: the same V-head
+        grouped->tiled reorder, on raw e4m3 bytes (1 byte/value, no nibble pack).
+        The vendor fp8 scale is either per-channel (1 value per output row),
+        per-tensor, or a DeepSeek-style 2D block grid [rows/br, cols/bc]
+        (Qwen3.5/3.6 use 128x128 block-scale on linear_attn, weight_scale_inv).
+        Row/col reorders index_select the weight and the matching scale; block
+        reorders reduce the row/col perm to whole scale blocks and assert block
+        alignment, so a scale a V-head split cannot be applied to fails loud."""
+        if not name.endswith((
+            ".linear_attn.in_proj_qkv.weight",
+            ".linear_attn.in_proj_z.weight",
+            ".linear_attn.in_proj_a.weight",
+            ".linear_attn.in_proj_b.weight",
+            ".linear_attn.out_proj.weight",
+        )):
+            return weight, scale
+
+        num_k_heads = self.hparams["linear_num_key_heads"]
+        num_v_heads = self.hparams["linear_num_value_heads"]
+        head_k_dim = self.hparams["linear_key_head_dim"]
+        head_v_dim = self.hparams["linear_value_head_dim"]
+        num_v_per_k = num_v_heads // num_k_heads
+
+        rows, cols = weight.shape[-2], weight.shape[-1]
+        qcfg = self.hparams.get("quantization_config") or {}
+        wbs = qcfg.get("weight_block_size")
+        block_dims = tuple(wbs) if isinstance(wbs, (list, tuple)) and len(wbs) == 2 else None
+        block_r = block_c = None
+        if (block_dims is not None and scale.ndim == 2
+                and scale.shape[0] == rows // block_dims[0]
+                and scale.shape[1] == cols // block_dims[1]):
+            kind = "block"
+            block_r, block_c = block_dims
+        elif scale.numel() == rows:
+            kind = "channel"
+        elif scale.numel() == 1:
+            kind = "tensor"
+        else:
+            raise ValueError(
+                f"fp8-native: unsupported scale layout {tuple(scale.shape)} for "
+                f"linear-attention tensor {name!r} (weight {tuple(weight.shape)}); "
+                "expected per-channel, per-tensor, or aligned block-scale")
+
+        def permute_scale_rows(s, row_perm, n_rows):
+            if kind == "tensor":
+                return s
+            if kind == "channel":
+                assert s.shape[0] == n_rows
+                return s.index_select(0, row_perm.to(device=s.device))
+            assert n_rows % block_r == 0
+            blocks = row_perm.reshape(-1, block_r)
+            starts = blocks[:, 0]
+            expected = starts.unsqueeze(1) + torch.arange(block_r, dtype=row_perm.dtype)
+            assert torch.equal(blocks, expected) and bool(torch.all(starts % block_r == 0)), \
+                f"fp8-native: V-head row reorder not aligned to {block_r}-row scale blocks for {name!r}"
+            block_perm = (starts // block_r).to(torch.long)
+            assert s.shape[0] == block_perm.numel()
+            return s.index_select(0, block_perm.to(device=s.device))
+
+        def reorder_rows(w, s, head_dim):
+            n = w.shape[0]
+            row_perm = self._reorder_v_heads(
+                torch.arange(n, dtype=torch.long).unsqueeze(-1),
+                0, num_k_heads, num_v_per_k, head_dim,
+            ).squeeze(-1)
+            w = w.index_select(0, row_perm.to(device=w.device))
+            s = permute_scale_rows(s, row_perm, n)
+            return w, s
+
+        if name.endswith(".linear_attn.in_proj_qkv.weight"):
+            q_dim = head_k_dim * num_k_heads
+            k_dim = head_k_dim * num_k_heads
+            q = weight[:q_dim]
+            k = weight[q_dim:q_dim + k_dim]
+            v = weight[q_dim + k_dim:]
+            if kind == "tensor":
+                v, _ = reorder_rows(v, scale, head_v_dim)
+                return torch.cat([q, k, v], dim=0), scale
+            if kind == "block":
+                assert q_dim % block_r == 0 and k_dim % block_r == 0
+                qn, kn = q_dim // block_r, k_dim // block_r
+                q_scale, k_scale, v_scale = scale[:qn], scale[qn:qn + kn], scale[qn + kn:]
+            else:
+                q_scale = scale[:q_dim]
+                k_scale = scale[q_dim:q_dim + k_dim]
+                v_scale = scale[q_dim + k_dim:]
+            v, v_scale = reorder_rows(v, v_scale, head_v_dim)
+            return torch.cat([q, k, v], dim=0), torch.cat([q_scale, k_scale, v_scale], dim=0)
+
+        if name.endswith(".linear_attn.in_proj_z.weight"):
+            weight, scale = reorder_rows(weight, scale, head_v_dim)
+        elif name.endswith((".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_b.weight")):
+            weight, scale = reorder_rows(weight, scale, 1)
+        elif name.endswith(".linear_attn.out_proj.weight"):
+            col_perm = self._reorder_v_heads(
+                torch.arange(num_v_heads * head_v_dim, dtype=torch.long).unsqueeze(0),
+                1, num_k_heads, num_v_per_k, head_v_dim,
+            ).squeeze(0)
+            weight = weight.index_select(-1, col_perm.to(device=weight.device, dtype=torch.long))
+            if kind == "block":
+                assert cols % block_c == 0
+                groups = col_perm.reshape(-1, block_c)
+                starts = groups[:, 0]
+                expected = starts.unsqueeze(1) + torch.arange(block_c, dtype=col_perm.dtype)
+                assert torch.equal(groups, expected) and bool(torch.all(starts % block_c == 0)), \
+                    f"fp8-native: out_proj column reorder not aligned to {block_c}-col scale blocks for {name!r}"
+                col_group_perm = (starts // block_c).to(torch.long)
+                assert scale.shape[-1] == col_group_perm.numel()
+                scale = scale.index_select(-1, col_group_perm.to(device=scale.device))
+            # per-channel / per-tensor scale is per output row, unaffected by an
+            # input-column permutation, so it is left unchanged.
+
+        return weight, scale
+
     def _transform_mxfp8_weight(self, name: str, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor]:
         """ROC8 twin of _transform_nvfp4_weight above: the SAME V-head
         grouped->tiled row/col reorder problem, but MXFP8 stores 1 raw e4m3
