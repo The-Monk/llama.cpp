@@ -218,6 +218,12 @@ class ModelBase:
         prefix = "model" if not self.is_mistral_format else "consolidated"
         part_names: list[str] = ModelBase.get_model_part_names(self.dir_model, prefix, ".safetensors")
         is_safetensors: bool = len(part_names) > 0
+        if not is_safetensors and not self.is_mistral_format and (self.dir_model / "model.safetensors.index.json").is_file():
+            # some vendor dumps shard safetensors with a non-standard filename prefix
+            # (e.g. "layers-0.safetensors" instead of "model-00001-of-N.safetensors"), so the
+            # prefix scan above finds nothing even though a valid index file exists. Trust the
+            # index in that case instead of silently falling through to the .bin branch below.
+            is_safetensors = True
         if not is_safetensors:
             part_names = ModelBase.get_model_part_names(self.dir_model, "pytorch_model", ".bin")
 
