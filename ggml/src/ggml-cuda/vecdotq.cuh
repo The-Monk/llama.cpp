@@ -1078,6 +1078,44 @@ static __device__ __forceinline__ float vec_dot_mxfp8_q8_1(
     return vec_dot_mxfp8_q8_1_impl<VDR_MXFP8_Q8_1_MMVQ>(vbq, bq8_1, kbx, iqs);
 }
 
+// T77-equivalent MXFP8 decode: RDNA4 hardware-dot2 path. MXFP8 values ARE e4m3
+// (identical to block_f8e4m3), so the same ggml_cuda_dot2_e4m3_q8 hardware
+// weight-decode applies verbatim -- ONLY the block scale differs (MXFP8's e8m0
+// power-of-2 exponent vs F8E4M3's fp16 d). Mirrors vec_dot_f8e4m3_q8_1_simd_impl
+// AND (deliberately) F8E5M2's T77 choice: activations stay native int8 q8_1
+// (LOSSLESS, no activation-quantize swap), NOT F8E4M3's T79 pure-dot4 (which
+// needs an e4m3 activation buffer + carries a disclosed ~1.2-1.5% accuracy hit).
+// Falls back to the scalar T73 impl (bit-identical, slower) off RDNA4 / non-HIP.
+template <int vdr>
+static __device__ __forceinline__ float vec_dot_mxfp8_q8_1_simd_impl(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_mxfp8 * bq8 = (const block_mxfp8 *) vbq + kbx;
+
+#if defined(GGML_CUDA_F8E4M3_HAS_NATIVE_DOT2)
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+        const int vi = get_int_b2(bq8->qs, iqs + i);
+        const int ui = get_int_b4(bq8_1->qs, iqs + i);
+
+        const int8_t a0 = (int8_t) (ui >>  0);
+        const int8_t a1 = (int8_t) (ui >>  8);
+        const int8_t a2 = (int8_t) (ui >> 16);
+        const int8_t a3 = (int8_t) (ui >> 24);
+
+        sumf = ggml_cuda_dot2_e4m3_q8((uint32_t) vi         & 0xFFFF, a0, a1, sumf);
+        sumf = ggml_cuda_dot2_e4m3_q8(((uint32_t) vi >> 16) & 0xFFFF, a2, a3, sumf);
+    }
+
+    // e8m0 (power-of-2) scale, same convention as vec_dot_mxfp8_q8_1_impl above.
+    return sumf * ggml_cuda_e8m0_to_fp32(bq8->e) * __low2float(bq8_1->ds);
+#else
+    return vec_dot_mxfp8_q8_1_impl<vdr>(vbq, bq8_1, kbx, iqs);
+#endif
+}
+
 // T79: pure V_DOT4_F32_FP8_FP8 decode dot. Where T77's hardware-dot2 path
 // still detours the ACTIVATION through int8 (q8_1) and only accelerates the
 // WEIGHT-side decode (2 terms / 3 hardware instructions: cvt_pk_f32_fp8 +
