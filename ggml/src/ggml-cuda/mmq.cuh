@@ -1624,6 +1624,18 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma(
 // or the tiling math). Only the D4 single-float-scale activation layout is
 // implemented (see quantize_mmq_f8e4m3 in quantize.cu); no DS4/D2S6 variant
 // needed since fp8 has no zero-point/partial-sum correction to carry.
+//
+// Card 120 (GGML_HIP_FP8_MIXED_BF8_ACT, default OFF): when the CMake option
+// is on, this same function drives the MIXED fp8(e4m3 weight)xbf8(e5m2
+// activation) accuracy experiment instead -- the byte container/addressing
+// is IDENTICAL (both quantize_mmq_f8e4m3 and quantize_mmq_f8e5m2 write the
+// same block_q8_1_mmq D4 layout, see quantize.cu), only the WMMA opcode
+// changes (mma_mixed_fp8_bf8 instead of mma), and the host side swaps which
+// activation quantizer fills y (mmq.cu, same macro). Function name is left
+// unchanged (not renamed to "..._bf8act_mma") to keep this a minimal,
+// revertible, single-function diff -- the macro is the single source of
+// truth for which silicon path is active, and it defaults OFF so production
+// F8E4M3 prefill is byte-for-byte unchanged.
 template <int mmq_x, int mmq_y>
 static __device__ __forceinline__ void vec_dot_f8e4m3_f8e4m3_mma(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
@@ -1666,7 +1678,11 @@ static __device__ __forceinline__ void vec_dot_f8e4m3_f8e4m3_mma(
 #pragma unroll
             for (int n = 0; n < ntx; ++n) {
                 tile_C C;
+#if defined(GGML_HIP_FP8_MIXED_BF8_ACT)
+                mma_mixed_fp8_bf8(C, A[n], B); // card 120: fp8(e4m3 weight) x bf8(e5m2 activation)
+#else
                 mma(C, A[n], B);
+#endif // defined(GGML_HIP_FP8_MIXED_BF8_ACT)
 
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {

@@ -1396,6 +1396,39 @@ namespace ggml_cuda_mma {
 #endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
     }
 
+    // Card 120: MIXED fp8_e4m3 (A, weight) x bf8_e5m2 (B, activation) -> f32
+    // WMMA (RDNA4/gfx12 only). Accuracy-lever experiment, not a speed lever --
+    // weights stay F8E4M3 (well-behaved, wants the extra mantissa bit),
+    // activations get quantized to bf8/e5m2 instead of e4m3 (wants the extra
+    // exponent bit for outlier range). ISA-verified real silicon (standalone
+    // HIP kernel + llvm-objdump --mcpu=gfx1201, card 120 session): encodes to
+    // `v_wmma_f32_16x16x16_fp8_bf8` (opcode 0xCC47), a DISTINCT opcode from
+    // both `v_wmma_f32_16x16x16_fp8_fp8` (0xCC46, the production fp8_fp8
+    // above) and the reverse `v_wmma_f32_16x16x16_bf8_fp8` (0xCC48) -- the
+    // RDNA4 WMMA cross matrix genuinely has all 4 fp8/bf8 combinations as
+    // independent instructions, operand order matters (A=fp8, B=bf8 for this
+    // one). Named separately (not a `mma()` overload) for the same ODR
+    // reason as `mma_bf8` above -- this C++ signature is already claimed by
+    // the fp8_fp8 overload. Gated behind GGML_HIP_FP8_MIXED_BF8_ACT (CMake
+    // option, default OFF) so the production fp8_fp8 path is byte-for-byte
+    // unchanged when the option is off.
+    template <data_layout dl_d, data_layout dl_ab>
+    static __device__ __forceinline__ void mma_mixed_fp8_bf8(
+            tile<16, 16, float, dl_d> & D, const tile<16, 8, int, dl_ab> & A, const tile<16, 8, int, dl_ab> & B) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+        using float8_t  = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+        using int32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+        float8_t          * acc   = (float8_t *) D.x;
+        const int32x2_t   * a_vec = (const int32x2_t *) A.x;
+        const int32x2_t   * b_vec = (const int32x2_t *) B.x;
+        acc[0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_bf8_w32_gfx12(a_vec[0], b_vec[0], acc[0]);
+        acc[0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_bf8_w32_gfx12(a_vec[1], b_vec[1], acc[0]);
+#else
+        GGML_UNUSED_VARS(D, A, B);
+        NO_DEVICE_CODE;
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+    }
+
     static __device__ __forceinline__ void mma(
             tile<32, 32, int> & D, const tile<32, 4, int> & A, const tile<32, 4, int> & B) {
 #if defined(AMD_MFMA_AVAILABLE)

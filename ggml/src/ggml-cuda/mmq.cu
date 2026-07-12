@@ -145,10 +145,22 @@ void ggml_cuda_mul_mat_q(
     // reuses this exact activation quantizer unchanged. quantize_mmq_f8e4m3's
     // own GGML_ASSERT(type_src0 == ...) was broadened to accept MXFP8 too
     // (quantize.cu) -- the two changes are correctness-coupled.
-    const bool use_native_f8e4m3 = src0->type == GGML_TYPE_F8E4M3 || src0->type == GGML_TYPE_MXFP8;
+    // Card 120: GGML_HIP_FP8_MIXED_BF8_ACT (CMake option, default OFF) routes
+    // F8E4M3's activation quantizer to the e5m2/bf8 one below instead of its
+    // own e4m3 one -- weights stay raw e4m3 (x_qs/x_df unaffected, this is
+    // purely a src1/activation-side swap), and vec_dot_f8e4m3_f8e4m3_mma
+    // (mmq.cuh, same macro) swaps the WMMA opcode fp8_fp8 -> fp8_bf8 to
+    // match. Both halves of this correctness-coupled pair share the same
+    // macro so they can never independently drift out of sync.
+#if defined(GGML_HIP_FP8_MIXED_BF8_ACT)
+    const bool use_mixed_bf8_act = src0->type == GGML_TYPE_F8E4M3;
+#else
+    const bool use_mixed_bf8_act = false;
+#endif // defined(GGML_HIP_FP8_MIXED_BF8_ACT)
+    const bool use_native_f8e4m3 = (src0->type == GGML_TYPE_F8E4M3 || src0->type == GGML_TYPE_MXFP8) && !use_mixed_bf8_act;
     // T97: same rationale as F8E4M3 above -- the bf8xbf8 WMMA fragment needs
     // src1 quantized to native e5m2, not int8 Q8_1.
-    const bool use_native_f8e5m2 = src0->type == GGML_TYPE_F8E5M2;
+    const bool use_native_f8e5m2 = src0->type == GGML_TYPE_F8E5M2 || use_mixed_bf8_act;
 
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
