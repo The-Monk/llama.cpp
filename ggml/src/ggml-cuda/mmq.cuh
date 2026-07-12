@@ -4223,6 +4223,23 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
+// Card 137 fix 1 (register spills) -- MXFP8/F8E5M2 mmq_x=48 tile
+// INVESTIGATED, NOT FIXABLE via launch_bounds: tried relaxing MIN_BLOCKS
+// 2->1 for exactly this (type, mmq_x) pair on the theory that the occupancy
+// hint was constraining the compiler's register budget below what the
+// kernel needs. Empirically FALSIFIED -- llvm-readobj NT_AMDGPU_METADATA on
+// the rebuilt object shows byte-identical vgpr_count=256 (the architectural
+// per-thread ceiling for wave32 on gfx1201) and vgpr_spill_count=28/63
+// (need_check=false/true) at BOTH MIN_BLOCKS=1 and MIN_BLOCKS=2 -- i.e. the
+// kernel's true live-register need already exceeds the hard 256-VGPR/thread
+// ISA limit regardless of any occupancy hint, so MIN_BLOCKS tuning cannot
+// move it. A real fix would require restructuring the WMMA accumulator/
+// tile-staging for this non-power-of-2 tile width (mmq_x=48 = 3 WMMA-N
+// chunks, more fragments than 32/64/96/128's cleaner divisions) -- out of
+// scope for a launch-parameter edit; would touch the shared mul_mat_q body
+// used by every mmq type and risk regressing the non-spilling common
+// shapes. Reported BLOCKED in card 137; see wiki/tech/rdna4-isa-
+// optimization-audit.md. MIN_BLOCKS left at the original 2 for every type.
 template <ggml_type type, int mmq_x, bool need_check>
 #if defined(GGML_USE_HIP)
 #if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
