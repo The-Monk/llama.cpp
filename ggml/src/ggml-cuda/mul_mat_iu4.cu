@@ -39,6 +39,9 @@
 
 #include "mma.cuh"
 #include <cstring>
+#include <random>
+#include <vector>
+#include <algorithm>
 
 using namespace ggml_cuda_mma;
 
@@ -145,17 +148,18 @@ static __global__ void k_mul_mat_iu4(
         load_generic(A, &sh_A[0][0], 4);
         load_generic(B, &sh_B[0][0], 4);
 
-        // KNOWN BUG (EXPERIMENTAL / model-blocked path, not fixed here -- see
-        // block_iu4 comment in ggml-common.h): this accumulator uses the
-        // default DATA_LAYOUT_I_MAJOR, but 615f718ca (iu4_w4a4.cu selftest)
-        // found the WMMA accumulator's physical VGPR layout on RDNA4 is the
-        // TRANSPOSE of the A/B input layout, so get_i()/get_j() here read
-        // (row, col) swapped -- only ever verified correct on the diagonal.
-        // The fix there was `tile<16, 16, int, DATA_LAYOUT_J_MAJOR> D`; this
-        // kernel was not ported to that fix. Output is therefore expected to
-        // be silently wrong (garbage/RTN-at-best) off the diagonal until it
-        // is.
-        tile<16, 16, int> D;
+        // Fix ported from 615f718ca (iu4_w4a4.cu selftest): the WMMA
+        // accumulator's physical VGPR layout on RDNA4 is the TRANSPOSE of
+        // the A/B input layout, so reading it back through the default
+        // DATA_LAYOUT_I_MAJOR tile gives get_i()/get_j() swapped relative
+        // to the true (row, col) -- invisible on the diagonal, wrong
+        // everywhere else. DATA_LAYOUT_J_MAJOR swaps get_i()<->get_j() back
+        // to the correct orientation (same convention mmq.cuh's
+        // vec_dot_q8_0_16_q8_1_mma already uses for an identical
+        // tile<16,4,int> A/B shape). The final store loop below must use
+        // the same data_layout tag for its get_i/get_j so it maps `l` back
+        // to the same (i, j) that acc[l] was accumulated under.
+        tile<16, 16, int, DATA_LAYOUT_J_MAJOR> D;
 #pragma unroll
         for (int l = 0; l < D.ne; ++l) {
             D.x[l] = 0;
@@ -174,8 +178,8 @@ static __global__ void k_mul_mat_iu4(
 
 #pragma unroll
     for (int l = 0; l < 8; ++l) {
-        const int     i = tile<16, 16, int>::get_i(l);
-        const int     j = tile<16, 16, int>::get_j(l);
+        const int     i = tile<16, 16, int, DATA_LAYOUT_J_MAJOR>::get_i(l);
+        const int     j = tile<16, 16, int, DATA_LAYOUT_J_MAJOR>::get_j(l);
         const int64_t m = m0 + i;
         const int64_t n = n0 + j;
         if (m < M && n < N) {
@@ -220,4 +224,147 @@ bool ggml_cuda_op_mul_mat_iu4(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 
     return true;
+}
+
+// Card 133 item 3: minimal synthetic correctness check for k_mul_mat_iu4
+// itself (not just the mma_iu4() primitive, which iu4_w4a4.cu's selftest
+// already covers). iu4 has no real GGUF producer model yet (rotation-free
+// packed-int4 W4A4, see mul_mat_iu4.cuh), so this bypasses
+// ggml_cuda_op_mul_mat_iu4()/k_quantize_act_iu4 and the ggml_tensor
+// machinery entirely: it hand-packs both operands into block_iu4 with a
+// fixed per-block scale of 1.0 (so the WMMA int32 accumulator IS the
+// answer, no floating-point rounding anywhere) and launches k_mul_mat_iu4
+// directly against an exact CPU int4 x int4 reference. Deliberately uses
+// non-multiple-of-16 M/N (exercises the boundary clamp) and K spanning 2
+// blocks (exercises the multi-chunk accumulation loop), same style as
+// iu4_w4a4.cu's run_trial().
+namespace ggml_cuda_mul_mat_iu4_selftest_detail {
+
+static void pack_iu4_block(const int vals[QK_IU4], block_iu4 & blk) {
+    blk.d = __float2half(1.0f); // fixed unit scale: accumulator == answer, no rounding
+    for (int j = 0; j < 4; ++j) {
+        uint32_t word = 0;
+        for (int b = 0; b < 4; ++b) {
+            const int      k_lo = 8*j + 2*b;
+            const int      k_hi = 8*j + 2*b + 1;
+            const uint32_t nlo  = (uint32_t) (vals[k_lo] & 0xF);
+            const uint32_t nhi  = (uint32_t) (vals[k_hi] & 0xF);
+            word |= (nlo | (nhi << 4)) << (8*b);
+        }
+        std::memcpy(blk.qs + 4*j, &word, 4);
+    }
+}
+
+static bool run_trial(std::mt19937 & rng, int64_t M, int64_t N, int64_t K, long & max_abs_err_out) {
+    std::uniform_int_distribution<int> valdist(-8, 7);
+    const int64_t n_blocks_k = K / QK_IU4;
+
+    std::vector<std::vector<int>> act_logical(M, std::vector<int>(K));
+    std::vector<std::vector<int>> w_logical(N, std::vector<int>(K));
+    for (int64_t m = 0; m < M; ++m) {
+        for (int64_t k = 0; k < K; ++k) {
+            act_logical[m][k] = valdist(rng);
+        }
+    }
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t k = 0; k < K; ++k) {
+            w_logical[n][k] = valdist(rng);
+        }
+    }
+
+    std::vector<block_iu4> act_blocks((size_t) (M * n_blocks_k));
+    std::vector<block_iu4> w_blocks((size_t) (N * n_blocks_k));
+    for (int64_t m = 0; m < M; ++m) {
+        for (int64_t c = 0; c < n_blocks_k; ++c) {
+            pack_iu4_block(&act_logical[m][c * QK_IU4], act_blocks[m * n_blocks_k + c]);
+        }
+    }
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t c = 0; c < n_blocks_k; ++c) {
+            pack_iu4_block(&w_logical[n][c * QK_IU4], w_blocks[n * n_blocks_k + c]);
+        }
+    }
+
+    block_iu4 * d_act = nullptr;
+    block_iu4 * d_w   = nullptr;
+    float *     d_dst = nullptr;
+    if (hipMalloc(&d_act, act_blocks.size() * sizeof(block_iu4)) != hipSuccess ||
+        hipMalloc(&d_w,   w_blocks.size()   * sizeof(block_iu4)) != hipSuccess ||
+        hipMalloc(&d_dst, (size_t) (M * N) * sizeof(float)) != hipSuccess) {
+        GGML_LOG_ERROR("%s: hipMalloc failed\n", __func__);
+        return false;
+    }
+    CUDA_CHECK(hipMemcpy(d_act, act_blocks.data(), act_blocks.size() * sizeof(block_iu4), hipMemcpyHostToDevice));
+    CUDA_CHECK(hipMemcpy(d_w,   w_blocks.data(),   w_blocks.size()   * sizeof(block_iu4), hipMemcpyHostToDevice));
+    CUDA_CHECK(hipMemset(d_dst, 0, (size_t) (M * N) * sizeof(float)));
+
+    const int64_t nb01                   = n_blocks_k * (int64_t) sizeof(block_iu4);
+    const int64_t dst_row_stride_floats  = N;
+    const dim3    grid((N + 15) / 16, (M + 15) / 16, 1);
+    const dim3    block(32, 1, 1);
+    k_mul_mat_iu4<<<grid, block, 0, 0>>>(
+            (const char *) d_w, d_act, d_dst, M, N, nb01, n_blocks_k, dst_row_stride_floats);
+    const hipError_t err = hipDeviceSynchronize();
+    if (err != hipSuccess) {
+        GGML_LOG_ERROR("%s: k_mul_mat_iu4 failed: %s\n", __func__, hipGetErrorString(err));
+        (void) hipFree(d_act); (void) hipFree(d_w); (void) hipFree(d_dst);
+        return false;
+    }
+
+    std::vector<float> out((size_t) (M * N));
+    CUDA_CHECK(hipMemcpy(out.data(), d_dst, out.size() * sizeof(float), hipMemcpyDeviceToHost));
+    (void) hipFree(d_act); (void) hipFree(d_w); (void) hipFree(d_dst);
+
+    long max_abs = 0;
+    long diag_mismatches = 0, offdiag_mismatches = 0;
+    for (int64_t m = 0; m < M; ++m) {
+        for (int64_t n = 0; n < N; ++n) {
+            long ref = 0;
+            for (int64_t k = 0; k < K; ++k) {
+                ref += (long) act_logical[m][k] * (long) w_logical[n][k];
+            }
+            const long got = (long) out[m * N + n];
+            const long diff = std::labs(got - ref);
+            max_abs = std::max(max_abs, diff);
+            if (diff != 0) {
+                if (m == n) { diag_mismatches++; } else { offdiag_mismatches++; }
+            }
+        }
+    }
+    max_abs_err_out = max_abs;
+    if (max_abs != 0) {
+        GGML_LOG_INFO("%s: mismatch signature: %ld diagonal, %ld off-diagonal (of %ld total)\n",
+                       __func__, diag_mismatches, offdiag_mismatches, (long) (M * N));
+    }
+    return max_abs == 0;
+}
+
+} // namespace ggml_cuda_mul_mat_iu4_selftest_detail
+
+bool ggml_cuda_mul_mat_iu4_selftest() {
+    const int device = ggml_cuda_get_device();
+    const int cc     = ggml_cuda_info().devices[device].cc;
+    if (!GGML_CUDA_CC_IS_RDNA4(cc)) {
+        // Not RDNA4 -- k_mul_mat_iu4's mma_iu4() call is a NO_DEVICE_CODE
+        // no-op off RDNA4, nothing meaningful to test. Vacuously true.
+        return true;
+    }
+
+    using namespace ggml_cuda_mul_mat_iu4_selftest_detail;
+    std::mt19937 rng(133133); // card 133
+    bool all_pass = true;
+    long worst = 0;
+    const int n_trials = 20;
+    // M, N deliberately not multiples of 16 (boundary clamp); K spans 2
+    // QK_IU4 blocks (multi-chunk accumulation loop).
+    for (int t = 0; t < n_trials; ++t) {
+        long max_abs_err = 0;
+        if (!run_trial(rng, /*M=*/24, /*N=*/40, /*K=*/64, max_abs_err)) {
+            all_pass = false;
+        }
+        worst = std::max(worst, max_abs_err);
+    }
+    GGML_LOG_INFO("%s: k_mul_mat_iu4 real-model wrapper, %d random trials (M=24,N=40,K=64) -> %s (max_abs_err=%ld)\n",
+                   __func__, n_trials, all_pass ? "PASS" : "FAIL", worst);
+    return all_pass;
 }

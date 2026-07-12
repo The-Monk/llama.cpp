@@ -20,12 +20,13 @@
 //       QuaRot/SpinQuant online rotation or a co-trained BitNet-a4.8 (see
 //       cards 122/133). Plain RTN quantization is a placeholder, not
 //       expected to be production quality even once numerically correct.
-//   (b) k_mul_mat_iu4's accumulator likely still carries the transposed-
-//       readback bug 615f718ca fixed in the iu4_w4a4.cu selftest
-//       (DATA_LAYOUT_J_MAJOR was never ported here) -- see the comment at
-//       its `tile<16, 16, int> D` declaration in mul_mat_iu4.cu. Output is
-//       expected to be garbage/RTN-at-best off the diagonal until that is
-//       fixed.
+//   (b) k_mul_mat_iu4's accumulator carried the same transposed-readback
+//       bug 615f718ca fixed in the iu4_w4a4.cu selftest (DATA_LAYOUT_J_MAJOR
+//       was not ported here originally); now ported -- see the comment at
+//       its `tile<16, 16, int, DATA_LAYOUT_J_MAJOR> D` declaration in
+//       mul_mat_iu4.cu. The kernel is therefore correct (verified against a
+//       CPU int4xint4 reference), but remains dormant because (a) still
+//       blocks end-to-end use.
 // It compiles and runs finite (no crash) on real GGUF tensors but is NOT
 // production. This dormancy is confined to GGML_TYPE_IU4's own dispatch
 // path (ggml-cuda.cu's GGML_TYPE_IU4 intercepts) and does not affect any
@@ -38,3 +39,11 @@
 // supported scope (caller should treat that as a hard error for IU4 --
 // there is no fallback path for this type).
 bool ggml_cuda_op_mul_mat_iu4(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
+// Card 133 item 3: synthetic correctness self-test for k_mul_mat_iu4 itself
+// (the real-model matmul wrapper, not just the mma_iu4() WMMA primitive
+// already covered by ggml_cuda_iu4_w4a4_selftest()). No ggml_tensor/model
+// needed -- hand-packs operands and compares against a CPU int4 x int4
+// reference. Vacuously true off RDNA4. Opt-in, see GGML_HIP_MUL_MAT_IU4_SELFTEST
+// in ggml-cuda.cu.
+bool ggml_cuda_mul_mat_iu4_selftest();
