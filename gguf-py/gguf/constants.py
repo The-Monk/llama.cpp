@@ -4535,9 +4535,9 @@ class GGMLQuantizationType(IntEnum):
     Q1_0    = 41
     F8E4M3  = 43
     F8E5M2  = 44
-    # NOTE: 45 (2OF4_FP8) reserved for the concurrent roc8-sparse-fp8 branch (not
-    # merged here) -- MXFP8 skips it and takes 46, matching ggml.h's GGML_TYPE_MXFP8.
+    TWO_OF_FOUR_FP8 = 45
     MXFP8   = 46
+    IU4     = 47  # EXPERIMENTAL, model-blocked (see GGML_TYPE_IU4 comment in ggml.h)
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4595,9 +4595,9 @@ class LlamaFileType(IntEnum):
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_F8E4M3        = 41  # except 1d tensors
     MOSTLY_F8E5M2        = 42  # except 1d tensors
-    # NOTE: 43 (MOSTLY_2OF4_FP8) reserved for roc8-sparse-fp8 (not merged) -- MXFP8
-    # skips it and takes 44, matching llama.h's LLAMA_FTYPE_MOSTLY_MXFP8.
+    MOSTLY_2OF4_FP8      = 43  # except 1d tensors (RDNA4 2:4-sparse SWMMAC)
     MOSTLY_MXFP8         = 44  # except 1d tensors
+    MOSTLY_IU4           = 45  # except 1d tensors -- EXPERIMENTAL, model-blocked
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -4725,7 +4725,9 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.F8E4M3: (32, 2 + 32),
     GGMLQuantizationType.F8E5M2: (32, 2 + 32),
+    GGMLQuantizationType.TWO_OF_FOUR_FP8: (32, 2 + 16 + 4),
     GGMLQuantizationType.MXFP8:  (32, 1 + 32),
+    GGMLQuantizationType.IU4:    (32, 2 + 16),
 }
 
 

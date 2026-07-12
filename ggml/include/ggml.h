@@ -432,12 +432,10 @@ extern "C" {
         GGML_TYPE_Q2_0    = 42, // PrismML ternary 2-bit (g128)
         GGML_TYPE_F8E4M3  = 43, // signed e4m3 weights + per-block fp16 scale (Path X)
         GGML_TYPE_F8E5M2  = 44, // signed e5m2 (bf8) weights + per-block fp16 scale (T97)
-        // NOTE: id 45 (GGML_TYPE_2OF4_FP8) is claimed on the sibling roc8-sparse-fp8
-        // branch (2:4-structured-sparse fp8, SWMMAC), not yet merged into
-        // roc8-prefix-share as of this commit -- MXFP8 deliberately skips it and takes
-        // 46 to avoid an id collision when the two branches merge.
+        GGML_TYPE_2OF4_FP8 = 45, // RDNA4 2:4-structured-sparse fp8 (SWMMAC driver-completeness run)
         GGML_TYPE_MXFP8   = 46, // MXFP8 (OCP MX): e4m3 weights + per-32-block e8m0 shared scale (mx.quantize)
-        GGML_TYPE_COUNT   = 47,
+        GGML_TYPE_IU4     = 47, // signed int4 x int4 W4A4, native RDNA4 WMMA -- EXPERIMENTAL, model-blocked (see comment at IU4 kernel registration)
+        GGML_TYPE_COUNT   = 48,
     };
 
     // precision
@@ -483,9 +481,9 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_F8E4M3  = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_F8E5M2  = 29, // except 1d tensors
-        // NOTE: 30 (GGML_FTYPE_MOSTLY_2OF4_FP8) claimed on roc8-sparse-fp8 (not yet
-        // merged) -- MXFP8 skips it and takes 31, same rationale as GGML_TYPE_MXFP8.
+        GGML_FTYPE_MOSTLY_2OF4_FP8 = 30, // except 1d tensors (RDNA4 2:4-sparse SWMMAC)
         GGML_FTYPE_MOSTLY_MXFP8   = 31, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IU4     = 32, // except 1d tensors -- EXPERIMENTAL, model-blocked
     };
 
     // available tensor operations:
