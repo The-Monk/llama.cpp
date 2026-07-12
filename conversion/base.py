@@ -832,6 +832,7 @@ class ModelBase:
             if weight.dtype != torch.float8_e4m3fn:
                 continue
             scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
+            weight, scale = self._transform_fp8_weight(name, weight, scale)
             if bdims is None:
                 # per-channel (rows,1)/(rows,) or per-tensor scalar/(1,); genuinely
                 # block-wise/NVFP4 scale (last dim > 1, no weight_block_size) is not ours.
@@ -874,6 +875,15 @@ class ModelBase:
         new_name = self.map_tensor_name(f"model.layers.{bid}.mlp.experts.{proj}.weight")
         logger.info(f"fp8-native: packed {new_name} [{weights.shape[0]} experts] as F8E4M3 (preserved)")
         self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.F8E4M3)
+
+    def _transform_fp8_weight(self, name: str, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor]:
+        """Hook for arch-specific row/col reorders that must be applied to a
+        preserved vendor F8E4M3 tensor before packing (ROC8). No-op by default;
+        overridden by _LinearAttentionVReorderBase (conversion/qwen.py) for the
+        GatedDeltaNet linear-attention V-head reorder -- the F8E4M3 twin of
+        _transform_mxfp8_weight below, but the vendor fp8 scale is per-channel or
+        DeepSeek-style 2D block-grid rather than MXFP8's per-32-group layout."""
+        return weight, scale
 
     def _transform_mxfp8_weight(self, name: str, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor]:
         """Hook for arch-specific row/col reorders that must be applied to a
