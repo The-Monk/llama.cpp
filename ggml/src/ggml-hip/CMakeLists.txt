@@ -119,9 +119,11 @@ if (GGML_HIP_ROCWMMA_FATTN)
     add_compile_definitions(GGML_HIP_ROCWMMA_FATTN)
 endif()
 
-if (GGML_HIP_FP8_MIXED_BF8_ACT)
-    add_compile_definitions(GGML_HIP_FP8_MIXED_BF8_ACT)
-endif()
+# Card 120: the mixed fp8(e4m3 weight) x bf8(e5m2 activation) WMMA prefill
+# path is now a RUNTIME toggle (GGML_HIP_FP8_ACT=bf8 env var, read once and
+# cached, mmq.cu) instead of a build-time CMake option -- both the fp8_fp8
+# and fp8_bf8 opcode paths are always compiled in. No build flag needed here
+# anymore; kept as a comment so the history is discoverable.
 
 if (NOT GGML_HIP_MMQ_MFMA)
     add_compile_definitions(GGML_HIP_NO_MMQ_MFMA)

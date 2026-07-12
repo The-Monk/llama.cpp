@@ -1409,9 +1409,11 @@ namespace ggml_cuda_mma {
     // independent instructions, operand order matters (A=fp8, B=bf8 for this
     // one). Named separately (not a `mma()` overload) for the same ODR
     // reason as `mma_bf8` above -- this C++ signature is already claimed by
-    // the fp8_fp8 overload. Gated behind GGML_HIP_FP8_MIXED_BF8_ACT (CMake
-    // option, default OFF) so the production fp8_fp8 path is byte-for-byte
-    // unchanged when the option is off.
+    // the fp8_fp8 overload. Both this function AND the production fp8_fp8
+    // path (`mma()` above) are ALWAYS compiled in -- selection between them
+    // is a RUNTIME choice (GGML_HIP_FP8_ACT env var, mmq.cu/mmq.cuh), not a
+    // build-time one, so no compile guard lives here beyond the hardware
+    // gate (AMD_WMMA_AVAILABLE && RDNA4) that already covers `mma()` too.
     template <data_layout dl_d, data_layout dl_ab>
     static __device__ __forceinline__ void mma_mixed_fp8_bf8(
             tile<16, 16, float, dl_d> & D, const tile<16, 8, int, dl_ab> & A, const tile<16, 8, int, dl_ab> & B) {
