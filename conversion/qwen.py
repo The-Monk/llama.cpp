@@ -300,7 +300,17 @@ class Qwen3NextModel(Qwen2MoeModel):
         elif "conv1d" in name:
             data_torch = data_torch.squeeze()
         elif name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight"):
-            data_torch = data_torch + 1
+            # HF stores these transformer RMSNorm weights offset by -1, so we add +1 here.
+            # MLX mx.quantize exports using the "qwen3_5_language_mlx_plus_one" convention
+            # (ROC8 --mxfp8-native path) ALREADY bake the +1 into the stored weight; adding
+            # it again makes every transformer norm +1 too high -> catastrophic garbage PPL
+            # (root-caused 2026-07-12: attn_norm/post_attention_norm were exactly +1.0 off,
+            # ssm_norm unaffected). Skip the +1 for those sources.
+            _quant = self.hparams.get("quantization") or {}
+            _mlx_plus_one = ("plus_one" in str(_quant.get("norm_convention", ""))
+                             or getattr(self, "_mxfp8_native", False))
+            if not _mlx_plus_one:
+                data_torch = data_torch + 1
 
         if "in_proj_qkvz.weight" in name:
             # original order:  [q, k, v, z] * head_count
