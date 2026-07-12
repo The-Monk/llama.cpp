@@ -145,18 +145,29 @@ void ggml_cuda_mul_mat_q(
     // reuses this exact activation quantizer unchanged. quantize_mmq_f8e4m3's
     // own GGML_ASSERT(type_src0 == ...) was broadened to accept MXFP8 too
     // (quantize.cu) -- the two changes are correctness-coupled.
-    // Card 120: GGML_HIP_FP8_MIXED_BF8_ACT (CMake option, default OFF) routes
-    // F8E4M3's activation quantizer to the e5m2/bf8 one below instead of its
-    // own e4m3 one -- weights stay raw e4m3 (x_qs/x_df unaffected, this is
-    // purely a src1/activation-side swap), and vec_dot_f8e4m3_f8e4m3_mma
-    // (mmq.cuh, same macro) swaps the WMMA opcode fp8_fp8 -> fp8_bf8 to
-    // match. Both halves of this correctness-coupled pair share the same
-    // macro so they can never independently drift out of sync.
-#if defined(GGML_HIP_FP8_MIXED_BF8_ACT)
-    const bool use_mixed_bf8_act = src0->type == GGML_TYPE_F8E4M3;
-#else
-    const bool use_mixed_bf8_act = false;
-#endif // defined(GGML_HIP_FP8_MIXED_BF8_ACT)
+    // Card 120: GGML_HIP_FP8_ACT=bf8 (env var, default unset == e4m3, i.e.
+    // production behavior) is a RUNTIME toggle -- read ONCE and cached in a
+    // static local (never getenv() in this hot per-mul_mat-call path), not
+    // a build-time CMake option. Routes F8E4M3's activation quantizer to
+    // the e5m2/bf8 one below instead of its own e4m3 one -- weights stay
+    // raw e4m3 (x_qs/x_df unaffected, this is purely a src1/activation-side
+    // swap). The paired device-side change (vec_dot_f8e4m3_mixed_bf8_mma
+    // swapping the WMMA opcode fp8_fp8 -> fp8_bf8) is selected by the SAME
+    // cached bool, threaded through mmq_args -> mul_mat_q_case ->
+    // launch_mul_mat_q -> the mul_mat_q kernel launch parameters ->
+    // mul_mat_q_process_tile (mmq.cuh) -- a genuine kernel-launch parameter,
+    // not a cross-TU __device__ global (this project does not build with
+    // -fgpu-rdc/relocatable device code; an extern __device__ global defined
+    // in one .cu and read in another's device code fails to link -- verified
+    // with a standalone 3-TU test, card 120 runtime-toggle session: "lld:
+    // error: undefined protected symbol"). Both halves of this correctness-
+    // coupled pair read the identical cached value so they can never
+    // independently drift out of sync.
+    static const bool g_fp8_use_mixed_bf8_act = []() {
+        const char * env = getenv("GGML_HIP_FP8_ACT");
+        return env != nullptr && std::string(env) == "bf8";
+    }();
+    const bool use_mixed_bf8_act = g_fp8_use_mixed_bf8_act && src0->type == GGML_TYPE_F8E4M3;
     const bool use_native_f8e4m3 = (src0->type == GGML_TYPE_F8E4M3 || src0->type == GGML_TYPE_MXFP8) && !use_mixed_bf8_act;
     // T97: same rationale as F8E4M3 above -- the bf8xbf8 WMMA fragment needs
     // src1 quantized to native e5m2, not int8 Q8_1.
@@ -200,7 +211,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            use_stream_k, ne1};
+            use_stream_k, ne1, use_mixed_bf8_act};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -267,7 +278,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        use_stream_k, ne12};
+        use_stream_k, ne12, use_mixed_bf8_act};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }

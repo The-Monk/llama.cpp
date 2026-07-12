@@ -1624,18 +1624,6 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma(
 // or the tiling math). Only the D4 single-float-scale activation layout is
 // implemented (see quantize_mmq_f8e4m3 in quantize.cu); no DS4/D2S6 variant
 // needed since fp8 has no zero-point/partial-sum correction to carry.
-//
-// Card 120 (GGML_HIP_FP8_MIXED_BF8_ACT, default OFF): when the CMake option
-// is on, this same function drives the MIXED fp8(e4m3 weight)xbf8(e5m2
-// activation) accuracy experiment instead -- the byte container/addressing
-// is IDENTICAL (both quantize_mmq_f8e4m3 and quantize_mmq_f8e5m2 write the
-// same block_q8_1_mmq D4 layout, see quantize.cu), only the WMMA opcode
-// changes (mma_mixed_fp8_bf8 instead of mma), and the host side swaps which
-// activation quantizer fills y (mmq.cu, same macro). Function name is left
-// unchanged (not renamed to "..._bf8act_mma") to keep this a minimal,
-// revertible, single-function diff -- the macro is the single source of
-// truth for which silicon path is active, and it defaults OFF so production
-// F8E4M3 prefill is byte-for-byte unchanged.
 template <int mmq_x, int mmq_y>
 static __device__ __forceinline__ void vec_dot_f8e4m3_f8e4m3_mma(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
@@ -1678,11 +1666,81 @@ static __device__ __forceinline__ void vec_dot_f8e4m3_f8e4m3_mma(
 #pragma unroll
             for (int n = 0; n < ntx; ++n) {
                 tile_C C;
-#if defined(GGML_HIP_FP8_MIXED_BF8_ACT)
-                mma_mixed_fp8_bf8(C, A[n], B); // card 120: fp8(e4m3 weight) x bf8(e5m2 activation)
-#else
                 mma(C, A[n], B);
-#endif // defined(GGML_HIP_FP8_MIXED_BF8_ACT)
+
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    const int   i  = i0 + n*tile_A::I + tile_C::get_i(l);
+                    const float dA = x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + k0/QI_F8E4M3];
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA*dB;
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(x, y, sum, k00);
+    NO_DEVICE_CODE;
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+}
+
+// Card 120: MIXED twin of vec_dot_f8e4m3_f8e4m3_mma above -- byte-for-byte
+// IDENTICAL addressing/tiling (both quantize_mmq_f8e4m3 and
+// quantize_mmq_f8e5m2 write the same block_q8_1_mmq D4 layout, quantize.cu),
+// the ONLY change is the WMMA call: mma_mixed_fp8_bf8 (mma.cuh, real
+// v_wmma_f32_16x16x16_fp8_bf8 hardware opcode, ISA-verified) instead of
+// mma() (fp8_fp8). ALWAYS compiled in (no build flag) -- selection between
+// this function and vec_dot_f8e4m3_f8e4m3_mma above is a RUNTIME choice
+// made in mul_mat_q_process_tile (this file, below) based on
+// use_mixed_bf8_act, which is threaded from mmq_args (mmq.cuh) all the way
+// from mmq.cu's cached GGML_HIP_FP8_ACT env-var read. NOT registered in
+// mmq_type_traits (no F8E4M3 vec_dot_mmq_t member points here) -- calling it
+// requires the paired activation buffer to ALREADY be bf8-quantized
+// (quantize_mmq_f8e5m2_cuda, not quantize_mmq_f8e4m3_cuda), so it is only
+// ever reachable via the runtime-gated branch that keeps both halves of
+// this correctness-coupled pair in sync.
+template <int mmq_x, int mmq_y>
+static __device__ __forceinline__ void vec_dot_f8e4m3_mixed_bf8_mma(
+    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+    constexpr data_layout input_layout = get_input_data_layout();
+    typedef tile<16,  8, int, input_layout>          tile_A;
+    typedef tile<16,  8, int, input_layout>          tile_B;
+    typedef tile<16, 16, float, DATA_LAYOUT_J_MAJOR> tile_C;
+
+    constexpr int granularity   = mmq_get_granularity_device(mmq_x);
+    constexpr int rows_per_warp = granularity;
+    constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+
+    y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
+
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) x_qs + 2*MMQ_TILE_NE_K;
+    const int   * y_qs = (const int   *) y + 4;
+    const float * y_df = (const float *) y;
+
+    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI_F8E4M3) {
+        const int k0 = k00 + k01;
+
+        tile_A A[ntx];
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*MMQ_MMA_TILE_X_K_Q8_0 + k0, MMQ_MMA_TILE_X_K_Q8_0);
+        }
+
+#pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += ntx*tile_C::J) {
+            tile_B B;
+            load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+
+            const int   j  = j0 + tile_C::get_j(0);
+            const float dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                tile_C C;
+                mma_mixed_fp8_bf8(C, A[n], B); // card 120: fp8(e4m3 weight) x bf8(e5m2 activation)
 
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
@@ -4060,7 +4118,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
+        const bool use_mixed_bf8_act) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = mmq_get_nwarps_device();
@@ -4108,7 +4167,24 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
-        vec_dot(tile_x, tile_y, sum, 0);
+        // Card 120: F8E4M3 has a second, runtime-selectable vec_dot (mixed
+        // fp8(weight) x bf8(activation) WMMA) alongside the default fp8_fp8
+        // one already bound in `vec_dot` above -- both are ALWAYS compiled
+        // in, the branch below is the only place the choice is made, and
+        // it's compiled away to nothing for every type other than F8E4M3
+        // (if constexpr on the template type parameter). use_mixed_bf8_act
+        // is false for every type other than F8E4M3 (mmq_args default +
+        // mmq.cu only ever sets it true for F8E4M3 src0 tensors), so this
+        // is a correctness no-op for the other ~30 quant types.
+        if constexpr (type == GGML_TYPE_F8E4M3) {
+            if (use_mixed_bf8_act) {
+                vec_dot_f8e4m3_mixed_bf8_mma<mmq_x, mmq_y>(tile_x, tile_y, sum, 0);
+            } else {
+                vec_dot(tile_x, tile_y, sum, 0);
+            }
+        } else {
+            vec_dot(tile_x, tile_y, sum, 0);
+        }
 
         __syncthreads();
 
@@ -4124,7 +4200,15 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
-        vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+        if constexpr (type == GGML_TYPE_F8E4M3) {
+            if (use_mixed_bf8_act) {
+                vec_dot_f8e4m3_mixed_bf8_mma<mmq_x, mmq_y>(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+            } else {
+                vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+            }
+        } else {
+            vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+        }
 
         __syncthreads();
     }
@@ -4157,7 +4241,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const bool use_mixed_bf8_act) {
 
     // Skip unused template specializations for faster compilation:
     if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
@@ -4242,7 +4326,7 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, use_mixed_bf8_act);
         return;
     }
 #endif // (defined(GGML_USE_HIP) && !defined(CDNA4) && !defined(CDNA3)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
@@ -4322,7 +4406,7 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, use_mixed_bf8_act);
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -4391,7 +4475,7 @@ static __global__ void mul_mat_q(
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, use_mixed_bf8_act);
 }
 
 template <ggml_type type, int mmq_x, bool need_check>
@@ -4539,6 +4623,11 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     bool use_stream_k; int64_t ncols_max;
+    // Card 120: runtime toggle for the F8E4M3 mixed fp8(weight)xbf8(activation)
+    // WMMA path (GGML_HIP_FP8_ACT=bf8 env var, cached host-side in mmq.cu).
+    // Always false/unused for every type other than GGML_TYPE_F8E4M3 -- see
+    // mul_mat_q_process_tile below for where it's actually consumed.
+    bool use_mixed_bf8_act = false;
 };
 
 template<ggml_type type>
@@ -4592,7 +4681,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 ntx_fd);
+                 ntx_fd, args.use_mixed_bf8_act);
         } else {
             constexpr bool need_check = true;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
@@ -4600,7 +4689,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 ntx_fd);
+                 ntx_fd, args.use_mixed_bf8_act);
         }
         return;
     }
@@ -4632,7 +4721,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, args.use_mixed_bf8_act);
 
         if (!fixup_needed) {
             return;
@@ -4650,7 +4739,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, args.use_mixed_bf8_act);
 
         if (!fixup_needed) {
             return;

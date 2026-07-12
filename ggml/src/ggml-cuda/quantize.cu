@@ -692,10 +692,11 @@ void quantize_mmq_f8e5m2_cuda(
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     // Card 120: also accepts GGML_TYPE_F8E4M3 -- the MIXED fp8(e4m3 weight) x
-    // bf8(e5m2 activation) accuracy experiment (GGML_HIP_FP8_MIXED_BF8_ACT)
-    // reuses this quantizer unchanged to fill the activation side, exactly
-    // the same "activation format is independent of weight format" argument
-    // as quantize_mmq_f8e4m3_cuda's MXFP8 broadening above.
+    // bf8(e5m2 activation) accuracy experiment (runtime-selected via
+    // GGML_HIP_FP8_ACT=bf8, see mmq.cu) reuses this quantizer unchanged to
+    // fill the activation side, exactly the same "activation format is
+    // independent of weight format" argument as quantize_mmq_f8e4m3_cuda's
+    // MXFP8 broadening above.
     GGML_ASSERT(type_src0 == GGML_TYPE_F8E5M2 || type_src0 == GGML_TYPE_F8E4M3);
     GGML_ASSERT(ne00 % 4 == 0);
     GGML_ASSERT(ne0 % (4*QK8_1) == 0);

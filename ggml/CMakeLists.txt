@@ -219,7 +219,6 @@ option(GGML_HIP_NO_VMM                      "ggml: do not try to use HIP VMM"   
 option(GGML_HIP_ROCWMMA_FATTN               "ggml: enable rocWMMA for FlashAttention"         OFF)
 option(GGML_HIP_MMQ_MFMA                    "ggml: enable MFMA MMA for CDNA in MMQ"           ON)
 option(GGML_HIP_EXPORT_METRICS              "ggml: enable kernel perf metrics output"         OFF)
-option(GGML_HIP_FP8_MIXED_BF8_ACT           "ggml: card120 F8E4M3-weight x F8E5M2-activation mixed WMMA prefill (accuracy A/B, RDNA4 only)" OFF)
 option(GGML_MUSA_GRAPHS                     "ggml: use MUSA graph, experimental, unstable"    OFF)
 option(GGML_MUSA_MUDNN_COPY                 "ggml: enable muDNN for accelerated copy"         OFF)
 option(GGML_VULKAN                          "ggml: use Vulkan"                                OFF)
