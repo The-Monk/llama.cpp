@@ -752,6 +752,65 @@ void dequantize_row_2of4_fp8(const block_2of4_fp8 * GGML_RESTRICT x, float * GGM
     }
 }
 
+// T89 driver-completeness run: plain RTN symmetric int4 quantizer for
+// block_iu4. amax/7 per-block scale (matches the design doc exactly), round
+// to nearest, clamp to [-8,7]. NO imatrix weighting, NO rotation/SmoothQuant
+// -- quality is explicitly out of scope for this test, only that the packed
+// bytes are a faithful [-8,7] encoding of x[] under the SAME nibble
+// convention ggml_cuda_iu4_w4a4.cu's pack_row_i4() uses (low nibble of byte
+// b = element 2*b, high nibble = element 2*b+1 -- NOT block_q4_0's
+// split-half convention).
+// EXPERIMENTAL / model-blocked (see block_iu4 comment in ggml-common.h):
+// plain RTN here is a placeholder until a rotation-free W4A4 producer model
+// exists; it is not expected to be production-quality.
+void quantize_row_iu4_ref(const float * GGML_RESTRICT x, block_iu4 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_IU4;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            amax = MAX(amax, fabsf(v));
+        }
+
+        const float d  = amax / 7.0f;
+        const float id = d ? 1.0f/d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        for (int b = 0; b < qk/2; ++b) {
+            int q0 = (int) lrintf(x[i*qk + 2*b    ] * id);
+            int q1 = (int) lrintf(x[i*qk + 2*b + 1] * id);
+            q0 = q0 < -8 ? -8 : (q0 > 7 ? 7 : q0);
+            q1 = q1 < -8 ? -8 : (q1 > 7 ? 7 : q1);
+            y[i].qs[b] = (uint8_t) ((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+        }
+    }
+}
+
+void dequantize_row_iu4(const block_iu4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_IU4;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int b = 0; b < qk/2; ++b) {
+            const uint8_t byte = x[i].qs[b];
+            const int q0 = ((int8_t) (byte << 4)) >> 4;   // sign-extend low nibble
+            const int q1 = ((int8_t) (byte & 0xF0)) >> 4; // sign-extend high nibble
+            y[i*qk + 2*b    ] = q0 * d;
+            y[i*qk + 2*b + 1] = q1 * d;
+        }
+    }
+}
+
 // T97: reference implementation for deterministic creation of model files
 void quantize_row_f8e5m2_ref(const float * GGML_RESTRICT x, block_f8e5m2 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_F8E5M2;
@@ -2568,6 +2627,15 @@ size_t quantize_2of4_fp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     GGML_UNUSED(quant_weights);
     quantize_row_2of4_fp8_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_2OF4_FP8, n_per_row);
+}
+
+// T89 driver-completeness run: plain RTN, no imatrix weighting on purpose --
+// this is a "does the kernel execute" test, not an accuracy exercise.
+// EXPERIMENTAL / model-blocked, see block_iu4 comment in ggml-common.h.
+size_t quantize_iu4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_iu4_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_IU4, n_per_row);
 }
 
 // ====================== Ternary (de)-quantization (BitNet b1.58 and TriLMs)
@@ -5823,6 +5891,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_2OF4_FP8:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_2of4_fp8, data, nb);
+            } break;
+        case GGML_TYPE_IU4:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_iu4, data, nb);
             } break;
         case GGML_TYPE_MXFP4:
             {
