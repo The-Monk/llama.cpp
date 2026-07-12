@@ -115,6 +115,20 @@ static __device__ __forceinline__ float vec_dot_f8e5m2_q8_1_simd_dispatch(
     return vec_dot_f8e5m2_q8_1_simd_impl<VDR_F8E5M2_Q8_1_MMVQ_SIMD>(vbq, bq8_1, kbx, iqs);
 }
 
+// MXFP8 decode dispatch: T77 hardware-dot2 (ggml_cuda_dot2_e4m3_q8), activations
+// stay native int8 q8_1 -- mirrors F8E5M2 above (lossless, no activation swap,
+// NOT F8E4M3's T79 dot4). MXFP8 values are e4m3 so the same hw weight-decode
+// applies; only the e8m0 scale differs. VDR=8 (whole 32-value block per call),
+// same as the F8E5M2/T77 finding; the fallback to the portable scalar impl lives
+// INSIDE vec_dot_mxfp8_q8_1_simd_impl (#if GGML_CUDA_F8E4M3_HAS_NATIVE_DOT2/#else),
+// so this stays correct on non-RDNA4 HIP/CUDA/MUSA builds.
+#define VDR_MXFP8_Q8_1_MMVQ_SIMD 8
+
+static __device__ __forceinline__ float vec_dot_mxfp8_q8_1_simd_dispatch(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_mxfp8_q8_1_simd_impl<VDR_MXFP8_Q8_1_MMVQ_SIMD>(vbq, bq8_1, kbx, iqs);
+}
+
 // T73 (small-batch decode fix): F8E4M3-only, batch-size-aware VDR/vec_dot
 // selection, used ONLY by the main mul_mat_vec_q kernel (ncols_dst is a real
 // compile-time template parameter there, so this is a free, zero-runtime-
@@ -149,6 +163,11 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_decode(ggml_type
     if (type == GGML_TYPE_F8E5M2) {
         return vec_dot_f8e5m2_q8_1_simd_dispatch;
     }
+    // ROC8: MXFP8 T77 hardware-dot2 decode (same lossless int8-activation path
+    // as F8E5M2 above; fallback lives inside the simd_impl for non-RDNA4).
+    if (type == GGML_TYPE_MXFP8) {
+        return vec_dot_mxfp8_q8_1_simd_dispatch;
+    }
     GGML_UNUSED(ncols_dst);
     return get_vec_dot_q_cuda(type);
 }
@@ -159,6 +178,9 @@ static constexpr __host__ __device__ int get_vdr_mmvq_decode(ggml_type type, int
     }
     if (type == GGML_TYPE_F8E5M2) {
         return VDR_F8E5M2_Q8_1_MMVQ_SIMD;
+    }
+    if (type == GGML_TYPE_MXFP8) {
+        return VDR_MXFP8_Q8_1_MMVQ_SIMD;
     }
     GGML_UNUSED(ncols_dst);
     return get_vdr_mmvq(type);
