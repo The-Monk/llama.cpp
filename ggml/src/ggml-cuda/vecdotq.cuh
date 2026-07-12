@@ -1205,6 +1205,59 @@ static __device__ __forceinline__ float vec_dot_f8e4m3_f8e4m3_impl(
 #endif
 }
 
+// Card 137 fix 2: pure V_DOT4_F32_BF8_BF8 decode dot -- the bf8 (F8E5M2)
+// twin of vec_dot_f8e4m3_f8e4m3_impl (T79) above. RDNA4 has a dedicated bf8
+// dot4 opcode right beside fp8's (ISA doc 70651 p.4744, V_DOT4_F32_BF8_BF8,
+// opcode 39, vs fp8's V_DOT4_F32_FP8_FP8 opcode 38); ISA-verified this
+// session (`__builtin_amdgcn_dot4_f32_bf8_bf8` -> exactly `v_dot4_f32_bf8_bf8`,
+// llvm-objdump --mcpu=gfx1201 on a standalone HIP test kernel, single VOP3P
+// instruction). Same requirement as T79: BOTH operands must already be
+// native bf8 -- the activation buffer must come from
+// quantize_row_f8e5m2_for_mmvq_cuda (quantize.cu, this card), not the
+// standard int8 quantize_row_q8_1_cuda, so this is only reachable via the
+// dedicated F8E5M2-only dispatch branch in mmvq.cu (both the vec_dot AND the
+// activation-quantize call are swapped together, same correctness-coupling
+// discipline as T79 -- see that function's comment for the full rationale).
+//
+// ACCURACY DISCLOSURE (mandatory, mirrors T79): quantizing ACTIVATIONS to
+// bf8 (e5m2, only 2 mantissa bits vs e4m3's 3) is a strictly LARGER
+// quantization step than T79's e4m3-activation swap, which itself already
+// cost +1.2-1.5% PPL relative to the lossless int8-activation baseline. This
+// path is therefore expected to cost MORE than T79's hit, on top of bf8's
+// existing weight-side +2.5% PPL delta (T97, vs BF16) -- gate adoption on a
+// fresh PPL re-measurement (see card 137 KB) against the T97 hardware-dot2
+// (int8-activation) baseline this supersedes; do not assume the T79 numbers
+// transfer.
+template <int vdr>
+static __device__ __forceinline__ float vec_dot_f8e5m2_f8e5m2_impl(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_f8e5m2 * bq8 = (const block_f8e5m2 *) vbq + kbx;
+
+#if defined(GGML_CUDA_F8E5M2_HAS_NATIVE_DOT2)
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+        const uint32_t vi = (uint32_t) get_int_b2(bq8->qs, iqs + i);
+        const uint32_t ui = (uint32_t) get_int_b4(bq8_1->qs, iqs + i);
+        sumf = __builtin_amdgcn_dot4_f32_bf8_bf8(vi, ui, sumf);
+    }
+
+    return sumf * (float) bq8->d * __low2float(bq8_1->ds);
+#else
+    // Portable fallback: no native dot4 available off RDNA4/gfx12 -- reuse
+    // the T97 dot2 (or scalar) impl. NOTE this reads bq8_1 as int8 q8_1
+    // activations, which is WRONG if the caller already swapped the
+    // quantize function to the bf8 buffer -- this branch is dead code on any
+    // target this dispatch is actually reachable from (F8E5M2 decode is
+    // gated GGML_CUDA_CC_IS_RDNA4 at the mmvq.cu call site, same gate this
+    // macro expands under), kept only so the translation unit still compiles
+    // portably.
+    return vec_dot_f8e5m2_q8_1_impl<vdr>(vbq, bq8_1, kbx, iqs);
+#endif
+}
+
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
