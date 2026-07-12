@@ -115,6 +115,20 @@ static __device__ __forceinline__ float vec_dot_f8e5m2_q8_1_simd_dispatch(
     return vec_dot_f8e5m2_q8_1_simd_impl<VDR_F8E5M2_Q8_1_MMVQ_SIMD>(vbq, bq8_1, kbx, iqs);
 }
 
+// Card 137 fix 2: pure V_DOT4_F32_BF8_BF8 path (both operands native bf8 --
+// see vec_dot_f8e5m2_f8e5m2_impl, vecdotq.cuh, for the full design/accuracy-
+// disclosure comment). This is the T97 "next lever" the comment above
+// flagged: RDNA4 has a native bf8xbf8 dot4 opcode right beside fp8's
+// (ISA-confirmed, V_DOT4_F32_BF8_BF8 opcode 39). VDR sweep lever, same
+// cheap-rebuild-only convention T77/T79 established (plain #define here,
+// NOT in vecdotq.cuh).
+#define VDR_F8E5M2_F8E5M2_MMVQ_DOT4 2
+
+static __device__ __forceinline__ float vec_dot_f8e5m2_f8e5m2_dispatch(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_f8e5m2_f8e5m2_impl<VDR_F8E5M2_F8E5M2_MMVQ_DOT4>(vbq, bq8_1, kbx, iqs);
+}
+
 // MXFP8 decode dispatch: T77 hardware-dot2 (ggml_cuda_dot2_e4m3_q8), activations
 // stay native int8 q8_1 -- mirrors F8E5M2 above (lossless, no activation swap,
 // NOT F8E4M3's T79 dot4). MXFP8 values are e4m3 so the same hw weight-decode
@@ -156,10 +170,31 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_decode(ggml_type
     if (type == GGML_TYPE_F8E4M3) {
         return vec_dot_f8e4m3_f8e4m3_dispatch;
     }
-    // T97: unconditional dispatch, same as F8E4M3 above -- the fallback to
-    // the portable scalar impl lives INSIDE vec_dot_f8e5m2_q8_1_simd_impl
-    // (vecdotq.cuh, #if defined(GGML_CUDA_F8E5M2_HAS_NATIVE_DOT2)/#else), not
-    // here, so this stays correct even on non-RDNA4 HIP/CUDA/MUSA builds.
+    // Card 137 fix 2 (bf8 dot4, MEASURED AND NOT ADOPTED): built the pure
+    // bf8xbf8 V_DOT4 path (vec_dot_f8e5m2_f8e5m2_dispatch below) mirroring
+    // T79's F8E4M3 supersede, and ISA-confirmed it emits the native
+    // v_dot4_f32_bf8_bf8 opcode with the predicted register win (mmvq
+    // decode kernel VGPR dropped ~102->27, matching fp8's T79 profile). BUT
+    // the mandatory PPL gate (card 137 KB, Qwen3.6-27B-F8E5M2, README.md
+    // corpus, 6 chunks, `-ub 4` to force this exact mmvq path -- PPL is
+    // bit-deterministic so a single fresh run is reproducible, no drift/
+    // resample caveat needed) shows it is measurably WORSE, not just noise:
+    // int8-activation baseline (this dispatch) PPL 2.5162 +/- 0.13044 vs
+    // bf8-activation dot4 PPL 2.5799 +/- 0.13637 -- a real +2.5% relative
+    // increase, worse in 4/6 chunks, exactly the direction the accuracy-
+    // disclosure comment on vec_dot_f8e5m2_f8e5m2_impl (vecdotq.cuh)
+    // predicted (bf8 activations have only 2 mantissa bits, a strictly
+    // larger quantization step than T79's already-costly e4m3-activation
+    // swap). Per the card 137 gate ("commit only if PPL is sane/not-
+    // regressed"), this does NOT clear the bar -- so F8E5M2 decode STAYS on
+    // the T97 int8-activation hardware-dot2 path (lossless activations,
+    // matches every other quant type's decode contract) as the default.
+    // vec_dot_f8e5m2_f8e5m2_dispatch/_impl and quantize_row_f8e5m2_for_
+    // mmvq_cuda are kept, correct, and ISA-validated (dead code on this
+    // dispatch, unused nowhere else) for a future call site where the
+    // register savings might outweigh the accuracy cost (e.g. an
+    // accuracy-tolerant batched-verify/spec-decode shape) -- re-enabling is
+    // the one-line swap below, already proven to compile and run correctly.
     if (type == GGML_TYPE_F8E5M2) {
         return vec_dot_f8e5m2_q8_1_simd_dispatch;
     }
@@ -177,7 +212,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq_decode(ggml_type type, int
         return VDR_F8E4M3_F8E4M3_MMVQ_DOT4;
     }
     if (type == GGML_TYPE_F8E5M2) {
-        return VDR_F8E5M2_Q8_1_MMVQ_SIMD;
+        return VDR_F8E5M2_Q8_1_MMVQ_SIMD; // PPL-gated off dot4, see get_vec_dot_q_cuda_decode above
     }
     if (type == GGML_TYPE_MXFP8) {
         return VDR_MXFP8_Q8_1_MMVQ_SIMD;
@@ -1463,6 +1498,13 @@ void ggml_cuda_mul_mat_vec_q(
         // Reachable only when ggml_cuda_should_use_mmvq already gated
         // F8E4M3 to RDNA4 (mmvq.cu, should_use_mmvq), so no separate cc
         // check is needed here.
+        // Card 137 fix 2: F8E5M2 decode STAYS on int8 q8_1 activations (the
+        // T97 default) -- the bf8-activation dot4 path failed its PPL gate
+        // (see get_vec_dot_q_cuda_decode above), so quantize_row_f8e5m2_for_
+        // mmvq_cuda is NOT wired in here; matching the dispatch table keeps
+        // this call site correctness-coupled with it (an unconditional swap
+        // here without the dispatch swap would silently feed bf8 bytes to a
+        // vec_dot that expects int8, or vice versa).
         if (src0->type == GGML_TYPE_F8E4M3) {
             quantize_row_f8e4m3_for_mmvq_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         } else {

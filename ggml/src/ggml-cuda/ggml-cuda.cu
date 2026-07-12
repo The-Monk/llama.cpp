@@ -2684,6 +2684,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         // not just a missed perf win. Not benched (no F8E4M3 split-mode
         // model validated; our guardrail is single-GPU only) but must not be
         // left silently wrong.
+        // Card 137 fix 2: F8E5M2 decode dispatch stayed on int8 q8_1
+        // activations (the bf8-activation dot4 path failed its PPL gate,
+        // see get_vec_dot_q_cuda_decode in mmvq.cu) -- so no F8E5M2 branch
+        // is needed here, it already falls through to quantize_row_q8_1_cuda
+        // below, matching mmvq.cu's dispatch table.
         const quantize_cuda_t quantize_src1 = src0->type == GGML_TYPE_F8E4M3 ?
             quantize_row_f8e4m3_for_mmvq_cuda : quantize_row_q8_1_cuda;
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_q, quantize_src1);
