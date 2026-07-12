@@ -468,6 +468,18 @@ static __global__ void dequantize_block_iq4_xs(const void * __restrict__ vx, dst
     }
 }
 
+// NOTE (ROC8 fp4-hw-cvt investigation, gfx1201): scalar per-thread LUT
+// dequant (kvalues_mxfp4[]), one element/thread -- not restructured to use
+// AMD's packed hw fp4->f16 decoder (cvt_scalef32_pk(8)_fp4_f16). That
+// instruction does not exist on gfx1201/RDNA4 silicon (confirmed: absent
+// from the RDNA4 ISA manual, gated behind clang target features
+// `fp4-cvt-scale-insts`/`gfx1250-insts` that gfx1201 does not carry, and
+// crashes the LLVM backend if force-enabled for --offload-arch=gfx1201 --
+// gfx1250-exclusive, same class of finding as the wide-K fp8 WMMA dead end).
+// Even setting hardware aside, the pk8 form needs 8 contiguous fp4 lanes
+// gathered into one thread to be worth using -- a kernel-shape change, not
+// a drop-in swap into this one-element-per-thread loop. See the
+// vec_dot_mxfp4_q8_1 comment in vecdotq.cuh for full detail.
 template<typename dst_t>
 static __global__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restrict__ yy) {
 
@@ -617,6 +629,8 @@ static void dequantize_row_mxfp4_cuda(const void * vx, dst_t * y, const int64_t 
     dequantize_block_mxfp4<<<nb, 32, 0, stream>>>(vx, y);
 }
 
+// NOTE (ROC8 fp4-hw-cvt investigation, gfx1201): same finding as
+// dequantize_block_mxfp4 above -- gfx1250-exclusive hardware, not wired.
 template <typename dst_t>
 static __global__ void dequantize_block_nvfp4(
         const void * __restrict__ vx,
