@@ -69,6 +69,7 @@
 #include "ggml-cuda/iu4_w4a4.cuh"
 #include "ggml-cuda/mxfp8_selftest.cuh"
 #include "ggml-cuda/mul_mat_2of4_fp8.cuh"
+#include "ggml-cuda/mul_mat_iu4.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2389,12 +2390,13 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * glu,
                                           const ggml_tensor * ffn_up_bias = nullptr,
                                           const ggml_tensor * ffn_gate_bias = nullptr) {
-    // RDNA4 2:4-structured-sparse fp8 SWMMAC driver-completeness run: the
-    // gate/up/GLU fusion path below calls straight into the generic
-    // mmq/mmvq machinery, which has no GGML_TYPE_2OF4_FP8 entry -- force
-    // these nodes back through the normal per-op MUL_MAT dispatch
-    // (ggml_cuda_mul_mat), which IS hooked for 2OF4_FP8.
-    if (ffn_up->src[0]->type == GGML_TYPE_2OF4_FP8 || ffn_gate->src[0]->type == GGML_TYPE_2OF4_FP8) {
+    // RDNA4 2:4-structured-sparse fp8 SWMMAC / T89 IU4 driver-completeness
+    // runs: the gate/up/GLU fusion path below calls straight into the
+    // generic mmq/mmvq machinery, which has no GGML_TYPE_2OF4_FP8 or
+    // GGML_TYPE_IU4 entry -- force these nodes back through the normal
+    // per-op MUL_MAT dispatch (ggml_cuda_mul_mat), which IS hooked for both.
+    if (ffn_up->src[0]->type == GGML_TYPE_2OF4_FP8 || ffn_gate->src[0]->type == GGML_TYPE_2OF4_FP8 ||
+        ffn_up->src[0]->type == GGML_TYPE_IU4      || ffn_gate->src[0]->type == GGML_TYPE_IU4) {
         return false;
     }
 
@@ -2518,13 +2520,14 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
-    // RDNA4 2:4-structured-sparse fp8 SWMMAC driver-completeness run: this
-    // fusion path calls straight into ggml_cuda_mul_mat_vec_q (mmvq.cu's
-    // generic templated dispatch), which has no GGML_TYPE_2OF4_FP8 entry --
-    // 2OF4_FP8 has its own dedicated kernel (mul_mat_2of4_fp8.cu) hooked
-    // only at the top of the normal, unfused ggml_cuda_mul_mat(). Refuse
-    // fusion so those nodes take that path.
-    if (src0->type == GGML_TYPE_2OF4_FP8) {
+    // RDNA4 2:4-structured-sparse fp8 SWMMAC / T89 IU4 driver-completeness
+    // runs: this fusion path calls straight into ggml_cuda_mul_mat_vec_q
+    // (mmvq.cu's generic templated dispatch), which has no GGML_TYPE_2OF4_FP8
+    // or GGML_TYPE_IU4 entry -- both have their own dedicated kernel
+    // (mul_mat_2of4_fp8.cu / mul_mat_iu4.cu) hooked only at the top of the
+    // normal, unfused ggml_cuda_mul_mat(). Refuse fusion so those nodes take
+    // that path.
+    if (src0->type == GGML_TYPE_2OF4_FP8 || src0->type == GGML_TYPE_IU4) {
         return false;
     }
 
@@ -2574,6 +2577,19 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (src0->type == GGML_TYPE_2OF4_FP8) {
         const bool ok = ggml_cuda_op_mul_mat_2of4_fp8(ctx, src0, src1, dst);
         GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_2of4_fp8 does not support this tensor shape");
+        return;
+    }
+
+    // T89 driver-completeness run (EXPERIMENTAL, model-blocked -- see
+    // block_iu4 comment in ggml-common.h): GGML_TYPE_IU4 (native int4xint4
+    // W4A4 WMMA) is NOT wired into the generic mmq/mmvq dispatch below -- it
+    // gets its own small dedicated kernel (mul_mat_iu4.cu), hooked here
+    // exactly like the GGML_HINT_SRC0_IS_HADAMARD intercept further down.
+    // Single-GPU only (no split-buffer handling), MUL_MAT only (no
+    // MUL_MAT_ID).
+    if (src0->type == GGML_TYPE_IU4) {
+        const bool ok = ggml_cuda_op_mul_mat_iu4(ctx, src0, src1, dst);
+        GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_iu4 does not support this tensor shape");
         return;
     }
 
@@ -5233,12 +5249,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_F8E5M2:
                     case GGML_TYPE_MXFP8:
                         return true;
-                    // RDNA4 2:4-structured-sparse fp8 SWMMAC driver-completeness
-                    // run: 2OF4_FP8 only has a real kernel for plain GGML_OP_MUL_MAT
-                    // (ggml_cuda_op_mul_mat_2of4_fp8, hooked at the top of
-                    // ggml_cuda_mul_mat). MUL_MAT_ID (MoE routing) is NOT wired --
-                    // fine for this dense-model test, not required by the task.
+                    // RDNA4 2:4-structured-sparse fp8 SWMMAC / T89 IU4 (EXPERIMENTAL,
+                    // model-blocked) driver-completeness runs: both only have a real
+                    // kernel for plain GGML_OP_MUL_MAT (ggml_cuda_op_mul_mat_2of4_fp8 /
+                    // ggml_cuda_op_mul_mat_iu4, hooked at the top of ggml_cuda_mul_mat).
+                    // MUL_MAT_ID (MoE routing) is NOT wired for either -- fine for
+                    // dense-model testing, not required by the task.
                     case GGML_TYPE_2OF4_FP8:
+                    case GGML_TYPE_IU4:
                         return op->op == GGML_OP_MUL_MAT;
                     default:
                         return false;
