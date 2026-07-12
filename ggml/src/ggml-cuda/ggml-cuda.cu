@@ -5822,6 +5822,19 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
             GGML_LOG_INFO("%s: GGML_HIP_IU4_W4A4_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
         }
     }
+    // Card 133 item 3: k_mul_mat_iu4 real-model wrapper correctness self-test
+    // (mul_mat_iu4.cu) -- distinct from GGML_HIP_IU4_W4A4_SELFTEST above,
+    // which only covers the mma_iu4() primitive. Dormant capability, opt-in
+    // only, no model/quant path routes through it. Runs at most once per
+    // process.
+    if (getenv("GGML_HIP_MUL_MAT_IU4_SELFTEST") != nullptr) {
+        static bool mul_mat_iu4_selftest_ran = false;
+        if (!mul_mat_iu4_selftest_ran) {
+            mul_mat_iu4_selftest_ran = true;
+            const bool ok = ggml_cuda_mul_mat_iu4_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_IU4_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
     // RDNA4 2:4-structured-sparse SWMMAC driver-completeness self-test (swmmac24.cu).
     // Dormant capability, opt-in only, no model/quant path routes through it -- see
     // swmmac24.cuh for the doctrine rationale. Runs at most once per process.
