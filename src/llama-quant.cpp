@@ -442,6 +442,7 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_F8E4M3:  return_type = GGML_TYPE_F16;    break;
             case GGML_TYPE_F8E5M2:  return_type = GGML_TYPE_F16;    break;
             case GGML_TYPE_2OF4_FP8: return_type = GGML_TYPE_F8E4M3; break;
+            case GGML_TYPE_2OF4_F16: return_type = GGML_TYPE_F16;    break; // card 141: dense fp16 fallback, mirrors 2OF4_FP8 -> F8E4M3
             case GGML_TYPE_MXFP8:   return_type = GGML_TYPE_F16;    break;
             case GGML_TYPE_IU4:     return_type = GGML_TYPE_F16;    break; // EXPERIMENTAL, model-blocked
             default:
@@ -860,6 +861,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_F8E4M3: return GGML_TYPE_F8E4M3;
         case LLAMA_FTYPE_MOSTLY_F8E5M2: return GGML_TYPE_F8E5M2;
         case LLAMA_FTYPE_MOSTLY_2OF4_FP8: return GGML_TYPE_2OF4_FP8;
+        case LLAMA_FTYPE_MOSTLY_2OF4_F16: return GGML_TYPE_2OF4_F16; // card 141
         case LLAMA_FTYPE_MOSTLY_MXFP8:  return GGML_TYPE_MXFP8;
         case LLAMA_FTYPE_MOSTLY_IU4:    return GGML_TYPE_IU4; // EXPERIMENTAL, model-blocked
 
@@ -1113,6 +1115,22 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                                    " -> falling back to F8E4M3\n",
                                    __func__, ggml_get_name(tensor), 100.0f*ratio, 100.0f*k_min_2of4_ratio);
                     metadata[i].target_type = GGML_TYPE_F8E4M3;
+                }
+            }
+
+            // card 141: same lossy-on-violation gate as block_2of4_fp8 above, for
+            // the fp16-valued sparse type. Falls back to dense F16 (not F8E4M3 --
+            // no reason to also take a precision hit on a tensor the prune didn't
+            // cleanly touch).
+            if (metadata[i].target_type == GGML_TYPE_2OF4_F16) {
+                ml.load_data_for(it->tensor);
+                const float ratio = tensor_2of4_sparsity_ratio(it->tensor);
+                constexpr float k_min_2of4_ratio = 0.98f;
+                if (ratio < k_min_2of4_ratio) {
+                    LLAMA_LOG_WARN("%s: %-40s - not cleanly 2:4-sparse (%.1f%% of groups <=2 nonzero, need >=%.0f%%)"
+                                   " -> falling back to F16\n",
+                                   __func__, ggml_get_name(tensor), 100.0f*ratio, 100.0f*k_min_2of4_ratio);
+                    metadata[i].target_type = GGML_TYPE_F16;
                 }
             }
         } else {

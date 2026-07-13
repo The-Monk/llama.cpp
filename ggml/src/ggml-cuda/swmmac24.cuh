@@ -12,10 +12,14 @@
 // It is DELIBERATELY UNUSED by any model/quant default path -- see swmmac24.cu's
 // self-test hook, gated behind an opt-in env var, for how it's reached.
 //
-// Two SWMMAC forms are implemented here (the two gfx1201-native forms validated in
-// ~/phase2-spike/{int4_swmmac_throughput,fp8_swmmac_throughput,act24_mask_pack}.hip):
+// Three SWMMAC forms are implemented here (the first two are the gfx1201-native
+// forms validated in ~/phase2-spike/{int4_swmmac_throughput,fp8_swmmac_throughput,
+// act24_mask_pack}.hip; the third, card 141, is the same clang builtin family
+// confirmed present for gfx1201 -- "wmma-128b-insts,wavefrontsize32" feature gate,
+// same as the fp8 form -- via BuiltinsAMDGPU.inc, hardware-validated the same way):
 //   V_SWMMAC_I32_16X16X32_IU4        (int4 A/B, int32 accumulate)
 //   V_SWMMAC_F32_16X16X32_FP8_FP8    (fp8e4m3 A/B, fp32 accumulate)
+//   V_SWMMAC_F32_16X16X32_F16        (fp16 A/B, fp32 accumulate -- card 141)
 //
 // Per-lane VGPR layout is transcribed directly from the ISA doc's Table
 // "Matrix Element Storage in VGPRs" (sec 7.12.2, A-Matrix/B-Matrix/C-D-Matrix rows) and
@@ -54,6 +58,11 @@ typedef int   v2i __attribute__((ext_vector_type(2)));
 typedef int   v4i __attribute__((ext_vector_type(4)));
 typedef int   v8i __attribute__((ext_vector_type(8)));
 typedef float v8f __attribute__((ext_vector_type(8)));
+// card 141 (sparse-fp16): half-precision lane vectors, same ext_vector_type
+// convention already used for f16 WMMA fragments elsewhere in this driver
+// (mma.cuh's halfx8_t/halfx16_t).
+typedef _Float16 v8h  __attribute__((ext_vector_type(8)));
+typedef _Float16 v16h __attribute__((ext_vector_type(16)));
 
 // Sparse-index format invariant (ISA doc sec 7.12.3): 2 bits/index, 2 indices/group
 // of 4 K-columns, 4 groups' worth (16 bits) packed into the low half of the 32-bit
@@ -72,6 +81,21 @@ struct Loc { int lane, vgpr, startbit; };
 // footprint to a dense 16x16 tile of the same dataSize per ISA Table 43).
 static __host__ __device__ __forceinline__ Loc swmmac24_a_loc(int dataSizeBits, int row, int col) {
     const int r = row & 0xF;
+    if (dataSizeBits == 16) {
+        // card 141 (sparse-fp16): DERIVED, not doc-given (same induction method
+        // the file header describes for swmmac24_b32_loc_8bit -- see there for
+        // the general rule: lane keeps col[3] as its "half" bit; the remaining
+        // col[2:0] splits between vgpr-select and startPosn by how many
+        // dataSizeBits-wide values fit in one 32-bit dword, floor(32/16)=2 ->
+        // 1 startPosn bit (col[0]) + 2 vgpr-select bits (col[2:1]), vs. the
+        // 8-bit case's 2 startPosn bits + 1 vgpr bit and the 4-bit case's 3
+        // startPosn bits + 0 vgpr bits -- a mechanical function of dataSize,
+        // exactly the pattern the 8-bit B-matrix case extrapolated from the
+        // 4-bit doc-given case. HARDWARE-VALIDATED via
+        // ggml_cuda_swmmac24_selftest()'s test_f16_swmmac_24 before any
+        // real-model kernel trusts it (same discipline as the 8-bit B case).
+        return { (((col >> 3) & 1) << 4) | r, (col >> 1) & 3, (col & 1) * 16 };
+    }
     if (dataSizeBits == 8) {
         // doc: lane={col[3],row[3:0]}  vgpr=col[2]  startPosn=col[1:0]
         return { (((col >> 3) & 1) << 4) | r, (col >> 2) & 1, (col & 3) * 8 };
@@ -95,6 +119,20 @@ static __host__ __device__ __forceinline__ Loc swmmac24_b32_loc_8bit(int row, in
     const int vgpr = (((row >> 3) & 1) << 1) | ((row >> 2) & 1);
     const int startPosn = row & 3;
     return { lane, vgpr, startPosn * 8 };
+}
+
+// B-Matrix 32x16 (row 0..31 = K, col 0..15 = N), dataSizeBits==16 (card 141,
+// DERIVED + hardware-validated -- see swmmac24_a_loc's dataSizeBits==16
+// branch for the general induction rule). lane keeps the same {row[4],col[3:0]}
+// tag as the 4-bit/8-bit forms; the remaining row[3:0] (4 bits, since row
+// needs 5 bits total and row[4] moved to lane) splits floor(32/16)=2 values
+// per dword -> 1 startPosn bit (row[0]) + 3 vgpr-select bits (row[3:1]),
+// covering all 8 dwords (v8i / v16h) the ISA's f16 B operand needs.
+static __host__ __device__ __forceinline__ Loc swmmac24_b32_loc_16bit(int row, int col) {
+    const int lane = (((row >> 4) & 1) << 4) | (col & 0xF);
+    const int vgpr = (row >> 1) & 7;
+    const int startPosn = row & 1;
+    return { lane, vgpr, startPosn * 16 };
 }
 
 // C/D-Matrix 16x16, 32-bit output (row 0..15, col 0..15). doc:
@@ -139,6 +177,28 @@ static __global__ void k_swmmac_fp8_24_perlane(const v2i * __restrict__ a, const
     dout[threadIdx.x] = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(a[threadIdx.x], b[threadIdx.x], c, idx[threadIdx.x]);
 #else
     // Host pass / non-RDNA4 device pass: the V_SWMMAC_F32_16X16X32_FP8_FP8
+    // instruction this targets doesn't exist here. Never actually launched
+    // off RDNA4 (ggml_cuda_swmmac24_selftest() runtime-gates on cc first).
+    GGML_UNUSED(a);
+    GGML_UNUSED(b);
+    GGML_UNUSED(idx);
+    GGML_UNUSED(dout);
+    NO_DEVICE_CODE;
+#endif // defined(RDNA4)
+}
+
+// card 141 (sparse-fp16): V_SWMMAC_F32_16X16X32_F16_F16 -- fp16 A/B (native,
+// no per-block scale needed), fp32 accumulate, same "wmma-128b-insts,
+// wavefrontsize32" feature gate as the fp8 form above (confirmed present in
+// clang's BuiltinsAMDGPU.inc for gfx1201, NOT gated to gfx1250-only like the
+// newer K=64/K=128 SWMMAC forms).
+static __global__ void k_swmmac_f16_24_perlane(const v8h * __restrict__ a, const v16h * __restrict__ b,
+                                         const unsigned * __restrict__ idx, v8f * __restrict__ dout) {
+#if defined(RDNA4)
+    v8f c = {0,0,0,0,0,0,0,0};
+    dout[threadIdx.x] = __builtin_amdgcn_swmmac_f32_16x16x32_f16_w32(a[threadIdx.x], b[threadIdx.x], c, idx[threadIdx.x]);
+#else
+    // Host pass / non-RDNA4 device pass: the V_SWMMAC_F32_16X16X32_F16
     // instruction this targets doesn't exist here. Never actually launched
     // off RDNA4 (ggml_cuda_swmmac24_selftest() runtime-gates on cc first).
     GGML_UNUSED(a);

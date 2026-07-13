@@ -69,6 +69,7 @@
 #include "ggml-cuda/iu4_w4a4.cuh"
 #include "ggml-cuda/mxfp8_selftest.cuh"
 #include "ggml-cuda/mul_mat_2of4_fp8.cuh"
+#include "ggml-cuda/mul_mat_2of4_f16.cuh"
 #include "ggml-cuda/mul_mat_iu4.cuh"
 #include "ggml.h"
 
@@ -2396,6 +2397,7 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     // GGML_TYPE_IU4 entry -- force these nodes back through the normal
     // per-op MUL_MAT dispatch (ggml_cuda_mul_mat), which IS hooked for both.
     if (ffn_up->src[0]->type == GGML_TYPE_2OF4_FP8 || ffn_gate->src[0]->type == GGML_TYPE_2OF4_FP8 ||
+        ffn_up->src[0]->type == GGML_TYPE_2OF4_F16 || ffn_gate->src[0]->type == GGML_TYPE_2OF4_F16 ||
         ffn_up->src[0]->type == GGML_TYPE_IU4      || ffn_gate->src[0]->type == GGML_TYPE_IU4) {
         return false;
     }
@@ -2527,7 +2529,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     // (mul_mat_2of4_fp8.cu / mul_mat_iu4.cu) hooked only at the top of the
     // normal, unfused ggml_cuda_mul_mat(). Refuse fusion so those nodes take
     // that path.
-    if (src0->type == GGML_TYPE_2OF4_FP8 || src0->type == GGML_TYPE_IU4) {
+    if (src0->type == GGML_TYPE_2OF4_FP8 || src0->type == GGML_TYPE_2OF4_F16 || src0->type == GGML_TYPE_IU4) {
         return false;
     }
 
@@ -2577,6 +2579,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (src0->type == GGML_TYPE_2OF4_FP8) {
         const bool ok = ggml_cuda_op_mul_mat_2of4_fp8(ctx, src0, src1, dst);
         GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_2of4_fp8 does not support this tensor shape");
+        return;
+    }
+
+    // card 141: RDNA4 2:4-structured-sparse fp16 SWMMAC, end-to-end -- same
+    // intercept pattern as GGML_TYPE_2OF4_FP8 immediately above, its own
+    // dedicated kernel (mul_mat_2of4_f16.cu). Single-GPU only (no
+    // split-buffer handling), MUL_MAT only (no MUL_MAT_ID).
+    if (src0->type == GGML_TYPE_2OF4_F16) {
+        const bool ok = ggml_cuda_op_mul_mat_2of4_f16(ctx, src0, src1, dst);
+        GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_2of4_f16 does not support this tensor shape");
         return;
     }
 
@@ -5261,6 +5273,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     // MUL_MAT_ID (MoE routing) is NOT wired for either -- fine for
                     // dense-model testing, not required by the task.
                     case GGML_TYPE_2OF4_FP8:
+                    case GGML_TYPE_2OF4_F16:
                     case GGML_TYPE_IU4:
                         return op->op == GGML_OP_MUL_MAT;
                     default:

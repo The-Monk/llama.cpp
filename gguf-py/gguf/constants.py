@@ -4538,6 +4538,7 @@ class GGMLQuantizationType(IntEnum):
     TWO_OF_FOUR_FP8 = 45
     MXFP8   = 46
     IU4     = 47  # EXPERIMENTAL, model-blocked (see GGML_TYPE_IU4 comment in ggml.h)
+    TWO_OF_FOUR_F16 = 48  # card 141, RDNA4 2:4-sparse SWMMAC fp16
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4598,6 +4599,7 @@ class LlamaFileType(IntEnum):
     MOSTLY_2OF4_FP8      = 43  # except 1d tensors (RDNA4 2:4-sparse SWMMAC)
     MOSTLY_MXFP8         = 44  # except 1d tensors
     MOSTLY_IU4           = 45  # except 1d tensors -- EXPERIMENTAL, model-blocked
+    MOSTLY_2OF4_F16      = 46  # except 1d tensors (card 141, RDNA4 2:4-sparse SWMMAC fp16)
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -4728,6 +4730,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.TWO_OF_FOUR_FP8: (32, 2 + 16 + 4),
     GGMLQuantizationType.MXFP8:  (32, 1 + 32),
     GGMLQuantizationType.IU4:    (32, 2 + 16),
+    GGMLQuantizationType.TWO_OF_FOUR_F16: (32, 16 + 4),
 }
 
 

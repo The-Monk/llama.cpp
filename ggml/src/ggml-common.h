@@ -316,6 +316,30 @@ typedef struct {
 } block_2of4_fp8;
 static_assert(sizeof(block_2of4_fp8) == sizeof(ggml_half) + QK_2OF4_FP8/2 + QK_2OF4_FP8/8, "wrong 2of4_fp8 block size/padding");
 
+// 2OF4_F16 (card 141: sparse-fp16 2:4 end-to-end, mirrors 2OF4_FP8 exactly
+// except the kept values are stored as NATIVE fp16, not e4m3+scale). fp16
+// already has a 5-bit exponent / 10-bit mantissa -- wide enough dynamic
+// range that, unlike e4m3, it needs NO per-block scale factor at all; the
+// 16 kept values are just raw ggml_fp16_t. Same meta/index packing as
+// block_2of4_fp8 (2-bit-per-index, 2 indices/group of 4, 8 groups -> the
+// SAME 16 meaningful bits of `meta` feed directly into the ISA's
+// `sparsity_idx` lane operand for the K=32 SWMMAC forms -- see swmmac24.cuh).
+//
+//   qs[2*g+0], qs[2*g+1]  -- fp16 values for the two kept values of group g
+//                            (g = 0..7), value order matches ascending
+//                            in-group position (v0 = lower position).
+//   meta[g/2]             -- byte holding 2 groups' worth of 2-bit indices,
+//                            IDENTICAL layout/packing to block_2of4_fp8.meta.
+//
+// 36 bytes / 32 logical values = 9 bpw (vs 16 bpw dense fp16) -- half the
+// weights kept (2:4) plus a small index tax, no fp8 precision loss at all.
+#define QK_2OF4_F16 32
+typedef struct {
+    ggml_half qs[QK_2OF4_F16/2];   // 16 kept fp16 values (2 per group of 4, 8 groups) -- ggml_half == raw fp16 bit pattern, same type block_q4_1.d etc use
+    uint8_t   meta[QK_2OF4_F16/8]; // 4 bytes: packed 2-bit-per-index sparsity metadata (same format as block_2of4_fp8)
+} block_2of4_f16;
+static_assert(sizeof(block_2of4_f16) == (QK_2OF4_F16/2)*sizeof(ggml_half) + QK_2OF4_F16/8, "wrong 2of4_f16 block size/padding");
+
 // IU4 (T89->driver-completeness run): signed int4 weights (2/byte) + one
 // fp16 scale per block. Q4_0-shaped (18 bytes / 32 values), but the nibble
 // packing convention is DIFFERENT from block_q4_0: byte b's low nibble is

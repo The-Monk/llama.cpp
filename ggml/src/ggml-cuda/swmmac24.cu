@@ -32,6 +32,14 @@ using fp8e4m3 = __hip_fp8_e4m3;
 static inline uint8_t fp8_bits(float v) { fp8e4m3 f(v); return f.__x; }
 static inline float   fp8_to_f32(uint8_t bits) { fp8e4m3 f; f.__x = bits; return (float) f; }
 
+// card 141 (sparse-fp16): plain bit-pattern round-trip via _Float16 (the same
+// scalar type swmmac24.cuh's v8h/v16h vectors are built from, and the type
+// mma.cuh already uses host+device throughout this driver) -- avoids relying
+// on any HIP-specific __half_as_ushort-style intrinsic name that may differ
+// from CUDA's.
+static inline uint16_t half_bits(float v)        { _Float16 h = (_Float16) v; uint16_t b; memcpy(&b, &h, sizeof(b)); return b; }
+static inline float    half_to_f32(uint16_t bits) { _Float16 h; memcpy(&h, &bits, sizeof(h)); return (float) h; }
+
 static void gen_2to4_pattern(std::mt19937 & rng, int idx_pairs[8][2]) {
     static const int choices[6][2] = {{0,1},{0,2},{0,3},{1,2},{1,3},{2,3}};
     std::uniform_int_distribution<int> pick(0, 5);
@@ -235,6 +243,111 @@ static bool test_fp8_swmmac_24(int n_trials) {
     return all_pass;
 }
 
+// card 141: sparse-fp16 self-test. Same structure as test_fp8_swmmac_24 (build
+// a real 2:4-sparse A + dense B, run the actual hardware instruction, compare
+// against a host dense reference) but for fp16 values (no quantization/scale
+// codec involved at all -- host reference uses the SAME __half round-trip the
+// device operand bytes carry, so any residual error is pure fp16 rounding,
+// not an approximation of the sparse format).
+static bool test_f16_swmmac_24(int n_trials) {
+    std::mt19937 rng(9012);
+    std::uniform_real_distribution<float> valdist(-3.0f, 3.0f);
+    bool all_pass = true;
+    double max_rel_over_all = 0;
+
+    for (int trial = 0; trial < n_trials; ++trial) {
+        float A_logical[16][32] = {{0}};
+        float B_dense[32][16];
+        int idx_pairs[16][8][2];
+
+        for (int i = 0; i < 16; ++i) {
+            gen_2to4_pattern(rng, idx_pairs[i]);
+            for (int g = 0; g < 8; ++g) {
+                A_logical[i][4*g + idx_pairs[i][g][0]] = valdist(rng);
+                A_logical[i][4*g + idx_pairs[i][g][1]] = valdist(rng);
+            }
+        }
+        for (int k = 0; k < 32; ++k)
+            for (int n = 0; n < 16; ++n)
+                B_dense[k][n] = valdist(rng);
+
+        std::vector<std::vector<uint32_t>> aregs(32, std::vector<uint32_t>(4, 0));
+        std::vector<std::vector<uint32_t>> idxregs(32, std::vector<uint32_t>(1, 0));
+        for (int i = 0; i < 16; ++i) {
+            for (int g = 0; g < 8; ++g) {
+                const int cp0 = 2*g, cp1 = 2*g + 1;
+                const float v0 = A_logical[i][4*g + idx_pairs[i][g][0]];
+                const float v1 = A_logical[i][4*g + idx_pairs[i][g][1]];
+                swmmac24_put_bits(aregs, swmmac24_a_loc(16, i, cp0), half_bits(v0), 16);
+                swmmac24_put_bits(aregs, swmmac24_a_loc(16, i, cp1), half_bits(v1), 16);
+                const Loc idxloc = swmmac24_a_loc(16, i, cp0);
+                const int idxFirstBit = ((4*g >> 2) & 3) * 4;
+                swmmac24_put_bits(idxregs, {idxloc.lane, 0, idxFirstBit + 0}, idx_pairs[i][g][0], 2);
+                swmmac24_put_bits(idxregs, {idxloc.lane, 0, idxFirstBit + 2}, idx_pairs[i][g][1], 2);
+            }
+        }
+        std::vector<std::vector<uint32_t>> bregs(32, std::vector<uint32_t>(8, 0));
+        for (int k = 0; k < 32; ++k)
+            for (int n = 0; n < 16; ++n)
+                swmmac24_put_bits(bregs, swmmac24_b32_loc_16bit(k, n), half_bits(B_dense[k][n]), 16);
+
+        std::vector<v8h>  a_arg(32);
+        std::vector<v16h> b_arg(32);
+        std::vector<unsigned> idx_arg(32);
+        for (int l = 0; l < 32; ++l) {
+            uint16_t a_tmp[8]; memcpy(a_tmp, aregs[l].data(), sizeof(a_tmp));
+            for (int j = 0; j < 8; ++j) { _Float16 h; memcpy(&h, &a_tmp[j], sizeof(h)); a_arg[l][j] = h; }
+            uint16_t b_tmp[16]; memcpy(b_tmp, bregs[l].data(), sizeof(b_tmp));
+            for (int j = 0; j < 16; ++j) { _Float16 h; memcpy(&h, &b_tmp[j], sizeof(h)); b_arg[l][j] = h; }
+            idx_arg[l] = idxregs[l][0];
+        }
+
+        v8h *d_a = nullptr; v16h *d_b = nullptr; unsigned *d_idx = nullptr; v8f *d_dout = nullptr;
+        if (hipMalloc(&d_a, 32*sizeof(v8h)) != hipSuccess || hipMalloc(&d_b, 32*sizeof(v16h)) != hipSuccess ||
+            hipMalloc(&d_idx, 32*sizeof(unsigned)) != hipSuccess || hipMalloc(&d_dout, 32*sizeof(v8f)) != hipSuccess) {
+            GGML_LOG_ERROR("%s: f16 self-test hipMalloc failed\n", __func__);
+            return false;
+        }
+        CUDA_CHECK(hipMemcpy(d_a, a_arg.data(), 32*sizeof(v8h), hipMemcpyHostToDevice));
+        CUDA_CHECK(hipMemcpy(d_b, b_arg.data(), 32*sizeof(v16h), hipMemcpyHostToDevice));
+        CUDA_CHECK(hipMemcpy(d_idx, idx_arg.data(), 32*sizeof(unsigned), hipMemcpyHostToDevice));
+
+        hipLaunchKernelGGL(k_swmmac_f16_24_perlane, dim3(1), dim3(32), 0, 0, d_a, d_b, d_idx, d_dout);
+        const hipError_t err = hipDeviceSynchronize();
+        if (err != hipSuccess) {
+            GGML_LOG_ERROR("%s: f16 SWMMAC kernel failed: %s\n", __func__, hipGetErrorString(err));
+            CUDA_CHECK(hipFree(d_a)); CUDA_CHECK(hipFree(d_b)); CUDA_CHECK(hipFree(d_idx)); CUDA_CHECK(hipFree(d_dout));
+            return false;
+        }
+
+        std::vector<v8f> dout(32);
+        CUDA_CHECK(hipMemcpy(dout.data(), d_dout, 32*sizeof(v8f), hipMemcpyDeviceToHost));
+
+        double max_rel = 0;
+        for (int i = 0; i < 16; ++i) {
+            for (int j = 0; j < 16; ++j) {
+                float ref = 0;
+                for (int k = 0; k < 32; ++k) {
+                    const float av = half_to_f32(half_bits(A_logical[i][k])); // 0 for structurally-dropped k
+                    const float bv = half_to_f32(half_bits(B_dense[k][j]));
+                    ref += av * bv;
+                }
+                const Loc loc = swmmac24_d_loc(i, j);
+                float tmp[8]; memcpy(tmp, &dout[loc.lane], sizeof(tmp));
+                const float got = tmp[loc.vgpr];
+                const double rel = fabs((double) got - (double) ref) / fmax(1.0, fabs((double) ref));
+                max_rel = fmax(max_rel, rel);
+            }
+        }
+        max_rel_over_all = fmax(max_rel_over_all, max_rel);
+        if (max_rel > 0.01) all_pass = false;
+        CUDA_CHECK(hipFree(d_a)); CUDA_CHECK(hipFree(d_b)); CUDA_CHECK(hipFree(d_idx)); CUDA_CHECK(hipFree(d_dout));
+    }
+    GGML_LOG_INFO("%s: V_SWMMAC_F32_16X16X32_F16 2:4-sparse (card 141), %d random trials, max_rel_err=%.6f -> %s\n",
+                   __func__, n_trials, max_rel_over_all, all_pass ? "PASS" : "FAIL");
+    return all_pass;
+}
+
 } // namespace ggml_cuda_swmmac24
 
 // Host-pass-compiled, RUNTIME-gated entry point (T122 fix -- see the header
@@ -255,7 +368,8 @@ bool ggml_cuda_swmmac24_selftest() {
                    "(dormant capability, T99: not used by any model path -- correctness-only gate)\n", __func__);
     const bool ok_iu4 = ggml_cuda_swmmac24::test_iu4_swmmac_24(20);
     const bool ok_fp8 = ggml_cuda_swmmac24::test_fp8_swmmac_24(20);
-    const bool ok = ok_iu4 && ok_fp8;
+    const bool ok_f16 = ggml_cuda_swmmac24::test_f16_swmmac_24(20); // card 141
+    const bool ok = ok_iu4 && ok_fp8 && ok_f16;
     GGML_LOG_INFO("%s: overall result: %s\n", __func__, ok ? "PASS" : "FAIL");
     return ok;
 }

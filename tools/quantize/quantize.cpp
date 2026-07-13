@@ -36,6 +36,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "F8E4M3",   LLAMA_FTYPE_MOSTLY_F8E4M3,   " 8.5 bpw, signed e4m3 + fp16 block scale (Path X)", },
     { "F8E5M2",   LLAMA_FTYPE_MOSTLY_F8E5M2,   " 8.5 bpw, signed e5m2/bf8 + fp16 block scale (T97)", },
     { "2OF4_FP8", LLAMA_FTYPE_MOSTLY_2OF4_FP8, " 5.5 bpw, RDNA4 2:4-structured-sparse fp8 (SWMMAC) -- lossy fallback to F8E4M3 per-tensor if not cleanly 2:4-sparse", },
+    { "2OF4_F16", LLAMA_FTYPE_MOSTLY_2OF4_F16, " 9 bpw, RDNA4 2:4-structured-sparse fp16 (SWMMAC, card 141) -- no fp8 precision loss, lossy fallback to F16 per-tensor if not cleanly 2:4-sparse", },
     { "MXFP8",    LLAMA_FTYPE_MOSTLY_MXFP8,    " 8.25 bpw, OCP MXFP8: signed e4m3 + shared e8m0 per-32 scale (ROC8)", },
     { "IU4",      LLAMA_FTYPE_MOSTLY_IU4,      " 4.5 bpw, signed int4x int4 W4A4 native RDNA4 WMMA -- EXPERIMENTAL, plain RTN, model-blocked/driver-completeness only (T89)", },
     { "Q4_0",     LLAMA_FTYPE_MOSTLY_Q4_0,     " 4.34G, +0.4685 ppl @ Llama-3-8B",  },
