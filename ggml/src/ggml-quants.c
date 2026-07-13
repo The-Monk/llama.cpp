@@ -752,6 +752,86 @@ void dequantize_row_2of4_fp8(const block_2of4_fp8 * GGML_RESTRICT x, float * GGM
     }
 }
 
+// card 141: sparse-fp16 2:4 -- identical group-argmax "keep top-2-of-4 by
+// magnitude" selection as quantize_row_2of4_fp8_ref, but the kept values are
+// stored as RAW fp16 (no block scale -- fp16's native 5-bit exponent already
+// covers the dynamic range, unlike e4m3 which needs the extra scale to reach
+// useful precision). See block_2of4_f16 comment in ggml-common.h.
+void quantize_row_2of4_f16_ref(const float * GGML_RESTRICT x, block_2of4_f16 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_2OF4_F16;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float   kept_vals[QK_2OF4_F16/2];
+        uint8_t idx0[QK_2OF4_F16/4];
+        uint8_t idx1[QK_2OF4_F16/4];
+
+        for (int g = 0; g < QK_2OF4_F16/4; ++g) {
+            const float * grp = x + i*qk + g*4;
+
+            int   best0 = -1, best1 = -1;
+            float best0v = -1.0f, best1v = -1.0f;
+            for (int j = 0; j < 4; ++j) {
+                const float av = fabsf(grp[j]);
+                if (av > best0v) {
+                    best1v = best0v; best1 = best0;
+                    best0v = av;     best0 = j;
+                } else if (av > best1v) {
+                    best1v = av; best1 = j;
+                }
+            }
+            if (best0 < 0) { best0 = 0; }
+            if (best1 < 0) { best1 = (best0 == 0) ? 1 : 0; }
+
+            const int lo = best0 < best1 ? best0 : best1;
+            const int hi = best0 < best1 ? best1 : best0;
+
+            idx0[g] = (uint8_t) lo;
+            idx1[g] = (uint8_t) hi;
+            kept_vals[2*g + 0] = grp[lo];
+            kept_vals[2*g + 1] = grp[hi];
+        }
+
+        for (int j = 0; j < QK_2OF4_F16/2; ++j) {
+            y[i].qs[j] = GGML_FP32_TO_FP16(kept_vals[j]);
+        }
+
+        for (int g = 0; g < QK_2OF4_F16/4; ++g) {
+            const uint8_t nib = (uint8_t) ((idx0[g] & 0x3) | ((idx1[g] & 0x3) << 2));
+            if ((g & 1) == 0) {
+                y[i].meta[g/2] = nib;
+            } else {
+                y[i].meta[g/2] = (uint8_t) (y[i].meta[g/2] | (nib << 4));
+            }
+        }
+    }
+}
+
+void dequantize_row_2of4_f16(const block_2of4_f16 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_2OF4_F16;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = 0.0f;
+        }
+
+        for (int g = 0; g < QK_2OF4_F16/4; ++g) {
+            const uint8_t byte = x[i].meta[g/2];
+            const uint8_t nib  = ((g & 1) == 0) ? (uint8_t) (byte & 0x0F) : (uint8_t) (byte >> 4);
+            const int idx0 = nib & 0x3;
+            const int idx1 = (nib >> 2) & 0x3;
+
+            y[i*qk + g*4 + idx0] = GGML_FP16_TO_FP32(x[i].qs[2*g + 0]);
+            y[i*qk + g*4 + idx1] = GGML_FP16_TO_FP32(x[i].qs[2*g + 1]);
+        }
+    }
+}
+
 // T89 driver-completeness run: plain RTN symmetric int4 quantizer for
 // block_iu4. amax/7 per-block scale (matches the design doc exactly), round
 // to nearest, clamp to [-8,7]. NO imatrix weighting, NO rotation/SmoothQuant
@@ -2627,6 +2707,12 @@ size_t quantize_2of4_fp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     GGML_UNUSED(quant_weights);
     quantize_row_2of4_fp8_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_2OF4_FP8, n_per_row);
+}
+
+size_t quantize_2of4_f16(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_2of4_f16_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_2OF4_F16, n_per_row);
 }
 
 // T89 driver-completeness run: plain RTN, no imatrix weighting on purpose --
@@ -5891,6 +5977,20 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_2OF4_FP8:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_2of4_fp8, data, nb);
+            } break;
+        case GGML_TYPE_2OF4_F16:
+            {
+                // no block scale field to validate (see block_2of4_f16 comment) --
+                // check every kept fp16 value directly, same as VALIDATE_ROW_DATA_D_F16_IMPL
+                // does for a block's `.d` scale.
+                const block_2of4_f16 * q = (const block_2of4_f16 *) (data);
+                for (size_t i = 0; i < (nb); ++i) {
+                    for (int j = 0; j < QK_2OF4_F16/2; ++j) {
+                        if (!validate_fp16(q[i].qs[j], i)) {
+                            return false;
+                        }
+                    }
+                }
             } break;
         case GGML_TYPE_IU4:
             {

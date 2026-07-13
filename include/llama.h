@@ -160,6 +160,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_2OF4_FP8      = 43, // except 1d tensors (RDNA4 2:4-sparse SWMMAC)
         LLAMA_FTYPE_MOSTLY_MXFP8         = 44, // except 1d tensors (ROC8)
         LLAMA_FTYPE_MOSTLY_IU4           = 45, // except 1d tensors -- EXPERIMENTAL, model-blocked (T89, see ggml.h GGML_TYPE_IU4 comment)
+        LLAMA_FTYPE_MOSTLY_2OF4_F16      = 46, // except 1d tensors (card 141, RDNA4 2:4-sparse SWMMAC fp16)
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
