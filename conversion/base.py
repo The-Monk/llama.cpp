@@ -812,6 +812,36 @@ class ModelBase:
         block_dims_cfg = tuple(wbs) if isinstance(wbs, (list, tuple)) and len(wbs) == 2 else None
 
         for name in list(self.model_tensors.keys()):
+            # Fused-MoE fp8 (Qwen3.5/3.6 MoE): experts are stored as fused 3D tensors
+            # experts.gate_up_proj [n_expert, 2*n_ff, n_embd] and experts.down_proj
+            # [n_expert, n_embd, n_ff], each paired with a per-expert scalar
+            # <name>_scale (F32 [n_expert]) rather than a per-.weight scale. Split
+            # gate_up into gate/up mirroring Qwen2MoeModel.modify_tensors, broadcast
+            # each expert's scalar to per-channel, and pack each as a 3D block_f8e4m3
+            # so the native F8E4M3 expert kernel runs the vendor fp8 unchanged.
+            m_fused = re.search(r'\.mlp\.experts\.(gate_up_proj|down_proj)$', name)
+            if m_fused and (name + "_scale") in self.model_tensors:
+                weight = LazyTorchTensor.to_eager(self.model_tensors[name]())
+                if weight.dtype != torch.float8_e4m3fn:
+                    continue
+                scale = LazyTorchTensor.to_eager(self.model_tensors[name + "_scale"]())
+                per_expert = scale.reshape(-1).float().cpu().numpy()      # [n_expert]
+                base = name[:name.rindex(".mlp.experts.")] + ".mlp.experts"
+                consumed += [name, name + "_scale"]
+                if m_fused.group(1) == "gate_up_proj":
+                    n_ff = weight.shape[-2] // 2
+                    halves = ((weight[:, :n_ff, :], "gate_proj"), (weight[:, n_ff:, :], "up_proj"))
+                else:
+                    halves = ((weight, "down_proj"),)
+                for w, proj in halves:
+                    wbytes = w.contiguous().view(torch.uint8).cpu().numpy()   # [n_expert, rows, cols]
+                    rows = wbytes.shape[-2]
+                    sarr = np.ascontiguousarray(np.broadcast_to(per_expert[:, None], (per_expert.shape[0], rows)))
+                    raw = gguf.quants.pack_f8e4m3_preserve(wbytes, sarr, block_dims=None)
+                    new_name = self.map_tensor_name(f"{base}.{proj}.weight")
+                    logger.info(f"fp8-native: packed fused {new_name} [{wbytes.shape[0]} experts] as F8E4M3 (preserved)")
+                    self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.F8E4M3)
+                continue
             if not name.endswith(".weight"):
                 continue
             # Skip weights that the model's modify_tensors splits/transposes into
@@ -867,6 +897,13 @@ class ModelBase:
 
             m = re.search(r'\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$', name)
             if m and n_experts > 0:
+                # Materialize the raw bytes here, while iterating in model_tensors
+                # (== safetensors offset) order, so each shard is read once
+                # sequentially. Deferring the fault to _flush_fp8_experts' np.stack
+                # would read the 256 experts in expert-id order instead, which is
+                # offset-scattered within the shard and thrashes the ZFS mmap path
+                # (~850x read amplification on the per-expert Ornith layout).
+                wbytes = np.array(wbytes, copy=True)
                 bid_m = re.search(r'\.layers\.(\d+)\.', name)
                 bid = int(bid_m.group(1)) if bid_m else 0
                 key = (bid, m.group(2))
