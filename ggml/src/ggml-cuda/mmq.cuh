@@ -1808,24 +1808,58 @@ static __device__ __forceinline__ void vec_dot_f8e5m2_f8e5m2_mma(
             load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*MMQ_MMA_TILE_X_K_Q8_0 + k0, MMQ_MMA_TILE_X_K_Q8_0);
         }
 
-#pragma unroll
-        for (int j0 = 0; j0 < mmq_x; j0 += ntx*tile_C::J) {
-            tile_B B;
-            load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+        // Card 140: mmq_x=48 (3 WMMA-N chunks at this width, ntx=1) fully
+        // unrolling this j0 loop hits the 256-VGPR/thread ceiling on gfx1201
+        // (vgpr_spill_count 28/63 -- see the mul_mat_q dead-end comment below
+        // and wiki/tech/rdna4-isa-optimization-audit.md). Only mmq_x=48 gets
+        // a non-unrolled copy of the loop (`unroll(disable)`, forces one
+        // chunk's B/C tile live at a time instead of the compiler keeping
+        // several chunks' operands live for ILP); this is a duplicated loop,
+        // not a shared helper, so the `else` arm below -- every other width
+        // -- stays textually identical to the pre-card-140 code and its
+        // codegen is provably unaffected.
+        if constexpr (mmq_x == 48) {
+#pragma clang loop unroll(disable)
+            for (int j0 = 0; j0 < mmq_x; j0 += ntx*tile_C::J) {
+                tile_B B;
+                load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
 
-            const int   j  = j0 + tile_C::get_j(0);
-            const float dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+                const int   j  = j0 + tile_C::get_j(0);
+                const float dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
 
 #pragma unroll
-            for (int n = 0; n < ntx; ++n) {
-                tile_C C;
-                mma_bf8(C, A[n], B);
+                for (int n = 0; n < ntx; ++n) {
+                    tile_C C;
+                    mma_bf8(C, A[n], B);
 
 #pragma unroll
-                for (int l = 0; l < tile_C::ne; ++l) {
-                    const int   i  = i0 + n*tile_A::I + tile_C::get_i(l);
-                    const float dA = x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + k0/QI_F8E5M2];
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA*dB;
+                    for (int l = 0; l < tile_C::ne; ++l) {
+                        const int   i  = i0 + n*tile_A::I + tile_C::get_i(l);
+                        const float dA = x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + k0/QI_F8E5M2];
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA*dB;
+                    }
+                }
+            }
+        } else {
+#pragma unroll
+            for (int j0 = 0; j0 < mmq_x; j0 += ntx*tile_C::J) {
+                tile_B B;
+                load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+
+                const int   j  = j0 + tile_C::get_j(0);
+                const float dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+
+#pragma unroll
+                for (int n = 0; n < ntx; ++n) {
+                    tile_C C;
+                    mma_bf8(C, A[n], B);
+
+#pragma unroll
+                    for (int l = 0; l < tile_C::ne; ++l) {
+                        const int   i  = i0 + n*tile_A::I + tile_C::get_i(l);
+                        const float dA = x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + k0/QI_F8E5M2];
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA*dB;
+                    }
                 }
             }
         }
@@ -1889,24 +1923,54 @@ static __device__ __forceinline__ void vec_dot_mxfp8_mxfp8_mma(
             load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*MMQ_MMA_TILE_X_K_Q8_0 + k0, MMQ_MMA_TILE_X_K_Q8_0);
         }
 
-#pragma unroll
-        for (int j0 = 0; j0 < mmq_x; j0 += ntx*tile_C::J) {
-            tile_B B;
-            load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+        // Card 140: same fix as vec_dot_f8e5m2_f8e5m2_mma above -- mmq_x=48
+        // (3 WMMA-N chunks, ntx=1) fully unrolling this j0 loop hits the
+        // 256-VGPR/thread ceiling on gfx1201 (vgpr_spill_count 28/63). A
+        // duplicated (not shared-lambda) loop body, so the `else` arm below
+        // -- every other width -- stays textually identical to the
+        // pre-card-140 code.
+        if constexpr (mmq_x == 48) {
+#pragma clang loop unroll(disable)
+            for (int j0 = 0; j0 < mmq_x; j0 += ntx*tile_C::J) {
+                tile_B B;
+                load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
 
-            const int   j  = j0 + tile_C::get_j(0);
-            const float dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+                const int   j  = j0 + tile_C::get_j(0);
+                const float dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
 
 #pragma unroll
-            for (int n = 0; n < ntx; ++n) {
-                tile_C C;
-                mma(C, A[n], B);
+                for (int n = 0; n < ntx; ++n) {
+                    tile_C C;
+                    mma(C, A[n], B);
 
 #pragma unroll
-                for (int l = 0; l < tile_C::ne; ++l) {
-                    const int   i  = i0 + n*tile_A::I + tile_C::get_i(l);
-                    const float dA = x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + k0/QI_MXFP8];
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA*dB;
+                    for (int l = 0; l < tile_C::ne; ++l) {
+                        const int   i  = i0 + n*tile_A::I + tile_C::get_i(l);
+                        const float dA = x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + k0/QI_MXFP8];
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA*dB;
+                    }
+                }
+            }
+        } else {
+#pragma unroll
+            for (int j0 = 0; j0 < mmq_x; j0 += ntx*tile_C::J) {
+                tile_B B;
+                load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+
+                const int   j  = j0 + tile_C::get_j(0);
+                const float dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+
+#pragma unroll
+                for (int n = 0; n < ntx; ++n) {
+                    tile_C C;
+                    mma(C, A[n], B);
+
+#pragma unroll
+                    for (int l = 0; l < tile_C::ne; ++l) {
+                        const int   i  = i0 + n*tile_A::I + tile_C::get_i(l);
+                        const float dA = x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + k0/QI_MXFP8];
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA*dB;
+                    }
                 }
             }
         }
