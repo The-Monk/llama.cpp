@@ -820,6 +820,27 @@ class ModelBase:
             # into k_b_proj/v_b_proj (k_b transposed). Let these dequant + split.
             if name.endswith("kv_b_proj.weight"):
                 continue
+            # GatedDeltaNet / SSM linear-attn conv1d is a DEPTHWISE conv (shape
+            # [out_ch, 1, kernel]), not a GEMM: fp8 tensor-core preserve doesn't apply
+            # and the arch's modify_tensors reshapes it ([out,1,k] -> [k,out]). Raw
+            # preserve would pack the 3D fp8 verbatim and bypass that reshape, tripping
+            # GGML_ASSERT(ggml_is_matrix(c)) in the qwen35 loader. Dequantize the vendor
+            # fp8 conv1d back to bf16 in place (and drop its scale) so the normal path
+            # reshapes it correctly. Keeps authentic-Quark fp8 for every real matmul.
+            if "conv1d" in name and name.endswith(".weight"):
+                _sn = (name + "_scale") if (name + "_scale") in self.model_tensors else \
+                      ((name + "_scale_inv") if (name + "_scale_inv") in self.model_tensors else None)
+                _w = LazyTorchTensor.to_eager(self.model_tensors[name]())
+                if _w.dtype == torch.float8_e4m3fn and _sn is not None:
+                    _s = LazyTorchTensor.to_eager(self.model_tensors[_sn]()).float()
+                    _wf = _w.float()
+                    while _s.ndim < _wf.ndim:
+                        _s = _s.unsqueeze(-1)
+                    _deq = (_wf * _s).to(torch.bfloat16)
+                    self.model_tensors[name] = (lambda t=_deq: t)
+                    self.model_tensors.pop(_sn, None)
+                    logger.info(f"fp8-native: dequantized depthwise conv1d {name} -> bf16 (arch reshape path)")
+                continue
             # per-channel/per-tensor scale (.weight_scale) or block-scale (.weight_scale_inv)
             if name + "_scale" in self.model_tensors:
                 scale_name, bdims = name + "_scale", None
