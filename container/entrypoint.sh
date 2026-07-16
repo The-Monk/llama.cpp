@@ -21,7 +21,13 @@ f = os.path.join(cache, "user_models.json")
 data = {}
 if os.path.exists(f):
     data = json.load(open(f))
+# Bake in the validated serving config (override with LLAMA_ARGS env).
+# Default: continuous batching (multi-user / vLLM-replacement; 35B-A3B fp8 peaks
+# ~537 t/s @ npl~114, mod-4 alignment, f16-KV only). Single-user latency:
+# LLAMA_ARGS="-ngl 999 --spec-type draft-mtp --spec-draft-n-max 8" (MTP, 27B 18->45).
+llama_args = os.environ.get("LLAMA_ARGS", "-ngl 999 --cont-batching --reasoning off")
 data[name] = {"checkpoint": ckpt, "recipe": "llamacpp",
+              "recipe_options": {"llamacpp_args": llama_args, "merge_args": True},
               "suggested": True, "labels": ["custom"], "source": "local_upload"}
 json.dump(data, open(f, "w"))
 print(f"registered {name} -> {ckpt}")
@@ -35,6 +41,7 @@ c = json.load(open(f)) if os.path.exists(f) else {}
 c.setdefault("llamacpp", {})
 c["llamacpp"]["backend"] = "rocm"
 c["llamacpp"]["prefer_system"] = False
+c["disable_model_filtering"] = True   # local direct-path models show in the chat picker
 c["port"] = int(os.environ.get("LEMONADE_PORT", "13305"))
 c["host"] = "0.0.0.0"
 json.dump(c, open(f, "w"))
@@ -54,6 +61,14 @@ case "${1:-serve}" in
   ppl)
     shift
     exec /opt/llama/llama-perplexity -m "$MODEL" "$@"
+    ;;
+  lookup)
+    # Drafter-free n-gram prompt-lookup decode — fast single-stream on repetitive/
+    # code/RAG output (no draft model, no extra VRAM). 27B 18->134, A3B 66->298 t/s
+    # at draft-max~12. temp=0 greedy is exact modulo fp8 rounding. Pass -f/-p + args.
+    shift
+    exec /opt/llama/llama-lookup -m "$MODEL" -ngl 999 \
+         --spec-draft-n-max "${DRAFT_MAX:-12}" "$@"
     ;;
   bash|sh)
     exec /bin/bash

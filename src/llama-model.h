@@ -602,6 +602,24 @@ struct llama_model {
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
 
+    // dspark: block-diffusion drafter (DFlash-family) with log-SNR conditioning
+    // plus a low-rank Markov consistency head and a confidence head. The Markov/
+    // confidence refinement loop is NOT wired into the compute graph yet (v1 does
+    // single-shot block drafting); the tensors are still loaded so nothing in the
+    // gguf is orphaned.
+    struct ggml_tensor * dspark_log_snr_fc1     = nullptr;
+    struct ggml_tensor * dspark_log_snr_fc1_b   = nullptr;
+    struct ggml_tensor * dspark_log_snr_fc2     = nullptr;
+    struct ggml_tensor * dspark_log_snr_fc2_b   = nullptr;
+    struct ggml_tensor * dspark_markov_head_a   = nullptr;
+    struct ggml_tensor * dspark_markov_head_b   = nullptr;
+    struct ggml_tensor * dspark_confidence_head   = nullptr;
+    struct ggml_tensor * dspark_confidence_head_b = nullptr;
+
+    uint32_t    dspark_block_size   = 0;
+    float       dspark_min_log_snr  = 0.0f;
+    float       dspark_max_log_snr  = 0.0f;
+
     std::vector<llama_layer> layers;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma

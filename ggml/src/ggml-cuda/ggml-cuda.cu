@@ -71,6 +71,7 @@
 #include "ggml-cuda/mul_mat_2of4_fp8.cuh"
 #include "ggml-cuda/mul_mat_2of4_f16.cuh"
 #include "ggml-cuda/mul_mat_iu4.cuh"
+#include "ggml-cuda/mul_mat_q2_0_wmma.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2603,6 +2604,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const bool ok = ggml_cuda_op_mul_mat_iu4(ctx, src0, src1, dst);
         GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_iu4 does not support this tensor shape");
         return;
+    }
+
+    // Experimental decode-time lever (see mul_mat_q2_0_wmma.cuh): route Q2_0
+    // ternary decode GEMVs (batch=1) through the native RDNA4 iu4 WMMA
+    // instead of the dp4a mmvq.cu path. Opt-in only -- unlike the IU4/2OF4
+    // intercepts above (which are unconditional because those types are
+    // never produced by a real model), Q2_0 IS the production ternary
+    // decode path, so this is gated behind an env var and a strict shape
+    // check; unset/out-of-scope calls fall straight through to the
+    // unmodified mmvq.cu path below.
+    {
+        static const bool q2_0_wmma_decode_enabled = (getenv("GGML_HIP_Q2_0_WMMA_DECODE") != nullptr);
+        if (q2_0_wmma_decode_enabled && ggml_cuda_q2_0_wmma_decode_supports(src0, src1, dst)) {
+            const bool ok = ggml_cuda_op_mul_mat_q2_0_wmma(ctx, src0, src1, dst);
+            GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_q2_0_wmma does not support this tensor shape");
+            return;
+        }
     }
 
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
@@ -5870,6 +5888,29 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
             mxfp8_selftest_ran = true;
             const bool ok = ggml_cuda_mxfp8_selftest();
             GGML_LOG_INFO("%s: GGML_HIP_MXFP8_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // Concurrency PoC (see mul_mat_q2_0_wmma.cuh): spawns a detached
+    // background thread that hammers the WMMA path on its own stream, IN
+    // THIS SAME PROCESS/CONTEXT, for the life of the process -- used to
+    // measure whether a real decode workload (mmvq, VALU-bound) on the main
+    // stream holds its throughput while a WMMA-bound companion runs
+    // concurrently on a second stream of the SAME context (the mechanism the
+    // T112 async draft/verify pipeline actually uses). Opt-in only, no
+    // effect unless GGML_HIP_WMMA_CONCURRENCY_POC is set; duration/intensity
+    // tunable via GGML_HIP_WMMA_CONCURRENCY_POC_SECONDS /
+    // _ITERS (defaults: 120s, 500000 iters/launch).
+    if (getenv("GGML_HIP_WMMA_CONCURRENCY_POC") != nullptr) {
+        static bool wmma_concurrency_poc_started = false;
+        if (!wmma_concurrency_poc_started) {
+            wmma_concurrency_poc_started = true;
+            const char * secs_env  = getenv("GGML_HIP_WMMA_CONCURRENCY_POC_SECONDS");
+            const char * iters_env = getenv("GGML_HIP_WMMA_CONCURRENCY_POC_ITERS");
+            const double secs  = secs_env  ? atof(secs_env)  : 120.0;
+            const long   iters = iters_env ? atol(iters_env) : 500000L;
+            GGML_LOG_INFO("%s: starting GGML_HIP_WMMA_CONCURRENCY_POC companion (%.1fs, %ld iters/launch)\n",
+                           __func__, secs, iters);
+            ggml_cuda_start_wmma_concurrency_poc_companion(secs, iters);
         }
     }
 

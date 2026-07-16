@@ -51,8 +51,33 @@ int main(int argc, char ** argv) {
     llama_model_ptr model_dft;
     llama_context_ptr ctx_dft;
 
+    // mirror tools/server/server-context.cpp's has_draft/spec_mtp split so MTP
+    // self-speculation works from this example too (previously it unconditionally
+    // tried to load a second full model from an empty --spec-draft-model path).
+    const bool has_draft = params.speculative.has_dft();
+    const bool spec_mtp  = std::find(params.speculative.types.begin(),
+                                      params.speculative.types.end(),
+                                      COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+
+    // [FIX card ASYNC-ACCEPT-1] Bug3: MTP is not the only drafter type whose draft()
+    // depends on ctx_tgt's *just-computed* forward output. EAGLE3 and DFlash/DSpark
+    // (feature-injection block-diffusion drafters, see src/models/dflash.cpp /
+    // dspark.cpp) read the target's intermediate-layer activations
+    // (llama_get_embeddings_layer_inp(ctx_tgt, ...) inside
+    // common_speculative_impl_draft_dflash::process()) for the *current* verify
+    // batch and inject them into ctx_dft before draft() can meaningfully sample the
+    // next block. need_n_rs_seq() > 0 is exactly the set of types with this
+    // property (it's why they need bounded recurrent-state rollback in the first
+    // place: they're deeply coupled to the target's own positions/features, unlike
+    // draft-simple which is a fully independent model). Any code path that skips
+    // process() for these types, or runs it concurrently with the ctx_tgt decode it
+    // reads from, feeds the draft stale-or-wrong features -- this collapsed real
+    // measured dspark acceptance from ~28.6% (sequential) to ~1% (async modes 1/2)
+    // while target-verify stayed exact (coherent output, just a starved draft).
+    const bool spec_needs_tgt_process = params.speculative.need_n_rs_seq() > 0;
+
     // TODO: simplify this logic
-    {
+    if (has_draft) {
         const auto & params_spec = params.speculative.draft;
 
         auto params_dft = params;
@@ -60,6 +85,8 @@ int main(int argc, char ** argv) {
         params_dft.devices      = params_spec.devices;
         params_dft.model        = params_spec.mparams;
         params_dft.n_gpu_layers = params_spec.n_gpu_layers;
+        params_dft.cache_type_k = params_spec.cache_type_k;
+        params_dft.cache_type_v = params_spec.cache_type_v;
 
         if (params_spec.cpuparams.n_threads > 0) {
             params_dft.cpuparams.n_threads       = params.speculative.draft.cpuparams.n_threads;
@@ -77,10 +104,47 @@ int main(int argc, char ** argv) {
         }
 
         auto cparams = common_context_params_to_llama(params_dft);
+        if (spec_mtp) {
+            // a real second model was loaded (e.g. -md pointing at the same gguf so it
+            // can sit on a different device); restrict the graph to the nextn subgraph
+            // instead of running the full stack as the "draft". n_rs_seq=0: this draft
+            // context does not itself need the recurrent-state lookahead slots that
+            // params_dft may have inherited (SSM/hybrid archs) for the target side.
+            cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            cparams.n_rs_seq = 0;
+        }
+        cparams.ctx_other = ctx_tgt;
         ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
+        if (ctx_dft == nullptr) {
+            LOG_ERR("%s", "failed to create draft context\n");
+            return 1;
+        }
 
         params.speculative.draft.ctx_tgt = ctx_tgt;
         params.speculative.draft.ctx_dft = ctx_dft.get();
+    } else if (spec_mtp) {
+        // MTP self-speculation, no separate draft model given: the nextn head lives
+        // inside the target gguf, so reuse model_tgt's already-loaded weights and just
+        // add a lightweight MTP context (own KV-cache + compute buffers, no second copy
+        // of the model weights).
+        auto cparams_mtp = common_context_params_to_llama(params);
+        cparams_mtp.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+        cparams_mtp.type_k    = params.speculative.draft.cache_type_k;
+        cparams_mtp.type_v    = params.speculative.draft.cache_type_v;
+        cparams_mtp.n_rs_seq  = 0;
+        cparams_mtp.ctx_other = ctx_tgt;
+
+        ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
+        if (ctx_dft == nullptr) {
+            LOG_ERR("%s", "failed to create MTP context\n");
+            return 1;
+        }
+
+        params.speculative.draft.ctx_tgt = ctx_tgt;
+        params.speculative.draft.ctx_dft = ctx_dft.get();
+    } else {
+        LOG_ERR("%s", "no draft model given (--spec-draft-model) and --spec-type does not include draft-mtp\n");
+        return 1;
     }
 
     // check if the context supports partial sequence removal
@@ -131,9 +195,32 @@ int main(int argc, char ** argv) {
     // target model sampling context
     common_sampler_ptr smpl(common_sampler_init(model_tgt, params.sampling));
 
-    // eval the prompt
-    llama_decode(ctx_tgt,       llama_batch_get_one(inp.data(), inp.size() - 1));
-    llama_decode(ctx_dft.get(), llama_batch_get_one(inp.data(), inp.size() - 1));
+    // init the speculator before the prompt eval: draft-mtp's process() hook needs to run
+    // on the same prompt batch that's decoded into ctx_tgt (it pulls h_tgt via
+    // llama_get_embeddings_nextn(ctx_tgt) and feeds ctx_dft with embeddings, not raw token
+    // ids -- unlike draft-simple's process(), which does the equivalent of a plain
+    // llama_decode(ctx_dft, batch) with real tokens). Previously this example only ever did
+    // a manual llama_decode(ctx_dft, ...) with tokens here, which is correct for
+    // draft-simple but leaves an MTP draft context's prefill state never populated
+    // (0% useful predictions, ~1-2% accept by chance).
+    const auto & params_spec = params.speculative;
+
+    struct common_speculative * spec = common_speculative_init(params.speculative, 1);
+
+    // eval the prompt. common_speculative_process (needed by draft-mtp) reads
+    // batch.n_seq_id[k]/seq_id[k], which llama_batch_get_one() leaves null (it's meant
+    // for the simplest single-call decode path, not for feeding into the speculator) --
+    // build a real batch with seq_id populated instead.
+    llama_batch batch_prompt = llama_batch_init((int32_t) inp.size() - 1, 0, 1);
+    for (size_t i = 0; i + 1 < inp.size(); ++i) {
+        common_batch_add(batch_prompt, inp[i], (llama_pos) i, { seq_id }, false);
+    }
+    llama_decode(ctx_tgt, batch_prompt);
+    if (!common_speculative_process(spec, batch_prompt)) {
+        LOG_ERR("%s", "failed to process speculative batch during prompt eval\n");
+        return 1;
+    }
+    llama_batch_free(batch_prompt);
 
     // note: keep the last token separate!
     llama_token id_last = inp.back();
@@ -143,11 +230,6 @@ int main(int argc, char ** argv) {
     prompt_tgt.reserve(llama_n_ctx(ctx_tgt));
 
     int n_past = inp.size() - 1;
-
-    // init the speculator
-    const auto & params_spec = params.speculative;
-
-    struct common_speculative * spec = common_speculative_init(params.speculative, 1);
 
     common_speculative_begin(spec, seq_id, prompt_tgt);
 
@@ -176,7 +258,34 @@ int main(int argc, char ** argv) {
 
     const auto t_dec_start = ggml_time_us();
 
-    if (spec_mode == 2) {
+    // [FIX card ASYNC-ACCEPT-1] Bug3: this whole pipeline block launches gen() (==
+    // common_speculative_draft(), i.e. draft() only) for block N+1 concurrently
+    // with -- or, worse, entirely INSTEAD of ever calling -- common_speculative_
+    // process() on block N's just-verified batch. For draft-simple that's fine
+    // (draft() there IS the whole story). For DFlash/DSpark/EAGLE3/MTP, process()
+    // is the step that reads ctx_tgt's just-computed intermediate-layer features
+    // for block N and injects them into ctx_dft; draft() for block N+1 then cross-
+    // attends to that injected KV. Skipping process() (mode 2 never calls it at
+    // all) or racing it against the ctx_tgt decode it reads from (what mode 1 used
+    // to do) feeds these drafters STALE conditioning -- measured: dspark accept
+    // 28.6% (sequential, correct ordering) -> 0.78% (this pipeline, pre-fix).
+    //
+    // The dependency chain is hard and sequential no matter how it's scheduled:
+    //   decode(ctx_tgt, block N) -> process(block N)  [reads ctx_tgt's output]
+    //     -> draft(block N+1)    [reads process()'s injected KV]
+    // draft(block N+1) cannot legitimately start until process(block N) has run,
+    // and process(block N) cannot start until decode(ctx_tgt, block N) has
+    // returned -- so for these types there is NO valid placement of "draft(N+1) ||
+    // verify(N)" overlap at the call-ordering level; it collapses to exactly what
+    // sequential mode already does. (A genuine partial overlap would require
+    // exposing a mid-forward-pass hook so dspark's *shallow* target_layer_ids
+    // features -- computed early in ctx_tgt's stack -- could be read and injected
+    // while ctx_tgt's later layers are still computing; that needs a per-layer
+    // callback this driver doesn't have today, not a call-ordering fix. Left as
+    // future work, noted below.) So: for spec_needs_tgt_process types, skip this
+    // specialized (broken-for-them) pipeline entirely and fall through to the
+    // plain sequential loop below, which already calls process() correctly.
+    if (spec_mode == 2 && !spec_needs_tgt_process) {
         // ===== T112 PIPELINE: overlap draft-gen[N+1] (ctx_dft) with verify[N] (ctx_tgt) =====
         // The draft over-generates by one: the extra token is a *guess* for the target's bonus
         // token. Block N is kept in ctx_dft KV, so while the target verifies block N the draft
@@ -186,8 +295,25 @@ int main(int argc, char ** argv) {
         // confirmed prefix and regenerate. Output is identical to sequential in every case.
         // Only needs suffix seq_rm (always available), not FULL-checkpoint support.
 
+        auto trim = [&](llama_context * c, int pos) {
+            llama_memory_seq_rm(llama_get_memory(c), seq_id, pos, -1);
+        };
+
+        // [FIX card ASYNC-PIPELINE-POS-1] `draft()` (common_speculative_impl_draft_dflash)
+        // always requests exactly `params.n_max` (the configured/clamped block width) new
+        // mask tokens every call -- it ignores dp.n_max (-1 here) and just uses its own
+        // default. On a "hit", the *next* seed (bonus_guess) is the LAST of those
+        // already-decoded block tokens, so it already occupies a position at the tail of
+        // ctx_dft's KV cache. Re-submitting it as position `past` via a plain decode
+        // collides with what's already there (llama_decode's consecutive-position check
+        // fails with X == Y instead of Y == X + 1, observed as "llama_decode returned -1"
+        // repeating every iteration once the pipeline goes async). The block-diffusion
+        // draft only needs the *identity* of the seed token, not its stale hidden state
+        // from the speculative pass that guessed it -- trim ctx_dft back to `past` first so
+        // the position is free to be recomputed as the head of the new block.
         auto gen = [&](llama_token seed, int past, llama_tokens & out) {
             out.clear();
+            trim(ctx_dft.get(), past);
             common_speculative_get_draft_params(spec, seq_id) = {
                 /* .drafting = */ true,
                 /* .n_max    = */ -1,
@@ -201,9 +327,6 @@ int main(int argc, char ** argv) {
         auto split_guess = [](llama_tokens & blk) -> llama_token {
             if ((int) blk.size() >= 2) { llama_token g = blk.back(); blk.pop_back(); return g; }
             return LLAMA_TOKEN_NULL;
-        };
-        auto trim = [&](llama_context * c, int pos) {
-            llama_memory_seq_rm(llama_get_memory(c), seq_id, pos, -1);
         };
 
         // block 0 (sequential; nothing to overlap yet). Keep its ctx_dft KV.
@@ -331,21 +454,40 @@ int main(int argc, char ** argv) {
 
         //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
 
-        if (spec_mode == 1) {
+        if (spec_mode == 1 && !spec_needs_tgt_process) {
             // T112: run draft-reeval concurrently with target-verify on a separate
             // thread → separate per-context stream → GPU overlaps the two graphs.
             // batch_tgt is read-only to both decodes, so shared access is safe.
+            // Only valid for draft-simple (and other types with NO dependency on
+            // ctx_tgt's own just-computed output): draft-mtp/eagle3/dflash/dspark's
+            // process() reads ctx_tgt's just-computed embeddings_nextn / intermediate
+            // layer activations, so it must run strictly after ctx_tgt's decode, not
+            // concurrently with it -- falls through to the sequential path below.
+            // [card ASYNC-ACCEPT-1] this used to be gated on `!spec_mtp` only, which
+            // let dflash/dspark through this raw-llama_decode(ctx_dft, batch_tgt)
+            // path -- WRONG on two counts: (1) it decodes ctx_tgt's real token ids
+            // straight into ctx_dft, bypassing dspark's mask-diffusion input format
+            // entirely; (2) even calling the correct process() hook here would race
+            // ctx_tgt's decode for the features it reads. Measured effect: dspark
+            // accept collapsed 28.6% (sequential) -> 1.59% (this path). Broadened the
+            // guard to `!spec_needs_tgt_process` (== need_n_rs_seq() > 0) so DFlash/
+            // DSpark/EAGLE3 fall through to the correct sequential process() call below.
             std::thread th_dft([&] {
-                // NOTE: extend to support MTP, Eagle, etc. See server code for reference
                 llama_decode(ctx_dft.get(), batch_tgt);
             });
             llama_decode(ctx_tgt, batch_tgt);
             th_dft.join();
         } else {
-            // evaluate the target model, then the draft model (sequential baseline)
+            // evaluate the target model, then process the draft/MTP side. Using
+            // common_speculative_process() here (not a raw llama_decode(ctx_dft, ...))
+            // is required for draft-mtp -- it pulls ctx_tgt's embeddings_nextn output
+            // and feeds the nextn head; for draft-simple its process() is exactly the
+            // equivalent llama_decode(ctx_dft, batch), so this is a safe generalization.
             llama_decode(ctx_tgt, batch_tgt);
-            // NOTE: extend to support MTP, Eagle, etc. See server code for reference
-            llama_decode(ctx_dft.get(), batch_tgt);
+            if (!common_speculative_process(spec, batch_tgt)) {
+                LOG_ERR("%s", "failed to process speculative batch during verify\n");
+                break;
+            }
         }
 
         // only save the sampler sampler state if we use checkpoints

@@ -4533,6 +4533,9 @@ class GGMLQuantizationType(IntEnum):
     MXFP4   = 39
     NVFP4   = 40
     Q1_0    = 41
+    Q2_0    = 42  # PrismML ternary 2-bit (g128), see GGML_TYPE_Q2_0 in ggml.h -- missing from
+                  # gguf-py until now; blocked gguf_dump/GGUFReader on every Bonsai/Ternary gguf
+                  # (card 147 MTP-warm-start POC hit this first while reading target_layers).
     F8E4M3  = 43
     F8E5M2  = 44
     TWO_OF_FOUR_FP8 = 45
@@ -4725,6 +4728,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.MXFP4:   (32, 1 + 16),
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
+    GGMLQuantizationType.Q2_0:    (128, 2 + 32),  # block_q2_0: ggml_half d + 128*2bits/8 = 2 + 32 bytes
     GGMLQuantizationType.F8E4M3: (32, 2 + 32),
     GGMLQuantizationType.F8E5M2: (32, 2 + 32),
     GGMLQuantizationType.TWO_OF_FOUR_FP8: (32, 2 + 16 + 4),

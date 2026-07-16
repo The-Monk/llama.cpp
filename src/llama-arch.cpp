@@ -131,6 +131,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_MISTRAL3,         "mistral3"         },
     { LLM_ARCH_EAGLE3,           "eagle3"           },
     { LLM_ARCH_DFLASH,           "dflash"           },
+    { LLM_ARCH_DSPARK,           "dspark"           },
     { LLM_ARCH_MISTRAL4,         "mistral4"         },
     { LLM_ARCH_PADDLEOCR,        "paddleocr"        },
     { LLM_ARCH_MIMO2,            "mimo2"            },
@@ -308,6 +309,17 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_TARGET_LAYERS,         "%s.target_layers"        },
     { LLM_KV_TARGET_HIDDEN_SIZE,    "%s.target_hidden_size"   },
     { LLM_KV_NORM_BEFORE_RESIDUAL,  "%s.norm_before_residual" },
+
+    // DSpark: nested "<arch>.dspark.*" namespace (not the flat "<arch>.*" DFlash uses above)
+    { LLM_KV_DSPARK_TARGET_LAYERS,             "%s.dspark.target_layers"               },
+    { LLM_KV_DSPARK_BLOCK_SIZE,                "%s.dspark.block_size"                  },
+    { LLM_KV_DSPARK_MASK_TOKEN_ID,              "%s.dspark.mask_token_id"               },
+    { LLM_KV_DSPARK_MARKOV_RANK,                "%s.dspark.markov_rank"                 },
+    { LLM_KV_DSPARK_CONFIDENCE_HEAD,             "%s.dspark.confidence_head"             },
+    { LLM_KV_DSPARK_CONFIDENCE_HEAD_WITH_MARKOV, "%s.dspark.confidence_head_with_markov" },
+    { LLM_KV_DSPARK_LOG_SNR_CONDITIONING,        "%s.dspark.log_snr_conditioning"        },
+    { LLM_KV_DSPARK_MIN_LOG_SNR,                 "%s.dspark.min_log_snr"                 },
+    { LLM_KV_DSPARK_MAX_LOG_SNR,                 "%s.dspark.max_log_snr"                 },
 
     { LLM_KV_SHORTCONV_L_CACHE, "%s.shortconv.l_cache" },
     // sentence-transformers dense modules feature dims
@@ -603,6 +615,13 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_MASKED_EMBD_ORDERING,                   "masked_embd_ordering" },
     { LLM_TENSOR_FC,                                     "fc" },
     { LLM_TENSOR_D2T,                                    "d2t" },
+    { LLM_TENSOR_DSPARK_FC,                              "dspark.fc" },
+    { LLM_TENSOR_DSPARK_HIDDEN_NORM,                     "dspark.hidden_norm" },
+    { LLM_TENSOR_DSPARK_LOG_SNR_FC1,                     "dspark.log_snr_fc1" },
+    { LLM_TENSOR_DSPARK_LOG_SNR_FC2,                     "dspark.log_snr_fc2" },
+    { LLM_TENSOR_DSPARK_MARKOV_A,                        "dspark.markov_head_a" },
+    { LLM_TENSOR_DSPARK_MARKOV_B,                        "dspark.markov_head_b" },
+    { LLM_TENSOR_DSPARK_CONFIDENCE,                      "dspark.confidence_head" },
 };
 
 // declare information about the model weight tensors:
@@ -854,6 +873,14 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     // eagle3
     {LLM_TENSOR_FC,                         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_D2T,                        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
+    // dspark
+    {LLM_TENSOR_DSPARK_FC,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DSPARK_HIDDEN_NORM,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_DSPARK_LOG_SNR_FC1,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DSPARK_LOG_SNR_FC2,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DSPARK_MARKOV_A,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DSPARK_MARKOV_B,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DSPARK_CONFIDENCE,          {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
