@@ -717,8 +717,23 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             // GDDR6 channel aliasing. Measured 2026-07-10:
             //   fp8 (8-bit, ~4x the per-row byte stride): rpb=3 = +6.5% over rpb=2 (UMC 75% vs 70%).
             //   Q2_0 (2-bit, tiny stride): rpb=2 optimal; rpb=4 channel-aliases (-13.4% pothole).
-            // Split fp8 -> 3; everything else keeps the validated 2.
-            if (type == GGML_TYPE_F8E4M3 || type == GGML_TYPE_F8E5M2) {
+            //   That sweep was on the dense Bonsai-8B (Qwen3 arch).
+            // Re-swept 2026-07-14 on Bonsai-27B (qwen35 hybrid-attn/GatedDeltaNet, different
+            // matmul row shapes/strides than the 8B): rpb=3 reproducibly beats rpb=2 by ~2.3%
+            // (5-build interleaved A/B: rpb2 50.31/49.82 vs rpb3 51.12/51.27/51.18 t/s tg128).
+            // Re-checked the 8B on this same build: rpb2/3 still tied, no regression (160.8 vs
+            // 161.9 t/s). PPL byte-identical between rpb=2/3 on the 27B (wikitext-2, 20 chunks:
+            // 11.5576 +/- 0.47262 both) -- row-batching only changes grid parallelism, not the
+            // math, so this is correctness-neutral. Moved Q2_0 into the rpb=3 bucket: shape-
+            // dependent, not a flat per-quant constant -- ideally a per-(type,n_rows) dispatch
+            // key, kept here pending that.
+            // Re-swept 2026-07-16 (card 147) on GPU0 specifically (0000:04:00.0, the
+            // previous 07-14 sweep didn't record which card) with the archive job
+            // SIGSTOPped for a clean cold window, Bonsai-27B Q2_0, llama-bench tg128 -r5:
+            //   rpb=1: 44.93+/-0.37  rpb=2: 47.26+/-0.24  rpb=3: 49.68+/-0.78  rpb=4: 48.62+/-0.43
+            // rpb=3 confirmed still the GPU0 winner (monotonic 1<2<3>4), no regression
+            // from the 07-14 result. Kept as-is.
+            if (type == GGML_TYPE_F8E4M3 || type == GGML_TYPE_F8E5M2 || type == GGML_TYPE_Q2_0) {
                 return 3;
             }
             return 2;

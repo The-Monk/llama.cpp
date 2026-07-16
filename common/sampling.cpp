@@ -635,6 +635,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
 
+        if (getenv("DSPARK_DEBUG_VERIFY")) {
+            fprintf(stderr, "DSPARK_DEBUG_VERIFY: i=%zu idx=%d draft_id=%d target_id=%d match=%d is_eog=%d\n",
+                    i, idxs[i], draft[i], id, draft[i] == id,
+                    (int) llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx)), id));
+        }
+
         if (draft[i] != id) {
             break;
         }
@@ -646,6 +652,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
+
+        if (getenv("DSPARK_DEBUG_VERIFY")) {
+            fprintf(stderr, "DSPARK_DEBUG_VERIFY: i=%zu idx=%d (bonus) target_id=%d is_eog=%d\n",
+                    i, idxs[i], id,
+                    (int) llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx)), id));
+        }
     }
 
     return result;

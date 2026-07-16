@@ -286,6 +286,17 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    [GGML_TYPE_F8E4M3] = {
+        // card 151: correctness-fallback CPU entry -- see quants.c for why
+        // this exists (was NULL -> SIGSEGV whenever the backend scheduler
+        // kept a small-batch fp8 matmul on the CPU). vec_dot_type = F32 (no
+        // activation-quantization step) since this path trades speed for
+        // simplicity/correctness; it's not meant to be fast.
+        .from_float               = quantize_row_f8e4m3,
+        .vec_dot                  = ggml_vec_dot_f8e4m3_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q2_K] = {
         .from_float               = quantize_row_q2_K,
         .vec_dot                  = ggml_vec_dot_q2_K_q8_K,
