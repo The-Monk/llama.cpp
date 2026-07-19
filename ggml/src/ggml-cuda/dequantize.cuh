@@ -145,3 +145,26 @@ static __device__ __forceinline__ void dequantize_mxfp8(const void * vx, const i
     v.x = ggml_cuda_e4m3_to_fp32(x[ib].qs[iqs + 0]) * d;
     v.y = ggml_cuda_e4m3_to_fp32(x[ib].qs[iqs + 1]) * d;
 }
+
+// ROC8: MXFP6 -- same shared e8m0 scale as MXFP8 above, but the qs[] payload
+// is 6-bit-packed (4 codes / 3 bytes), not byte-per-value. `iqs` here is
+// always even (the dequantize_block_cont_cuda caller processes elements in
+// pairs) and (iqs, iqs+1) always fall in the SAME 4-value group (group size
+// 4 divides evenly into the stride-2 iteration), so one mxfp6_unpack4 call
+// covers both -- decode via the same lossless e3m2->e4m3->fp32 chain the
+// GPU vec_dot uses (ggml_cuda_e3m2_to_e4m3, mirrors ggml_e3m2_to_fp32 on the
+// CPU side bit-for-bit).
+static __device__ __forceinline__ void dequantize_mxfp6(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_mxfp6 * x = (const block_mxfp6 *) vx;
+
+    const float d = ggml_cuda_e8m0_to_fp32(x[ib].e);
+
+    const int g = iqs >> 2;
+    const int r = iqs & 3;
+
+    uint8_t codes[4];
+    mxfp6_unpack4(x[ib].qs + 3*g, codes);
+
+    v.x = ggml_cuda_e4m3_to_fp32(ggml_cuda_e3m2_to_e4m3(codes[r + 0])) * d;
+    v.y = ggml_cuda_e4m3_to_fp32(ggml_cuda_e3m2_to_e4m3(codes[r + 1])) * d;
+}

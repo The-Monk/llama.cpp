@@ -297,6 +297,17 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
+    [GGML_TYPE_MXFP6] = {
+        // ROC8: same correctness-fallback role as F8E4M3 above -- this type's
+        // real compute path is the GPU mmvq decode kernel (dp4a/hardware-dot2
+        // over e4m3-upconverted E3M2 weights); this CPU entry only exists so
+        // an accidental CPU-side dispatch dequantizes-and-dots instead of
+        // hitting a NULL vec_dot (card 151 lesson).
+        .from_float               = quantize_row_mxfp6,
+        .vec_dot                  = ggml_vec_dot_mxfp6_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q2_K] = {
         .from_float               = quantize_row_q2_K,
         .vec_dot                  = ggml_vec_dot_q2_K_q8_K,

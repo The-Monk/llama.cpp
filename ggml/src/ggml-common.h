@@ -121,6 +121,14 @@ typedef sycl::half2 ggml_half2;
 #define QI_MXFP8 (QK_MXFP8 / (4 * QR_MXFP8))
 #define QR_MXFP8 1
 
+// MXFP6: QI counts "groups of 4 values" (3 packed bytes/group), NOT raw
+// 4-byte words like every byte-per-value quant above -- get_mxfp6_e4m3x4()
+// (common.cuh) addresses qs at 3-byte-group granularity using this same
+// index, mirroring get_int_b2's byte-word addressing 1:1 so the mmvq main
+// loop (kbx/iqs arithmetic) is unchanged.
+#define QI_MXFP6 (QK_MXFP6 / 4)
+#define QR_MXFP6 1
+
 #define QI5_0 (QK5_0 / (4 * QR5_0))
 #define QR5_0 2
 
@@ -285,6 +293,37 @@ typedef struct {
     uint8_t qs[QK_MXFP8];     // signed e4m3 (OCP e4m3fn) raw bytes, 1 per value
 } block_mxfp8;
 static_assert(sizeof(block_mxfp8) == sizeof(uint8_t) + QK_MXFP8, "wrong mxfp8 block size/padding");
+
+// MXFP6 (OCP Microscaling FP6, ROC8): 6-bit E3M2 (3 exp bits, bias=3, 2
+// mantissa bits, OCP MX FP6 -- NO Inf/NaN encoding, all 64 bit patterns are
+// finite) weight elements, 4 packed per 3 bytes (24 bytes for QK_MXFP6=32
+// elements) + one shared per-32-block UE8M0 scale byte, same convention as
+// block_mxfp8/block_mxfp4 (scale = 2^(e-127), ggml_e8m0_to_fp32).
+//
+// E3M2 is a strict SUBSET of e4m3fn (OCP e4m3, 4 exp bits bias=7, 3 mantissa
+// bits): e4m3 has 4 more exponent steps of headroom on both ends and one
+// extra mantissa bit, so every finite E3M2 value round-trips EXACTLY through
+// e4m3 -- this is the whole design: the GPU vec_dot upconverts each 6-bit
+// element to its bit-exact e4m3 byte in-register (ggml_cuda_e3m2_to_e4m3,
+// common.cuh) and reuses the EXISTING fp8 dp4a/hardware-dot2 compute path
+// verbatim (see vecdotq.cuh vec_dot_mxfp6_q8_1[_simd]_impl) -- ~6.25 bpw
+// storage/bandwidth at fp8-grade compute, not a new compute kernel.
+//
+//   qs[3*g+0..2] -- 3 packed bytes holding 4 six-bit E3M2 codes v0..v3 of
+//                   group g (g = 0..7): v0 = qs[3g] & 0x3F; v1 = (qs[3g]>>6
+//                   & 0x3) | ((qs[3g+1]&0xF)<<2); v2 = (qs[3g+1]>>4 & 0xF) |
+//                   ((qs[3g+2]&0x3)<<4); v3 = qs[3g+2]>>2 & 0x3F (see
+//                   mxfp6_unpack4 in common.cuh for the single source of
+//                   truth -- CPU (ggml-quants.c) and GPU (common.cuh) both
+//                   implement this same bit layout independently).
+//
+// 25 bytes / 32 logical values = 6.25 bpw (vs block_mxfp8's 8.25 bpw).
+#define QK_MXFP6 32
+typedef struct {
+    uint8_t e;                    // UE8M0 shared scale (biased-127, power-of-2 only)
+    uint8_t qs[QK_MXFP6*6/8];      // 4 packed 6-bit E3M2 codes per 3 bytes (24 bytes)
+} block_mxfp6;
+static_assert(sizeof(block_mxfp6) == sizeof(uint8_t) + QK_MXFP6*6/8, "wrong mxfp6 block size/padding");
 
 // 2OF4_FP8 (RDNA4 2:4-structured-sparse SWMMAC driver-completeness run):
 // per-32-element block, host-side-compressed to the 16 "kept" nonzero

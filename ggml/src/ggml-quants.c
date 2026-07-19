@@ -999,6 +999,92 @@ void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+// MXFP6 (ROC8): mechanical mirror of quantize_row_mxfp8_ref -- same
+// power-of-2 shared-scale search, but the leaf format is 6-bit E3M2 (max
+// finite 28.0), not 8-bit e4m3 (max finite 448.0), and 4 leaf values are bit-
+// packed into 3 bytes instead of 1 byte each. See block_mxfp6 (ggml-common.h)
+// for the full design rationale (E3M2 subset-of-e4m3 lossless GPU upconvert).
+void quantize_row_mxfp6_ref(const float * GGML_RESTRICT x, block_mxfp6 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP6;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    uint8_t codes[QK_MXFP6];
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            amax = MAX(amax, fabsf(v));
+        }
+
+        // Smallest power-of-two scale d = 2^e such that amax/d <= 28.0
+        // (E3M2 max finite magnitude), same UE8M0 convention as
+        // quantize_row_mxfp8_ref above (see that function for the frexpf
+        // derivation), just against MXFP6's own finite ceiling.
+        uint8_t e = 0;
+        float d = 1.0f;
+        if (amax > 0.0f) {
+            int exp2;
+            const float mant = frexpf(amax / 28.0f, &exp2);
+            int biased = (mant <= 0.5f) ? (exp2 - 1 + 127) : (exp2 + 127);
+            if (biased < 0)   biased = 0;
+            if (biased > 254) biased = 254;
+            e = (uint8_t) biased;
+            d = ggml_e8m0_to_fp32(e);
+        }
+        const float id = d ? 1.0f/d : 0.0f;
+
+        y[i].e = e;
+
+        for (int j = 0; j < qk; ++j) {
+            const float x0 = x[i*qk + j]*id;
+            codes[j] = ggml_fp32_to_e3m2(x0);
+        }
+
+        // Pack 32 six-bit codes into 24 bytes, 4 values per 3 bytes (see
+        // block_mxfp6 comment, ggml-common.h, for the bit layout).
+        for (int g = 0; g < qk/4; ++g) {
+            const uint8_t v0 = codes[4*g+0];
+            const uint8_t v1 = codes[4*g+1];
+            const uint8_t v2 = codes[4*g+2];
+            const uint8_t v3 = codes[4*g+3];
+            y[i].qs[3*g+0] = (uint8_t) ((v0 & 0x3F) | ((v1 & 0x03) << 6));
+            y[i].qs[3*g+1] = (uint8_t) (((v1 >> 2) & 0x0F) | ((v2 & 0x0F) << 4));
+            y[i].qs[3*g+2] = (uint8_t) (((v2 >> 4) & 0x03) | ((v3 & 0x3F) << 2));
+        }
+    }
+}
+
+void dequantize_row_mxfp6(const block_mxfp6 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP6;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_e8m0_to_fp32(x[i].e);
+
+        for (int g = 0; g < qk/4; ++g) {
+            const uint8_t b0 = x[i].qs[3*g+0];
+            const uint8_t b1 = x[i].qs[3*g+1];
+            const uint8_t b2 = x[i].qs[3*g+2];
+
+            const uint8_t v0 = (uint8_t) (b0 & 0x3F);
+            const uint8_t v1 = (uint8_t) (((b0 >> 6) & 0x03) | ((b1 & 0x0F) << 2));
+            const uint8_t v2 = (uint8_t) (((b1 >> 4) & 0x0F) | ((b2 & 0x03) << 4));
+            const uint8_t v3 = (uint8_t) ((b2 >> 2) & 0x3F);
+
+            y[i*qk + 4*g+0] = ggml_e3m2_to_fp32(v0) * d;
+            y[i*qk + 4*g+1] = ggml_e3m2_to_fp32(v1) * d;
+            y[i*qk + 4*g+2] = ggml_e3m2_to_fp32(v2) * d;
+            y[i*qk + 4*g+3] = ggml_e3m2_to_fp32(v3) * d;
+        }
+    }
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
@@ -2701,6 +2787,12 @@ size_t quantize_mxfp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     GGML_UNUSED(quant_weights);
     quantize_row_mxfp8_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_MXFP8, n_per_row);
+}
+
+size_t quantize_mxfp6(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_mxfp6_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_MXFP6, n_per_row);
 }
 
 size_t quantize_2of4_fp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
@@ -6009,6 +6101,14 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 // encoding relevant here -- same rationale NVFP4 documents above
                 // for its own uint8 payload).
                 VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp8, data, nb);
+            } break;
+        case GGML_TYPE_MXFP6:
+            {
+                // Same e8m0 shared-scale validation as MXFP8 -- block_mxfp6's
+                // scale field is also named `e`. The packed 6-bit E3M2 qs[]
+                // bytes need no separate validation (no NaN/Inf encoding in
+                // E3M2 at all -- every one of the 64 codes is finite).
+                VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp6, data, nb);
             } break;
         case GGML_TYPE_NVFP4:
             {
