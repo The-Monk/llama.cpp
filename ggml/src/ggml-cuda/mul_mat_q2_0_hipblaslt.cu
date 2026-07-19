@@ -10,11 +10,16 @@
 #if defined(__HIP_PLATFORM_AMD__) && !defined(GGML_HIP_NO_HIPBLASLT)
 
 #include <hipblaslt/hipblaslt.h>
+#include <hipblaslt/hipblaslt-version.h>
 #include <hip/hip_fp16.h>
 #include <map>
 #include <tuple>
 #include <mutex>
 #include <vector>
+#include <string>
+#include <cstring>
+#include <cstdio>
+#include <sys/stat.h>
 
 namespace {
 
@@ -215,6 +220,80 @@ enum gemm_mode { MODE_I8 = 0, MODE_F8 = 1 };   // int8 (i8->i32) or fp8 (e4m3->f
 std::map<std::tuple<int64_t,int64_t,int64_t,int>, lt_plan> g_plan_cache;
 std::mutex g_plan_mtx;
 
+// ---- persistent tuned-algo cache ------------------------------------------
+// The autotune benchmark (measure best algo per shape) costs ~10s of warmup per
+// process. hipblasLtMatmulAlgo_t is a trivially-serializable POD (docs: "can be
+// trivially serialized and later restored for use with the same version of the
+// library"), so persist the winners to disk keyed by (N,M,K,mode). A version
+// tag (hipblaslt major.minor.patch-githash) invalidates the file if the library
+// changes. On a hit we skip the benchmark (one validation matmul instead).
+// Persist the winning heuristic-candidate INDEX (not the opaque algo blob --
+// restoring a serialized hipblasLtMatmulAlgo_t segfaults on use, and there is no
+// AlgoCheck API to validate it safely). The heuristic candidate list is
+// deterministic per (shape, library version), so re-requesting it and picking
+// the saved index reproduces the tuned kernel; a stale index just falls back to
+// a valid heuristic candidate (never a crash).
+#define TUNE_S2(x) #x
+#define TUNE_S(x) TUNE_S2(x)
+constexpr char TUNE_MAGIC[8] = {'R','D','N','4','G','T','3','\0'};
+
+std::map<std::tuple<int64_t,int64_t,int64_t,int>, int32_t> g_disk_best;
+bool g_disk_loaded = false;
+
+const char * tune_cache_path() {
+    static std::string path = [](){
+        if (const char * e = getenv("GGML_HIP_Q2_0_HIPBLASLT_TUNE_CACHE")) return std::string(e);
+        const char * home = getenv("HOME");
+        return std::string(home ? home : "/tmp") + "/.cache/ggml-rdna4-gemm-tune.bin";
+    }();
+    return path.c_str();
+}
+std::string tune_version_tag() {
+    return std::string("hipblaslt-") + TUNE_S(HIPBLASLT_VERSION_MAJOR) "." TUNE_S(HIPBLASLT_VERSION_MINOR)
+         "." TUNE_S(HIPBLASLT_VERSION_PATCH) "-" TUNE_S(HIPBLASLT_VERSION_TWEAK);
+}
+struct TuneRec { int64_t N, M, K; int32_t mode; int32_t best_index; };
+
+void load_disk_algos() {
+    if (g_disk_loaded) return;
+    g_disk_loaded = true;
+    FILE * f = fopen(tune_cache_path(), "rb");
+    if (!f) return;
+    char magic[8] = {0};
+    uint32_t vlen = 0;
+    std::string want = tune_version_tag();
+    std::string ver;
+    if (fread(magic, 1, 8, f) == 8 && memcmp(magic, TUNE_MAGIC, 8) == 0 &&
+        fread(&vlen, 4, 1, f) == 1 && vlen <= 256) {
+        ver.resize(vlen);
+        if (fread(&ver[0], 1, vlen, f) == vlen && ver == want) {
+            TuneRec r;
+            while (fread(&r, sizeof(TuneRec), 1, f) == 1) {
+                g_disk_best[std::make_tuple(r.N, r.M, r.K, (int)r.mode)] = r.best_index;
+            }
+        }
+    }
+    fclose(f);
+}
+void save_disk_algos() {   // rewrite whole file (few records); caller holds g_plan_mtx
+    std::string p = tune_cache_path();
+    auto slash = p.find_last_of('/');
+    if (slash != std::string::npos) mkdir(p.substr(0, slash).c_str(), 0755);  // best-effort
+    FILE * f = fopen(p.c_str(), "wb");
+    if (!f) return;
+    std::string ver = tune_version_tag();
+    uint32_t vlen = (uint32_t)ver.size();
+    fwrite(TUNE_MAGIC, 1, 8, f);
+    fwrite(&vlen, 4, 1, f);
+    fwrite(ver.data(), 1, vlen, f);
+    for (auto & kv : g_disk_best) {
+        TuneRec r{ std::get<0>(kv.first), std::get<1>(kv.first), std::get<2>(kv.first),
+                   (int32_t)std::get<3>(kv.first), kv.second };
+        fwrite(&r, sizeof(TuneRec), 1, f);
+    }
+    fclose(f);
+}
+
 // Returns a cached (or freshly built) plan for D(NxM)=op(A=W)[NxK]*B(X)[KxM], TN.
 // plan.ok == false means the heuristic found no algo for this shape/mode.
 const lt_plan & get_plan(int64_t N, int64_t M, int64_t K, int mode) {
@@ -239,37 +318,41 @@ const lt_plan & get_plan(int64_t N, int64_t M, int64_t K, int mode) {
         hipblasLtMatrixLayoutCreate(&p.lB, abT, K, M, K) == HIPBLAS_STATUS_SUCCESS &&
         hipblasLtMatrixLayoutCreate(&p.lD, dT,  N, M, N) == HIPBLAS_STATUS_SUCCESS;
     if (built) {
+        load_disk_algos();
+        const auto dkey = std::make_tuple(N, M, K, mode);
+
         hipblasLtMatmulPreference_t pref = nullptr;
-        size_t ws = LT_WS_BYTES;
-        int nAlgo = 0;
-        // gfx1201 has NO cost model in hipBLASLt (falls back to GFX90A/CDNA weights)
-        // so heur[0] is badly mis-ranked -- measured ffn-down at 163 TOPS when 318 was
-        // available. Pull many candidates and (unless disabled) MEASURE each with
-        // scratch buffers, caching the fastest. One-time cost per shape at warmup.
+        size_t ws = LT_WS_BYTES; int nAlgo = 0;
         constexpr int REQ = 64;
         std::vector<hipblasLtMatmulHeuristicResult_t> cand(REQ);
+        // ALWAYS fetch candidates (fast, deterministic order). The benchmark loop
+        // (the ~5s/shape cost) is what a persisted index lets us skip.
         if (hipblasLtMatmulPreferenceCreate(&pref) == HIPBLAS_STATUS_SUCCESS &&
             hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)) == HIPBLAS_STATUS_SUCCESS &&
             hipblasLtMatmulAlgoGetHeuristic(h, p.op, p.lA, p.lB, p.lD, p.lD, pref, REQ, cand.data(), &nAlgo) == HIPBLAS_STATUS_SUCCESS &&
             nAlgo > 0) {
             static const bool notune = (getenv("GGML_HIP_Q2_0_HIPBLASLT_NOTUNE") != nullptr);
             int best = 0;
-            if (!notune && nAlgo > 1) {
-                // scratch buffers (A=[K x N], B=[K x M] both 1 byte; D=[N x M] i32/f32)
+            auto di = g_disk_best.find(dkey);
+            if (di != g_disk_best.end() && di->second >= 0 && di->second < nAlgo) {
+                best = di->second;                       // persisted winner -> skip benchmark
+            } else if (!notune && nAlgo > 1) {
+                // benchmark all candidates with scratch buffers, persist the winning index
                 void *sA=nullptr,*sB=nullptr,*sD=nullptr,*sW=nullptr;
                 if (hipMalloc(&sA,(size_t)K*N)==hipSuccess && hipMalloc(&sB,(size_t)K*M)==hipSuccess &&
-                    hipMalloc(&sD,(size_t)N*M*4)==hipSuccess && hipMalloc(&sW,ws)==hipSuccess) {
+                    hipMalloc(&sD,(size_t)N*M*4)==hipSuccess && hipMalloc(&sW,LT_WS_BYTES)==hipSuccess) {
                     hipMemset(sA,1,(size_t)K*N); hipMemset(sB,1,(size_t)K*M);
                     const int32_t ai=1,bi=0; const float af=1.f,bf=0.f;
                     const void *alpha=(mode==MODE_F8)?(const void*)&af:(const void*)&ai;
                     const void *beta =(mode==MODE_F8)?(const void*)&bf:(const void*)&bi;
+                    auto run=[&](hipblasLtMatmulAlgo_t &a){ return hipblasLtMatmul(h,p.op,alpha,sA,p.lA,sB,p.lB,beta,sD,p.lD,sD,p.lD,&a,sW,LT_WS_BYTES,0); };
                     hipEvent_t e0,e1; hipEventCreate(&e0); hipEventCreate(&e1);
-                    double bestMs=1e30;
+                    double bestMs = 1e30;
                     for (int i=0;i<nAlgo;i++){
-                        if (hipblasLtMatmul(h,p.op,alpha,sA,p.lA,sB,p.lB,beta,sD,p.lD,sD,p.lD,&cand[i].algo,sW,ws,0)!=HIPBLAS_STATUS_SUCCESS) continue;
-                        for(int w=0;w<2;w++) hipblasLtMatmul(h,p.op,alpha,sA,p.lA,sB,p.lB,beta,sD,p.lD,sD,p.lD,&cand[i].algo,sW,ws,0);
+                        if (run(cand[i].algo) != HIPBLAS_STATUS_SUCCESS) continue;
+                        for(int w=0;w<2;w++) run(cand[i].algo);
                         hipDeviceSynchronize(); hipEventRecord(e0,0);
-                        for(int r=0;r<10;r++) hipblasLtMatmul(h,p.op,alpha,sA,p.lA,sB,p.lB,beta,sD,p.lD,sD,p.lD,&cand[i].algo,sW,ws,0);
+                        for(int r=0;r<10;r++) run(cand[i].algo);
                         hipEventRecord(e1,0); hipEventSynchronize(e1);
                         float ms=0; hipEventElapsedTime(&ms,e0,e1);
                         if (ms>0 && ms<bestMs){ bestMs=ms; best=i; }
@@ -277,6 +360,8 @@ const lt_plan & get_plan(int64_t N, int64_t M, int64_t K, int mode) {
                     hipEventDestroy(e0); hipEventDestroy(e1);
                 }
                 if (sA) hipFree(sA); if (sB) hipFree(sB); if (sD) hipFree(sD); if (sW) hipFree(sW);
+                g_disk_best[dkey] = best;                // persist winning INDEX for next process
+                save_disk_algos();
             }
             p.heur = cand[best];
             p.ok = true;
