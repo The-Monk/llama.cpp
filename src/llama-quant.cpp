@@ -444,6 +444,7 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_2OF4_FP8: return_type = GGML_TYPE_F8E4M3; break;
             case GGML_TYPE_2OF4_F16: return_type = GGML_TYPE_F16;    break; // card 141: dense fp16 fallback, mirrors 2OF4_FP8 -> F8E4M3
             case GGML_TYPE_MXFP8:   return_type = GGML_TYPE_F16;    break;
+            case GGML_TYPE_MXFP6:   return_type = GGML_TYPE_F16;    break;
             case GGML_TYPE_IU4:     return_type = GGML_TYPE_F16;    break; // EXPERIMENTAL, model-blocked
             default:
                 throw std::runtime_error(format("no tensor type fallback is defined for type %s",
@@ -863,6 +864,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_2OF4_FP8: return GGML_TYPE_2OF4_FP8;
         case LLAMA_FTYPE_MOSTLY_2OF4_F16: return GGML_TYPE_2OF4_F16; // card 141
         case LLAMA_FTYPE_MOSTLY_MXFP8:  return GGML_TYPE_MXFP8;
+        case LLAMA_FTYPE_MOSTLY_MXFP6:  return GGML_TYPE_MXFP6;
         case LLAMA_FTYPE_MOSTLY_IU4:    return GGML_TYPE_IU4; // EXPERIMENTAL, model-blocked
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;

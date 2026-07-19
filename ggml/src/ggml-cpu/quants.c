@@ -106,6 +106,40 @@ void ggml_vec_dot_f8e4m3_f32(int n, float * GGML_RESTRICT s, size_t bs, const vo
     *s = sumf;
 }
 
+// MXFP6 (ROC8): mechanical mirror of ggml_vec_dot_f8e4m3_f32/quantize_row_f8e4m3
+// above -- same "scalar correctness-fallback, not a speed path" role (this
+// type's real compute is the GPU mmvq decode kernel; this only exists so an
+// accidental CPU fallback dequantizes-and-dots instead of crashing on a NULL
+// vec_dot, per the card 151 lesson documented on the F8E4M3 entry).
+void quantize_row_mxfp6(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp6_ref(x, y, k);
+}
+
+void ggml_vec_dot_mxfp6_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+    GGML_ASSERT(nrc == 1);
+    GGML_ASSERT(n % QK_MXFP6 == 0);
+
+    const block_mxfp6 * GGML_RESTRICT x = (const block_mxfp6 *) vx;
+    const float        * GGML_RESTRICT y = (const float        *) vy;
+
+    const int64_t CHUNK = 512; // multiple of QK_MXFP6 (32)
+    float tmp[CHUNK];
+
+    float sumf = 0.0f;
+    for (int64_t done = 0; done < n; done += CHUNK) {
+        const int64_t this_chunk = done + CHUNK <= n ? CHUNK : (n - done);
+        dequantize_row_mxfp6(x + done / QK_MXFP6, tmp, this_chunk);
+        for (int64_t j = 0; j < this_chunk; ++j) {
+            sumf += tmp[j] * y[done + j];
+        }
+    }
+
+    *s = sumf;
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //

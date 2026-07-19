@@ -1143,6 +1143,82 @@ static __device__ __forceinline__ float vec_dot_mxfp8_q8_1_simd_impl(
 #endif
 }
 
+// ROC9 v2: MXFP6 decode dot products. Structurally IDENTICAL to the MXFP8
+// pair above -- the only change is the weight-byte source, and (v2) that
+// source now preloads the whole 24-byte block ONCE into registers
+// (mxfp6_load_block, common.cuh -- CK-style bit-offset unpack, see that
+// function's comment) rather than re-reading 3 bytes per group of 4 (v1's
+// get_mxfp6_e4m3x4, measured -41% decode vs FP8-E4M3, root-caused to the
+// repeated small/scattered loads). Everything downstream (the software
+// e4m3 decode below, or ggml_cuda_dot2_e4m3_q8's hardware path) is
+// unmodified F8E4M3/MXFP8 code -- MXFP6 rides the native fp8 compute path,
+// it doesn't get its own. `vdr` counts "groups of 4" (QI_MXFP6 =
+// QK_MXFP6/4 = 8), same role as MXFP8's "raw int32 words" count.
+#define VDR_MXFP6_Q8_1_MMVQ 2
+
+template <int vdr>
+static __device__ __forceinline__ float vec_dot_mxfp6_q8_1_impl(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_mxfp6 * bq8 = (const block_mxfp6 *) vbq + kbx;
+    const mxfp6_block_words blk = mxfp6_load_block(bq8->qs); // v2: whole block, once
+
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+        const int vi = mxfp6_e4m3x4_from_block(blk, iqs + i);
+        const int ui = get_int_b4(bq8_1->qs, iqs + i);
+
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint8_t wv = (uint8_t) (vi >> (8*j));
+            const int8_t  av = (int8_t)  (ui >> (8*j));
+            sumf += ggml_cuda_e4m3_to_fp32(wv) * (float) av;
+        }
+    }
+
+    return sumf * ggml_cuda_e8m0_to_fp32(bq8->e) * __low2float(bq8_1->ds);
+}
+
+static __device__ __forceinline__ float vec_dot_mxfp6_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_mxfp6_q8_1_impl<VDR_MXFP6_Q8_1_MMVQ>(vbq, bq8_1, kbx, iqs);
+}
+
+// RDNA4 hardware-dot2 path for MXFP6, mirrors vec_dot_mxfp8_q8_1_simd_impl
+// exactly (same activation-stays-int8-q8_1 rationale) -- v2: same whole-
+// block preload as vec_dot_mxfp6_q8_1_impl above.
+template <int vdr>
+static __device__ __forceinline__ float vec_dot_mxfp6_q8_1_simd_impl(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_mxfp6 * bq8 = (const block_mxfp6 *) vbq + kbx;
+
+#if defined(GGML_CUDA_F8E4M3_HAS_NATIVE_DOT2)
+    const mxfp6_block_words blk = mxfp6_load_block(bq8->qs); // v2: whole block, once
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+        const int vi = mxfp6_e4m3x4_from_block(blk, iqs + i);
+        const int ui = get_int_b4(bq8_1->qs, iqs + i);
+
+        const int8_t a0 = (int8_t) (ui >>  0);
+        const int8_t a1 = (int8_t) (ui >>  8);
+        const int8_t a2 = (int8_t) (ui >> 16);
+        const int8_t a3 = (int8_t) (ui >> 24);
+
+        sumf = ggml_cuda_dot2_e4m3_q8((uint32_t) vi         & 0xFFFF, a0, a1, sumf);
+        sumf = ggml_cuda_dot2_e4m3_q8(((uint32_t) vi >> 16) & 0xFFFF, a2, a3, sumf);
+    }
+
+    return sumf * ggml_cuda_e8m0_to_fp32(bq8->e) * __low2float(bq8_1->ds);
+#else
+    return vec_dot_mxfp6_q8_1_impl<vdr>(vbq, bq8_1, kbx, iqs);
+#endif
+}
+
 // T79: pure V_DOT4_F32_FP8_FP8 decode dot. Where T77's hardware-dot2 path
 // still detours the ACTIVATION through int8 (q8_1) and only accelerates the
 // WEIGHT-side decode (2 terms / 3 hardware instructions: cvt_pk_f32_fp8 +

@@ -71,6 +71,8 @@
 #include "ggml-cuda/mul_mat_2of4_fp8.cuh"
 #include "ggml-cuda/mul_mat_2of4_f16.cuh"
 #include "ggml-cuda/mul_mat_iu4.cuh"
+#include "ggml-cuda/mul_mat_iu4_mmq.cuh"
+#include "ggml-cuda/mul_mat_q2_0_fp8route_mmq.cuh"
 #include "ggml-cuda/mul_mat_q2_0_wmma.cuh"
 #include "ggml.h"
 
@@ -2591,6 +2593,62 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const bool ok = ggml_cuda_op_mul_mat_2of4_f16(ctx, src0, src1, dst);
         GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_2of4_f16 does not support this tensor shape");
         return;
+    }
+
+    // T162: MMQ-grade multi-warp/double-buffered WMMA iu4 GEMM
+    // (mul_mat_iu4_mmq.cu), opt-in via GGML_HIP_IU4_MMQ so it can be A/B
+    // benched against both the dp4a MMQ int8 path (unset) and the older
+    // one-warp-per-tile PoC kernels below (GGML_HIP_Q2_0_WMMA_DECODE).
+    // Checked before the unconditional IU4 intercept and the
+    // GGML_HIP_Q2_0_WMMA_DECODE intercept so either env var can select the
+    // new kernel for its respective type.
+    {
+        static const bool iu4_mmq_enabled = (getenv("GGML_HIP_IU4_MMQ") != nullptr);
+        if (iu4_mmq_enabled && ggml_cuda_iu4_mmq_supports(src0, src1, dst)) {
+            if (src0->type == GGML_TYPE_IU4) {
+                const bool ok = ggml_cuda_op_mul_mat_iu4_mmq(ctx, src0, src1, dst);
+                GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_iu4_mmq does not support this tensor shape");
+                return;
+            }
+            if (src0->type == GGML_TYPE_Q2_0) {
+                const bool ok = ggml_cuda_op_mul_mat_q2_0_iu4_mmq(ctx, src0, src1, dst);
+                GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_q2_0_iu4_mmq does not support this tensor shape");
+                return;
+            }
+            if (src0->type == GGML_TYPE_Q1_0) {
+                const bool ok = ggml_cuda_op_mul_mat_q1_0_iu4_mmq(ctx, src0, src1, dst);
+                GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_q1_0_iu4_mmq does not support this tensor shape");
+                return;
+            }
+        }
+    }
+
+    // T164: PER-CHANNEL weight-scale path (GGML_TYPE_Q2_0 only), its OWN env
+    // var (GGML_HIP_IU4_MMQ_PERCHANNEL) so it can be A/B benched against the
+    // production GGML_HIP_IU4_MMQ path above without disturbing it. See
+    // mul_mat_iu4_mmq.cu / w4a4_gate_bonsai_weight_grid.py (Phase 1 accuracy
+    // grid: per-channel weight + per-32 activation = +12.66% vs floor, PASS).
+    {
+        static const bool iu4_mmq_perchannel_enabled = (getenv("GGML_HIP_IU4_MMQ_PERCHANNEL") != nullptr);
+        if (iu4_mmq_perchannel_enabled && src0->type == GGML_TYPE_Q2_0 && ggml_cuda_iu4_mmq_supports(src0, src1, dst)) {
+            const bool ok = ggml_cuda_op_mul_mat_q2_0_iu4_mmq_perchannel(ctx, src0, src1, dst);
+            GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_q2_0_iu4_mmq_perchannel does not support this tensor shape");
+            return;
+        }
+    }
+
+    // T165: route ternary (Q2_0) weights through the native fp8 e4m3 WMMA
+    // datapath instead of iu4 (RC2 -- the int32->float rescale epilogue --
+    // is structurally absent there, since fp8 WMMA accumulates natively in
+    // fp32). Own env var, own standalone kernel file
+    // (mul_mat_q2_0_fp8route_mmq.cu), zero risk to every other path.
+    {
+        static const bool q2_0_fp8route_enabled = (getenv("GGML_HIP_Q2_0_FP8ROUTE_MMQ") != nullptr);
+        if (q2_0_fp8route_enabled && ggml_cuda_q2_0_fp8route_mmq_supports(src0, src1, dst)) {
+            const bool ok = ggml_cuda_op_mul_mat_q2_0_fp8route_mmq(ctx, src0, src1, dst);
+            GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_q2_0_fp8route_mmq does not support this tensor shape");
+            return;
+        }
     }
 
     // T89 driver-completeness run (EXPERIMENTAL, model-blocked -- see
@@ -5283,6 +5341,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_F8E4M3:
                     case GGML_TYPE_F8E5M2:
                     case GGML_TYPE_MXFP8:
+                    case GGML_TYPE_MXFP6:
                         return true;
                     // RDNA4 2:4-structured-sparse fp8 SWMMAC / T89 IU4 (EXPERIMENTAL,
                     // model-blocked) driver-completeness runs: both only have a real
@@ -5317,6 +5376,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_F8E4M3:
                     case GGML_TYPE_F8E5M2:
                     case GGML_TYPE_MXFP8:
+                    case GGML_TYPE_MXFP6:
                         return true;
                     default:
                         return false;
@@ -5864,6 +5924,18 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
             mul_mat_iu4_selftest_ran = true;
             const bool ok = ggml_cuda_mul_mat_iu4_selftest();
             GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_IU4_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // T162: k_mul_mat_iu4_mmq (MMQ-grade multi-warp/double-buffered kernel)
+    // correctness self-test -- covers BOTH the IU4 and Q2_0 loader traits.
+    // Opt-in only, no model/quant path routes through it. Runs at most once
+    // per process.
+    if (getenv("GGML_HIP_MUL_MAT_IU4_MMQ_SELFTEST") != nullptr) {
+        static bool mul_mat_iu4_mmq_selftest_ran = false;
+        if (!mul_mat_iu4_mmq_selftest_ran) {
+            mul_mat_iu4_mmq_selftest_ran = true;
+            const bool ok = ggml_cuda_mul_mat_iu4_mmq_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_IU4_MMQ_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
         }
     }
     // RDNA4 2:4-structured-sparse SWMMAC driver-completeness self-test (swmmac24.cu).

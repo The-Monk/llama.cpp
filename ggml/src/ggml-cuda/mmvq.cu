@@ -4,6 +4,101 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+
+// ROC9->runtime-toggle: experimental RDNA4 decode levers, shipped as ONE
+// binary with env-var switches rather than separate builds. Each flag is
+// read ONCE per process (static local, magic-statics init) and gates BOTH
+// the kernel-side dispatch (which vec_dot/vdr template instantiation gets
+// launched) and the matching host-side activation-quantizer call, so the
+// two sides never drift out of sync. Default OFF on every flag = the
+// ship-safe path (matches what every other quant type does). Mirrors the
+// existing GGML_HIP_Q2_0_WMMA_DECODE pattern (ggml-cuda.cu, intercepts at
+// the ggml_cuda_mul_mat call site) -- same idea, applied at the mmvq
+// dispatch/launch site instead since this lever lives inside the generic
+// mul_mat_vec_q template rather than a standalone kernel file.
+//
+//   GGML_HIP_F8E5M2_DOT4 (default: unset/OFF)
+//     OFF (default) -> vec_dot_f8e5m2_q8_1_simd_dispatch + int8 q8_1
+//                       activations (quantize_row_q8_1_cuda). Lossless,
+//                       matches every other quant type's decode contract.
+//     ON  (=1)       -> vec_dot_f8e5m2_f8e5m2_dispatch (native bf8xbf8
+//                       V_DOT4) + bf8 activations (quantize_row_f8e5m2_for_
+//                       mmvq_cuda). Measured +25% at npl8 verify-batch,
+//                       +2.5% relative PPL increase (card 137 gate) --
+//                       real speed for a real, disclosed accuracy cost.
+//                       NOT the ship default; opt in for batched/verify
+//                       workloads where the accuracy cost is acceptable.
+//
+// Both instantiations are compiled into every build; the flag only picks
+// which one gets LAUNCHED, so there is no rebuild between the two.
+//
+//   GGML_RDNA4_PROFILE=default|batch|mtp|self-draft (default: "default")
+//     A THIN resolver bundling the individual flags above -- not a new
+//     lever, just a convenience name for a combination. Resolved once/
+//     process, same magic-statics pattern.
+//       default    -> every flag's own ship-safe default (F8E5M2_DOT4 off).
+//       batch      -> F8E5M2_DOT4 on (the accuracy-tolerant batched-verify
+//                     shape the flag's own doc already names as the
+//                     intended opt-in use case).
+//       mtp        -> F8E5M2_DOT4 on (MTP verify is also a batched, small-N,
+//                     accuracy-tolerant shape).
+//       self-draft -> F8E5M2_DOT4 on (same rationale as mtp).
+//     An EXPLICITLY-SET individual flag always overrides the profile
+//     (checked first in ggml_cuda_f8e5m2_dot4_enabled below). NOTE:
+//     GGML_HIP_F8E5M2_DOT4 uses the same PRESENCE-check convention as every
+//     other GGML_HIP_* flag in this file (set = on, regardless of value --
+//     `=0` still counts as "set"), so the override is "is the var present
+//     at all", not "what value does it hold".
+enum class ggml_rdna4_profile {
+    DEFAULT,
+    BATCH,
+    MTP,
+    SELF_DRAFT,
+};
+
+static ggml_rdna4_profile ggml_cuda_rdna4_profile() {
+    static const ggml_rdna4_profile profile = [] {
+        const char * env = getenv("GGML_RDNA4_PROFILE");
+        if (env == nullptr) {
+            return ggml_rdna4_profile::DEFAULT;
+        }
+        if (strcmp(env, "batch") == 0) {
+            return ggml_rdna4_profile::BATCH;
+        }
+        if (strcmp(env, "mtp") == 0) {
+            return ggml_rdna4_profile::MTP;
+        }
+        if (strcmp(env, "self-draft") == 0) {
+            return ggml_rdna4_profile::SELF_DRAFT;
+        }
+        return ggml_rdna4_profile::DEFAULT; // unrecognized value: safest fallback
+    }();
+    return profile;
+}
+
+static bool ggml_cuda_f8e5m2_dot4_enabled() {
+    static const bool enabled = [] {
+        // Individual flag always overrides the profile, if explicitly set
+        // (presence-check convention, matches every other GGML_HIP_* flag
+        // in this codebase -- the VALUE doesn't matter, only whether the
+        // variable is present in the environment at all).
+        if (getenv("GGML_HIP_F8E5M2_DOT4") != nullptr) {
+            return true;
+        }
+        switch (ggml_cuda_rdna4_profile()) {
+            case ggml_rdna4_profile::BATCH:
+            case ggml_rdna4_profile::MTP:
+            case ggml_rdna4_profile::SELF_DRAFT:
+                return true;
+            case ggml_rdna4_profile::DEFAULT:
+            default:
+                return false;
+        }
+    }();
+    return enabled;
+}
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
@@ -19,6 +114,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_F8E4M3:  return vec_dot_f8e4m3_q8_1;
         case GGML_TYPE_F8E5M2:  return vec_dot_f8e5m2_q8_1;
         case GGML_TYPE_MXFP8:   return vec_dot_mxfp8_q8_1;
+        case GGML_TYPE_MXFP6:   return vec_dot_mxfp6_q8_1;
         case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
@@ -51,6 +147,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_F8E4M3:  return VDR_F8E4M3_Q8_1_MMVQ;
         case GGML_TYPE_F8E5M2:  return VDR_F8E5M2_Q8_1_MMVQ;
         case GGML_TYPE_MXFP8:   return VDR_MXFP8_Q8_1_MMVQ;
+        case GGML_TYPE_MXFP6:   return VDR_MXFP6_Q8_1_MMVQ;
         case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
         case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
         case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
@@ -143,6 +240,18 @@ static __device__ __forceinline__ float vec_dot_mxfp8_q8_1_simd_dispatch(
     return vec_dot_mxfp8_q8_1_simd_impl<VDR_MXFP8_Q8_1_MMVQ_SIMD>(vbq, bq8_1, kbx, iqs);
 }
 
+// ROC8/ROC9 v2: MXFP6 decode dispatch, mirrors MXFP8 exactly (T77
+// hardware-dot2, int8 q8_1 activations unchanged -- only the weight-side
+// CK-style whole-block upconvert differs, see vecdotq.cuh /
+// mxfp6_load_block, common.cuh). VDR=8 (whole 32-value block per call),
+// same value MXFP8/F8E5M2 settled on.
+#define VDR_MXFP6_Q8_1_MMVQ_SIMD 8
+
+static __device__ __forceinline__ float vec_dot_mxfp6_q8_1_simd_dispatch(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_mxfp6_q8_1_simd_impl<VDR_MXFP6_Q8_1_MMVQ_SIMD>(vbq, bq8_1, kbx, iqs);
+}
+
 // T73 (small-batch decode fix): F8E4M3-only, batch-size-aware VDR/vec_dot
 // selection, used ONLY by the main mul_mat_vec_q kernel (ncols_dst is a real
 // compile-time template parameter there, so this is a free, zero-runtime-
@@ -166,56 +275,63 @@ static __device__ __forceinline__ float vec_dot_mxfp8_q8_1_simd_dispatch(
 // swap at the ggml_cuda_mul_mat_vec_q call site (this file) -- the two
 // changes are correctness-coupled, see the accuracy-disclosure comment on
 // vec_dot_f8e4m3_f8e4m3_impl (vecdotq.cuh).
-static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_decode(ggml_type type, int ncols_dst) {
+static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_decode(ggml_type type, int ncols_dst, bool f8e5m2_dot4 = false) {
     if (type == GGML_TYPE_F8E4M3) {
         return vec_dot_f8e4m3_f8e4m3_dispatch;
     }
-    // Card 137 fix 2 (bf8 dot4, MEASURED AND NOT ADOPTED): built the pure
-    // bf8xbf8 V_DOT4 path (vec_dot_f8e5m2_f8e5m2_dispatch below) mirroring
-    // T79's F8E4M3 supersede, and ISA-confirmed it emits the native
-    // v_dot4_f32_bf8_bf8 opcode with the predicted register win (mmvq
-    // decode kernel VGPR dropped ~102->27, matching fp8's T79 profile). BUT
-    // the mandatory PPL gate (card 137 KB, Qwen3.6-27B-F8E5M2, README.md
-    // corpus, 6 chunks, `-ub 4` to force this exact mmvq path -- PPL is
-    // bit-deterministic so a single fresh run is reproducible, no drift/
-    // resample caveat needed) shows it is measurably WORSE, not just noise:
-    // int8-activation baseline (this dispatch) PPL 2.5162 +/- 0.13044 vs
-    // bf8-activation dot4 PPL 2.5799 +/- 0.13637 -- a real +2.5% relative
-    // increase, worse in 4/6 chunks, exactly the direction the accuracy-
-    // disclosure comment on vec_dot_f8e5m2_f8e5m2_impl (vecdotq.cuh)
-    // predicted (bf8 activations have only 2 mantissa bits, a strictly
-    // larger quantization step than T79's already-costly e4m3-activation
-    // swap). Per the card 137 gate ("commit only if PPL is sane/not-
-    // regressed"), this does NOT clear the bar -- so F8E5M2 decode STAYS on
-    // the T97 int8-activation hardware-dot2 path (lossless activations,
-    // matches every other quant type's decode contract) as the default.
-    // vec_dot_f8e5m2_f8e5m2_dispatch/_impl and quantize_row_f8e5m2_for_
-    // mmvq_cuda are kept, correct, and ISA-validated (dead code on this
-    // dispatch, unused nowhere else) for a future call site where the
-    // register savings might outweigh the accuracy cost (e.g. an
-    // accuracy-tolerant batched-verify/spec-decode shape) -- re-enabling is
-    // the one-line swap below, already proven to compile and run correctly.
+    // ROC9->runtime-toggle (GGML_HIP_F8E5M2_DOT4, see file-top comment
+    // block): built the pure bf8xbf8 V_DOT4 path
+    // (vec_dot_f8e5m2_f8e5m2_dispatch below) mirroring T79's F8E4M3
+    // supersede, and ISA-confirmed it emits the native v_dot4_f32_bf8_bf8
+    // opcode with the predicted register win (mmvq decode kernel VGPR
+    // dropped ~102->27, matching fp8's T79 profile). BUT the mandatory PPL
+    // gate (card 137 KB, Qwen3.6-27B-F8E5M2, README.md corpus, 6 chunks,
+    // `-ub 4` to force this exact mmvq path -- PPL is bit-deterministic so a
+    // single fresh run is reproducible, no drift/resample caveat needed)
+    // shows it is measurably WORSE on accuracy, not just noise: int8-
+    // activation baseline PPL 2.5162 +/- 0.13044 vs bf8-activation dot4 PPL
+    // 2.5799 +/- 0.13637 -- a real +2.5% relative increase, worse in 4/6
+    // chunks, exactly the direction the accuracy-disclosure comment on
+    // vec_dot_f8e5m2_f8e5m2_impl (vecdotq.cuh) predicted (bf8 activations
+    // have only 2 mantissa bits, a strictly larger quantization step than
+    // T79's already-costly e4m3-activation swap). It's ALSO measurably
+    // FASTER at batched/verify shapes (+25% at npl8, see mmvq.cu top-of-file
+    // GGML_HIP_F8E5M2_DOT4 doc). Speed-vs-accuracy tradeoff, not a strict
+    // win -- so this is a ship-time CHOICE, not a fixed default: default
+    // OFF (int8-activation hardware-dot2, lossless, matches every other
+    // quant type's decode contract), opt-in ON for accuracy-tolerant
+    // batched/verify/spec-decode workloads. Both instantiations compile into
+    // every build (see mul_mat_vec_q_switch_type's F8E5M2 case) -- this
+    // function only picks which one a given kernel INSTANCE embeds.
     if (type == GGML_TYPE_F8E5M2) {
-        return vec_dot_f8e5m2_q8_1_simd_dispatch;
+        return f8e5m2_dot4 ? vec_dot_f8e5m2_f8e5m2_dispatch : vec_dot_f8e5m2_q8_1_simd_dispatch;
     }
     // ROC8: MXFP8 T77 hardware-dot2 decode (same lossless int8-activation path
     // as F8E5M2 above; fallback lives inside the simd_impl for non-RDNA4).
     if (type == GGML_TYPE_MXFP8) {
         return vec_dot_mxfp8_q8_1_simd_dispatch;
     }
+    // ROC8: MXFP6 T77 hardware-dot2 decode (same lossless int8-activation path).
+    if (type == GGML_TYPE_MXFP6) {
+        return vec_dot_mxfp6_q8_1_simd_dispatch;
+    }
     GGML_UNUSED(ncols_dst);
     return get_vec_dot_q_cuda(type);
 }
 
-static constexpr __host__ __device__ int get_vdr_mmvq_decode(ggml_type type, int ncols_dst) {
+static constexpr __host__ __device__ int get_vdr_mmvq_decode(ggml_type type, int ncols_dst, bool f8e5m2_dot4 = false) {
     if (type == GGML_TYPE_F8E4M3) {
         return VDR_F8E4M3_F8E4M3_MMVQ_DOT4;
     }
     if (type == GGML_TYPE_F8E5M2) {
-        return VDR_F8E5M2_Q8_1_MMVQ_SIMD; // PPL-gated off dot4, see get_vec_dot_q_cuda_decode above
+        // ROC9->runtime-toggle: see get_vec_dot_q_cuda_decode above, same flag.
+        return f8e5m2_dot4 ? VDR_F8E5M2_F8E5M2_MMVQ_DOT4 : VDR_F8E5M2_Q8_1_MMVQ_SIMD;
     }
     if (type == GGML_TYPE_MXFP8) {
         return VDR_MXFP8_Q8_1_MMVQ_SIMD;
+    }
+    if (type == GGML_TYPE_MXFP6) {
+        return VDR_MXFP6_Q8_1_MMVQ_SIMD;
     }
     GGML_UNUSED(ncols_dst);
     return get_vdr_mmvq(type);
@@ -443,6 +559,11 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     if (type == GGML_TYPE_MXFP8) {
         return 0;
     }
+    // ROC8: MXFP6 -- same rationale as MXFP8 above (dense-only target model,
+    // no MUL_MAT_ID path exists to test/validate against).
+    if (type == GGML_TYPE_MXFP6) {
+        return 0;
+    }
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
@@ -506,6 +627,15 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     // gfx1201 today (the WMMA prefill path below is RDNA4-gated), so keep
     // other archs on the dequant fallback until validated there too.
     if (type == GGML_TYPE_MXFP8) {
+        return GGML_CUDA_CC_IS_RDNA4(cc) && ne11 <= MMVQ_MAX_BATCH_SIZE;
+    }
+    // ROC8: MXFP6 decode kernel (vec_dot_mxfp6_q8_1, vecdotq.cuh) is a lossless
+    // upconvert onto the existing portable/hardware-dot2 e4m3 decode -- same
+    // RDNA4-only gate as MXFP8 above (only produced/loaded for gfx1201 today;
+    // no WMMA/mmq prefill kernel exists for this type, prefill correctly falls
+    // back to the generic cuBLAS dequant path, ggml_cuda_op_mul_mat_cublas,
+    // whenever mmvq isn't applicable).
+    if (type == GGML_TYPE_MXFP6) {
         return GGML_CUDA_CC_IS_RDNA4(cc) && ne11 <= MMVQ_MAX_BATCH_SIZE;
     }
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -623,6 +753,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_F8E4M3:
                 case GGML_TYPE_F8E5M2:
                 case GGML_TYPE_MXFP8:
+                case GGML_TYPE_MXFP6:
                 case GGML_TYPE_Q2_K:
                 case GGML_TYPE_Q4_K:
                 case GGML_TYPE_Q5_K:
@@ -743,7 +874,19 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false>
+// ROC9->runtime-toggle: f8e5m2_dot4 (default false = ship-safe lossless) is
+// a compile-time template bool, NOT a runtime branch inside this kernel --
+// get_vdr_mmvq_decode/get_vec_dot_q_cuda_decode below must fold to a
+// constexpr (vdr feeds __launch_bounds__-adjacent unroll/tile-size math).
+// Both `true` and `false` instantiations of this kernel are compiled into
+// the binary; mul_mat_vec_q_switch_type picks which one to LAUNCH based on
+// the GGML_HIP_F8E5M2_DOT4 env var (see file-top comment block) -- exactly
+// the "compile both, choose at runtime via the launch site" pattern
+// GGML_HIP_Q2_0_WMMA_DECODE uses (ggml-cuda.cu), applied here at template-
+// instantiation granularity since this lever lives inside the generic mmvq
+// kernel rather than a standalone one. Meaningless (ignored) for every type
+// other than F8E5M2.
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool f8e5m2_dot4 = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -759,13 +902,13 @@ static __global__ void mul_mat_vec_q(
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq_decode(type, ncols_dst); // T73: F8E4M3 batch-aware (see def)
+    constexpr int vdr = get_vdr_mmvq_decode(type, ncols_dst, f8e5m2_dot4); // T73: F8E4M3 batch-aware (see def)
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
     constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda_decode(type, ncols_dst); // T73
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda_decode(type, ncols_dst, f8e5m2_dot4); // T73
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
@@ -1048,7 +1191,7 @@ static std::pair<dim3, dim3> calc_launch_params(
     return {block_nums, block_dims};
 }
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false>
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool f8e5m2_dot4 = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1062,7 +1205,7 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, f8e5m2_dot4>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1073,7 +1216,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, f8e5m2_dot4>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1101,7 +1244,7 @@ static void mul_mat_vec_q_moe_launch(
         ncols_dst, ids_stride);
 }
 
-template <ggml_type type>
+template <ggml_type type, bool f8e5m2_dot4 = false>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const int ncols_x, const int nrows_x, const int ncols_dst,
@@ -1187,7 +1330,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             if (use_small_k) {
                 std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
                                                                         nsamples_dst, warp_size, table_id, true);
-                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, true>(
+                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, true, f8e5m2_dot4>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
@@ -1195,7 +1338,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             } else {
                 std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
                                                                         nsamples_dst, warp_size, table_id);
-                mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(
+                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, f8e5m2_dot4>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
@@ -1205,7 +1348,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 2: {
             constexpr int c_ncols_dst = 2;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, f8e5m2_dot4>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -1213,7 +1356,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 3: {
             constexpr int c_ncols_dst = 3;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, f8e5m2_dot4>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -1221,7 +1364,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 4: {
             constexpr int c_ncols_dst = 4;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, f8e5m2_dot4>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -1229,7 +1372,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 5: {
             constexpr int c_ncols_dst = 5;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, f8e5m2_dot4>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -1237,7 +1380,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 6: {
             constexpr int c_ncols_dst = 6;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, f8e5m2_dot4>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -1245,7 +1388,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 7: {
             constexpr int c_ncols_dst = 7;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, f8e5m2_dot4>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -1253,7 +1396,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 8: {
             constexpr int c_ncols_dst = 8;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, f8e5m2_dot4>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -1323,13 +1466,32 @@ static void mul_mat_vec_q_switch_type(
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
             break;
         case GGML_TYPE_F8E5M2:
-            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_F8E5M2>
+            // ROC9->runtime-toggle (GGML_HIP_F8E5M2_DOT4, file-top comment
+            // block): BOTH the dot4 and int8-dot2 template instantiations
+            // are already compiled into this binary (mul_mat_vec_q<...,
+            // f8e5m2_dot4=true|false>) -- this is the ONE place that picks
+            // which gets launched, checked once/process, exactly mirroring
+            // GGML_HIP_Q2_0_WMMA_DECODE's runtime intercept (ggml-cuda.cu).
+            if (ggml_cuda_f8e5m2_dot4_enabled()) {
+                mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_F8E5M2, true>
+                    (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                     nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                     nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            } else {
+                mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_F8E5M2, false>
+                    (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                     nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                     nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            }
+            break;
+        case GGML_TYPE_MXFP8:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_MXFP8>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
             break;
-        case GGML_TYPE_MXFP8:
-            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_MXFP8>
+        case GGML_TYPE_MXFP6:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_MXFP6>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
@@ -1513,15 +1675,19 @@ void ggml_cuda_mul_mat_vec_q(
         // Reachable only when ggml_cuda_should_use_mmvq already gated
         // F8E4M3 to RDNA4 (mmvq.cu, should_use_mmvq), so no separate cc
         // check is needed here.
-        // Card 137 fix 2: F8E5M2 decode STAYS on int8 q8_1 activations (the
-        // T97 default) -- the bf8-activation dot4 path failed its PPL gate
-        // (see get_vec_dot_q_cuda_decode above), so quantize_row_f8e5m2_for_
-        // mmvq_cuda is NOT wired in here; matching the dispatch table keeps
-        // this call site correctness-coupled with it (an unconditional swap
-        // here without the dispatch swap would silently feed bf8 bytes to a
-        // vec_dot that expects int8, or vice versa).
+        // ROC9->runtime-toggle (GGML_HIP_F8E5M2_DOT4, file-top comment
+        // block): F8E5M2 activations are int8 q8_1 by DEFAULT (the T97
+        // lossless path; failed the PPL gate as a fixed default -- see
+        // get_vec_dot_q_cuda_decode above) and swap to native bf8 ONLY when
+        // the flag is on, matching the SAME runtime check the dispatch
+        // table (mul_mat_vec_q_switch_type) uses. This is the 3rd of 3
+        // coupled points the flag must gate consistently -- an unconditional
+        // swap here without matching the dispatch swap would silently feed
+        // bf8 bytes to a vec_dot that expects int8, or vice versa.
         if (src0->type == GGML_TYPE_F8E4M3) {
             quantize_row_f8e4m3_for_mmvq_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        } else if (src0->type == GGML_TYPE_F8E5M2 && ggml_cuda_f8e5m2_dot4_enabled()) {
+            quantize_row_f8e5m2_for_mmvq_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         } else {
             quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         }

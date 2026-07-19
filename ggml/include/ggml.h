@@ -436,7 +436,8 @@ extern "C" {
         GGML_TYPE_MXFP8   = 46, // MXFP8 (OCP MX): e4m3 weights + per-32-block e8m0 shared scale (mx.quantize)
         GGML_TYPE_IU4     = 47, // signed int4 x int4 W4A4, native RDNA4 WMMA -- EXPERIMENTAL, model-blocked (see comment at IU4 kernel registration)
         GGML_TYPE_2OF4_F16 = 48, // RDNA4 2:4-structured-sparse fp16 (card 141, native SWMMAC f16 A/B, fp32 accumulate)
-        GGML_TYPE_COUNT   = 49,
+        GGML_TYPE_MXFP6   = 49, // MXFP6 (OCP MX): e3m2 weights (6-bit packed) + per-32-block e8m0 shared scale, rides the e4m3 fp8 compute path (mx.quantize)
+        GGML_TYPE_COUNT   = 50,
     };
 
     // precision
@@ -486,6 +487,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP8   = 31, // except 1d tensors
         GGML_FTYPE_MOSTLY_IU4     = 32, // except 1d tensors -- EXPERIMENTAL, model-blocked
         GGML_FTYPE_MOSTLY_2OF4_F16 = 33, // except 1d tensors (card 141, RDNA4 2:4-sparse SWMMAC fp16)
+        GGML_FTYPE_MOSTLY_MXFP6   = 34, // except 1d tensors
     };
 
     // available tensor operations:
