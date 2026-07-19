@@ -46,6 +46,7 @@ endif()
 find_package(hip     REQUIRED)
 find_package(hipblas REQUIRED)
 find_package(rocblas REQUIRED)
+find_package(hipblaslt REQUIRED)   # Q2_0 prefill int8 GEMM route (mul_mat_q2_0_hipblaslt.cu)
 
 if (GGML_HIP_RCCL)
     find_package(rccl REQUIRED)
@@ -161,4 +162,4 @@ if (GGML_HIP_RCCL)
     target_link_libraries(ggml-hip PRIVATE ggml-base roc::rccl)
 endif()
 
-target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas roc::hipblaslt)

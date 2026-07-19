@@ -74,6 +74,7 @@
 #include "ggml-cuda/mul_mat_iu4_mmq.cuh"
 #include "ggml-cuda/mul_mat_q2_0_fp8route_mmq.cuh"
 #include "ggml-cuda/mul_mat_q2_0_wmma.cuh"
+#include "ggml-cuda/mul_mat_q2_0_hipblaslt.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2678,6 +2679,20 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             const bool ok = ggml_cuda_op_mul_mat_q2_0_wmma(ctx, src0, src1, dst);
             GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_q2_0_wmma does not support this tensor shape");
             return;
+        }
+    }
+
+    // Experimental PREFILL lever (see mul_mat_q2_0_hipblaslt.cuh): route Q2_0
+    // large-M (prefill) matmuls through AMD's tuned hipBLASLt int8 GEMM instead
+    // of the ~5%-efficient dp4a/mmq path. W8A8, per-channel weight scale (v1).
+    // Opt-in; a soft-fail (false) falls through to the unmodified path below.
+    {
+        static const bool q2_0_hipblaslt_prefill_enabled = (getenv("GGML_HIP_Q2_0_HIPBLASLT_PREFILL") != nullptr);
+        if (q2_0_hipblaslt_prefill_enabled && ggml_cuda_q2_0_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_q2_0_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+            // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
         }
     }
 
