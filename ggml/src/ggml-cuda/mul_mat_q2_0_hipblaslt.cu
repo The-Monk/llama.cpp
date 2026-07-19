@@ -14,6 +14,7 @@
 #include <map>
 #include <tuple>
 #include <mutex>
+#include <vector>
 
 namespace {
 
@@ -241,10 +242,43 @@ const lt_plan & get_plan(int64_t N, int64_t M, int64_t K, int mode) {
         hipblasLtMatmulPreference_t pref = nullptr;
         size_t ws = LT_WS_BYTES;
         int nAlgo = 0;
+        // gfx1201 has NO cost model in hipBLASLt (falls back to GFX90A/CDNA weights)
+        // so heur[0] is badly mis-ranked -- measured ffn-down at 163 TOPS when 318 was
+        // available. Pull many candidates and (unless disabled) MEASURE each with
+        // scratch buffers, caching the fastest. One-time cost per shape at warmup.
+        constexpr int REQ = 64;
+        std::vector<hipblasLtMatmulHeuristicResult_t> cand(REQ);
         if (hipblasLtMatmulPreferenceCreate(&pref) == HIPBLAS_STATUS_SUCCESS &&
             hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)) == HIPBLAS_STATUS_SUCCESS &&
-            hipblasLtMatmulAlgoGetHeuristic(h, p.op, p.lA, p.lB, p.lD, p.lD, pref, 1, &p.heur, &nAlgo) == HIPBLAS_STATUS_SUCCESS &&
+            hipblasLtMatmulAlgoGetHeuristic(h, p.op, p.lA, p.lB, p.lD, p.lD, pref, REQ, cand.data(), &nAlgo) == HIPBLAS_STATUS_SUCCESS &&
             nAlgo > 0) {
+            static const bool notune = (getenv("GGML_HIP_Q2_0_HIPBLASLT_NOTUNE") != nullptr);
+            int best = 0;
+            if (!notune && nAlgo > 1) {
+                // scratch buffers (A=[K x N], B=[K x M] both 1 byte; D=[N x M] i32/f32)
+                void *sA=nullptr,*sB=nullptr,*sD=nullptr,*sW=nullptr;
+                if (hipMalloc(&sA,(size_t)K*N)==hipSuccess && hipMalloc(&sB,(size_t)K*M)==hipSuccess &&
+                    hipMalloc(&sD,(size_t)N*M*4)==hipSuccess && hipMalloc(&sW,ws)==hipSuccess) {
+                    hipMemset(sA,1,(size_t)K*N); hipMemset(sB,1,(size_t)K*M);
+                    const int32_t ai=1,bi=0; const float af=1.f,bf=0.f;
+                    const void *alpha=(mode==MODE_F8)?(const void*)&af:(const void*)&ai;
+                    const void *beta =(mode==MODE_F8)?(const void*)&bf:(const void*)&bi;
+                    hipEvent_t e0,e1; hipEventCreate(&e0); hipEventCreate(&e1);
+                    double bestMs=1e30;
+                    for (int i=0;i<nAlgo;i++){
+                        if (hipblasLtMatmul(h,p.op,alpha,sA,p.lA,sB,p.lB,beta,sD,p.lD,sD,p.lD,&cand[i].algo,sW,ws,0)!=HIPBLAS_STATUS_SUCCESS) continue;
+                        for(int w=0;w<2;w++) hipblasLtMatmul(h,p.op,alpha,sA,p.lA,sB,p.lB,beta,sD,p.lD,sD,p.lD,&cand[i].algo,sW,ws,0);
+                        hipDeviceSynchronize(); hipEventRecord(e0,0);
+                        for(int r=0;r<10;r++) hipblasLtMatmul(h,p.op,alpha,sA,p.lA,sB,p.lB,beta,sD,p.lD,sD,p.lD,&cand[i].algo,sW,ws,0);
+                        hipEventRecord(e1,0); hipEventSynchronize(e1);
+                        float ms=0; hipEventElapsedTime(&ms,e0,e1);
+                        if (ms>0 && ms<bestMs){ bestMs=ms; best=i; }
+                    }
+                    hipEventDestroy(e0); hipEventDestroy(e1);
+                }
+                if (sA) hipFree(sA); if (sB) hipFree(sB); if (sD) hipFree(sD); if (sW) hipFree(sW);
+            }
+            p.heur = cand[best];
             p.ok = true;
         }
         if (pref) hipblasLtMatmulPreferenceDestroy(pref);
