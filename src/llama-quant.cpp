@@ -859,6 +859,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_BF16: return GGML_TYPE_BF16;
         case LLAMA_FTYPE_ALL_F32:     return GGML_TYPE_F32;
         case LLAMA_FTYPE_MOSTLY_Q1_0: return GGML_TYPE_Q1_0;
+        case LLAMA_FTYPE_MOSTLY_Q2_0: return GGML_TYPE_Q2_0;
         case LLAMA_FTYPE_MOSTLY_F8E4M3: return GGML_TYPE_F8E4M3;
         case LLAMA_FTYPE_MOSTLY_F8E5M2: return GGML_TYPE_F8E5M2;
         case LLAMA_FTYPE_MOSTLY_2OF4_FP8: return GGML_TYPE_2OF4_FP8;
