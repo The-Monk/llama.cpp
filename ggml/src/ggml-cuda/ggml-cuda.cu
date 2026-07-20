@@ -2656,66 +2656,56 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 
     // Phase-3(B): M-gated (batch-size-gated) int4-weight dispatch switch.
-    // GGML_TYPE_IU4 has two purpose-built kernels covering complementary
-    // batch regimes -- neither is the generic one-warp-per-tile W4A4 WMMA
-    // path below:
-    //   M==1        -> mul_mat_iu4_gemv.cu (lean bandwidth-bound GEMV,
-    //                   ~465-566 GB/s measured, see its doctrine comment).
-    //   M in [2,16] -> mul_mat_iu4_mmq.cu (the EXISTING MMQ-grade multi-
-    //                   warp/double-buffered iu4xiu4 WMMA kernel, T162 --
-    //                   already correctness-gated on roc9 and already
-    //                   consumes block_iu4 directly with no packing
-    //                   mismatch, unlike the CK route). This is the batched
-    //                   spec-decode VERIFY regime -- compute density
-    //                   matters more than bandwidth once M>1.
-    //   otherwise   -> falls through to the unconditional W4A4 WMMA
-    //                   intercept immediately below (unchanged default).
-    // CK (mul_mat_iu4_ck_wmma.cu) was the original M in [2,16] candidate;
-    // DEFERRED (coordinator decision 2026-07-20) on the pk_i4_t B-operand
-    // packing blocker (see that file's doctrine comment for the two
-    // documented, failed reconciliation attempts) in favor of this
-    // already-correct, already-in-tree kernel. The CK scaffold is kept in
-    // the tree (compiles+links, proven possible) but stays fully gated off
-    // (ggml_cuda_iu4_ck_wmma_supports() unconditionally false) as a
-    // documented future lead, not wired into this dispatch.
+    // FINALIZED 2026-07-20 per the crossover bench + the int4-dense-WMMA
+    // occupancy chase (both on int4-research-bank, Stage-6/7/8):
+    //   M <= 2  -> mul_mat_iu4_gemv.cu (lean bandwidth-bound GEMV, ~465-676
+    //              GB/s measured, see its doctrine comment). Crossover bench
+    //              (real ggml_backend_graph_compute dispatch, sustained
+    //              multi-sweep, GGML_HIP_IU4_MSWITCH_FORCE-isolated) showed
+    //              GEMV beating BOTH iu4_mmq and the unswitched default at
+    //              M=1 AND M=2 on both tested shapes (e.g. N4096K4096:
+    //              671.0/470.1 GB/s GEMV vs 187.0/192.3 iu4_mmq vs
+    //              208.3/208.6 default) -- hence the cutoff is M<=2, not
+    //              just M==1.
+    //   M >= 3  -> falls through to the unconditional W4A4 WMMA intercept
+    //              immediately below (unchanged default dp4a-class path).
+    //              The batch route (mul_mat_iu4_mmq.cu / T162) that used to
+    //              cover M in [2,16] here has been DROPPED from this
+    //              switch: the SAME crossover bench showed default beating
+    //              iu4_mmq at every M>=3 tested (e.g. N4096K4096 M=4: 206.9
+    //              default vs 191.5 iu4_mmq GB/s; M=8: 202.6 vs 190.8; M=16:
+    //              154.2 vs 145.2), and the separate int4-dense-WMMA
+    //              occupancy chase (Stage-6 small-tile, Stage-8 K=16 --
+    //              both on int4-research-bank) independently confirmed
+    //              dense int4 WMMA cannot approach the ~44% (338 TOPS) dp4a
+    //              parity bar via any tile/stage/K-width configuration
+    //              tried (ceiling holds at ~23% three independent ways).
+    //              So there is no batch-regime int4 WMMA route left worth
+    //              routing to -- dp4a wins the whole M>=3 range outright.
+    //              mul_mat_iu4_mmq.cu is NOT deleted (kept in the tree,
+    //              still reachable via its own GGML_HIP_IU4_MMQ env var,
+    //              unrelated to this switch) -- just unreferenced here.
+    // CK (mul_mat_iu4_ck_wmma.cu) remains DEFERRED (2026-07-20, pk_i4_t
+    // packing blocker) and fully gated off
+    // (ggml_cuda_iu4_ck_wmma_supports() unconditionally false); also not
+    // wired into this switch, kept as a documented future lead.
     // Opt-in via GGML_HIP_IU4_MSWITCH so the unmodified GGML_TYPE_IU4 path
     // (below) stays byte-identical when unset -- same discipline as every
     // other env-gated intercept in this function. Checked before the
     // unconditional IU4 intercept so it can claim IU4 first when enabled.
-    // GGML_HIP_IU4_MSWITCH_FORCE (bench-only debug knob, values "gemv" or
-    // "mmq"): overrides the M-based routing below so the crossover bench
-    // can measure BOTH kernels at every M (e.g. iu4_mmq forced at M==1,
-    // GEMV forced at M=8) instead of only each kernel's "natural" M range.
-    // Has no effect unless GGML_HIP_IU4_MSWITCH is also set. Not part of
-    // the production switch semantics -- the M-gate above/below is the
-    // real dispatch policy; this is strictly a measurement tool.
-    enum class Iu4MswitchForce { NONE, GEMV, MMQ };
-    static const Iu4MswitchForce iu4_mswitch_force = [] {
-        const char * v = getenv("GGML_HIP_IU4_MSWITCH_FORCE");
-        if (!v) return Iu4MswitchForce::NONE;
-        if (strcmp(v, "gemv") == 0) return Iu4MswitchForce::GEMV;
-        if (strcmp(v, "mmq")  == 0) return Iu4MswitchForce::MMQ;
-        return Iu4MswitchForce::NONE;
-    }();
     {
         static const bool iu4_mswitch_enabled = (getenv("GGML_HIP_IU4_MSWITCH") != nullptr);
         if (iu4_mswitch_enabled && src0->type == GGML_TYPE_IU4) {
             const int64_t m = dst->ne[1];
-            const bool force_gemv = iu4_mswitch_force == Iu4MswitchForce::GEMV;
-            const bool force_mmq  = iu4_mswitch_force == Iu4MswitchForce::MMQ;
-            if ((force_gemv || (!force_mmq && m == 1)) && ggml_cuda_iu4_gemv_supports(src0, src1, dst)) {
+            if (m <= 2 && ggml_cuda_iu4_gemv_supports(src0, src1, dst)) {
                 const bool ok = ggml_cuda_op_mul_mat_iu4_gemv(ctx, src0, src1, dst);
                 GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_iu4_gemv does not support this tensor shape");
                 return;
             }
-            if ((force_mmq || (!force_gemv && m >= 2 && m <= 16)) && ggml_cuda_iu4_mmq_supports(src0, src1, dst)) {
-                const bool ok = ggml_cuda_op_mul_mat_iu4_mmq(ctx, src0, src1, dst);
-                GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_iu4_mmq does not support this tensor shape");
-                return;
-            }
-            // else: out of the M-switch's scope (M outside {1}u[2,16], or a
-            // shape either route's _supports() rejects) -- fall through to
-            // the unconditional IU4 intercept below, unmodified.
+            // else: M >= 3, or GEMV's _supports() rejected the shape --
+            // fall through to the unconditional IU4 intercept below,
+            // unmodified (dp4a-class default; wins the whole M>=3 range,
+            // see the doctrine comment above).
         }
     }
 
@@ -6037,7 +6027,7 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
             GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_IU4_MMQ_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
         }
     }
-    // Phase-3(B) M-gated dispatch, M==1 route (mul_mat_iu4_gemv.cu)
+    // Phase-3(B) M-gated dispatch, M<=2 route (mul_mat_iu4_gemv.cu)
     // correctness self-test. Opt-in only, no model/quant path routes
     // through it unless GGML_HIP_IU4_MSWITCH is also set. Runs at most
     // once per process.
@@ -6049,10 +6039,10 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
             GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_IU4_GEMV_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
         }
     }
-    // Phase-3(B) M-gated dispatch, M in [2,16] route (mul_mat_iu4_ck_wmma.cu)
-    // correctness self-test -- see its doctrine comment: EXPECTED FAIL this
-    // session (packing not yet reconciled), kept as a real, honest,
-    // opt-in-only check rather than removed.
+    // mul_mat_iu4_ck_wmma.cu correctness self-test -- DEFERRED/not wired
+    // into the Phase-3(B) M-switch (see that file's doctrine comment:
+    // pk_i4_t packing not reconciled, EXPECTED FAIL), kept as a real,
+    // honest, opt-in-only check rather than removed.
     if (getenv("GGML_HIP_MUL_MAT_IU4_CK_WMMA_SELFTEST") != nullptr) {
         static bool mul_mat_iu4_ck_wmma_selftest_ran = false;
         if (!mul_mat_iu4_ck_wmma_selftest_ran) {
