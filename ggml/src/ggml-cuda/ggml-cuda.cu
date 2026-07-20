@@ -2657,30 +2657,60 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     // Phase-3(B): M-gated (batch-size-gated) int4-weight dispatch switch.
     // GGML_TYPE_IU4 has two purpose-built kernels covering complementary
-    // batch regimes -- neither is the generic W4A4 WMMA path below:
+    // batch regimes -- neither is the generic one-warp-per-tile W4A4 WMMA
+    // path below:
     //   M==1        -> mul_mat_iu4_gemv.cu (lean bandwidth-bound GEMV,
     //                   ~465-566 GB/s measured, see its doctrine comment).
-    //   M in [2,16] -> mul_mat_iu4_ck_wmma.cu (CK int4-weight WMMA GEMM,
-    //                   the batched spec-decode VERIFY regime -- compute
-    //                   density matters more than bandwidth once M>1).
+    //   M in [2,16] -> mul_mat_iu4_mmq.cu (the EXISTING MMQ-grade multi-
+    //                   warp/double-buffered iu4xiu4 WMMA kernel, T162 --
+    //                   already correctness-gated on roc9 and already
+    //                   consumes block_iu4 directly with no packing
+    //                   mismatch, unlike the CK route). This is the batched
+    //                   spec-decode VERIFY regime -- compute density
+    //                   matters more than bandwidth once M>1.
     //   otherwise   -> falls through to the unconditional W4A4 WMMA
     //                   intercept immediately below (unchanged default).
+    // CK (mul_mat_iu4_ck_wmma.cu) was the original M in [2,16] candidate;
+    // DEFERRED (coordinator decision 2026-07-20) on the pk_i4_t B-operand
+    // packing blocker (see that file's doctrine comment for the two
+    // documented, failed reconciliation attempts) in favor of this
+    // already-correct, already-in-tree kernel. The CK scaffold is kept in
+    // the tree (compiles+links, proven possible) but stays fully gated off
+    // (ggml_cuda_iu4_ck_wmma_supports() unconditionally false) as a
+    // documented future lead, not wired into this dispatch.
     // Opt-in via GGML_HIP_IU4_MSWITCH so the unmodified GGML_TYPE_IU4 path
     // (below) stays byte-identical when unset -- same discipline as every
     // other env-gated intercept in this function. Checked before the
     // unconditional IU4 intercept so it can claim IU4 first when enabled.
+    // GGML_HIP_IU4_MSWITCH_FORCE (bench-only debug knob, values "gemv" or
+    // "mmq"): overrides the M-based routing below so the crossover bench
+    // can measure BOTH kernels at every M (e.g. iu4_mmq forced at M==1,
+    // GEMV forced at M=8) instead of only each kernel's "natural" M range.
+    // Has no effect unless GGML_HIP_IU4_MSWITCH is also set. Not part of
+    // the production switch semantics -- the M-gate above/below is the
+    // real dispatch policy; this is strictly a measurement tool.
+    enum class Iu4MswitchForce { NONE, GEMV, MMQ };
+    static const Iu4MswitchForce iu4_mswitch_force = [] {
+        const char * v = getenv("GGML_HIP_IU4_MSWITCH_FORCE");
+        if (!v) return Iu4MswitchForce::NONE;
+        if (strcmp(v, "gemv") == 0) return Iu4MswitchForce::GEMV;
+        if (strcmp(v, "mmq")  == 0) return Iu4MswitchForce::MMQ;
+        return Iu4MswitchForce::NONE;
+    }();
     {
         static const bool iu4_mswitch_enabled = (getenv("GGML_HIP_IU4_MSWITCH") != nullptr);
         if (iu4_mswitch_enabled && src0->type == GGML_TYPE_IU4) {
             const int64_t m = dst->ne[1];
-            if (m == 1 && ggml_cuda_iu4_gemv_supports(src0, src1, dst)) {
+            const bool force_gemv = iu4_mswitch_force == Iu4MswitchForce::GEMV;
+            const bool force_mmq  = iu4_mswitch_force == Iu4MswitchForce::MMQ;
+            if ((force_gemv || (!force_mmq && m == 1)) && ggml_cuda_iu4_gemv_supports(src0, src1, dst)) {
                 const bool ok = ggml_cuda_op_mul_mat_iu4_gemv(ctx, src0, src1, dst);
                 GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_iu4_gemv does not support this tensor shape");
                 return;
             }
-            if (m >= 2 && m <= 16 && ggml_cuda_iu4_ck_wmma_supports(src0, src1, dst)) {
-                const bool ok = ggml_cuda_op_mul_mat_iu4_ck_wmma(ctx, src0, src1, dst);
-                GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_iu4_ck_wmma does not support this tensor shape");
+            if ((force_mmq || (!force_gemv && m >= 2 && m <= 16)) && ggml_cuda_iu4_mmq_supports(src0, src1, dst)) {
+                const bool ok = ggml_cuda_op_mul_mat_iu4_mmq(ctx, src0, src1, dst);
+                GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_iu4_mmq does not support this tensor shape");
                 return;
             }
             // else: out of the M-switch's scope (M outside {1}u[2,16], or a
