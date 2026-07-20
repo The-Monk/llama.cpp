@@ -2584,6 +2584,25 @@ size_t quantize_q1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     return nrow * row_size;
 }
 
+// PrismML ternary 2-bit (g128): code {0,1,2,3} -> symbol {-1,0,+1,+2} * d.
+// Mechanical mirror of quantize_q1_0 -- wraps the existing quantize_row_q2_0_ref
+// (round-trip-inverse of dequantize_row_q2_0). imatrix is ignored, same as the
+// q1_0 ref path (the ref quantizer picks its own per-block scale).
+size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    if (!quant_weights) {
+        quantize_row_q2_0_ref(src, dst, (int64_t)nrow*n_per_row);
+        return nrow * ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
+    }
+    size_t row_size = ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
+    char * qrow = (char *)dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q2_0_ref(src, (block_q2_0*)qrow, n_per_row);
+        src += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
 
 size_t quantize_q4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     if (!quant_weights) {

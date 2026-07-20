@@ -37,6 +37,7 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_F16:      return "F16";
         case LLAMA_FTYPE_MOSTLY_BF16:     return "BF16";
         case LLAMA_FTYPE_MOSTLY_Q1_0:     return "Q1_0";
+        case LLAMA_FTYPE_MOSTLY_Q2_0:     return "Q2_0 - 2.06 bpw ternary";
         case LLAMA_FTYPE_MOSTLY_F8E4M3:   return "F8E4M3";
         case LLAMA_FTYPE_MOSTLY_F8E5M2:   return "F8E5M2";
         case LLAMA_FTYPE_MOSTLY_2OF4_FP8: return "2OF4_FP8";
@@ -772,6 +773,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
+            case GGML_TYPE_Q2_0:    ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
             case GGML_TYPE_F8E4M3:  ftype = LLAMA_FTYPE_MOSTLY_F8E4M3;  break;
             case GGML_TYPE_F8E5M2:  ftype = LLAMA_FTYPE_MOSTLY_F8E5M2;  break;
             case GGML_TYPE_2OF4_FP8: ftype = LLAMA_FTYPE_MOSTLY_2OF4_FP8; break;

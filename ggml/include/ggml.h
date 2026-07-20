@@ -488,6 +488,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_IU4     = 32, // except 1d tensors -- EXPERIMENTAL, model-blocked
         GGML_FTYPE_MOSTLY_2OF4_F16 = 33, // except 1d tensors (card 141, RDNA4 2:4-sparse SWMMAC fp16)
         GGML_FTYPE_MOSTLY_MXFP6   = 34, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q2_0    = 35, // except 1d tensors (PrismML ternary 2-bit g128)
     };
 
     // available tensor operations:
