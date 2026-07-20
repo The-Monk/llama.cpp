@@ -209,13 +209,17 @@ bool ggml_cuda_q2_0_wmma_decode_supports(const ggml_tensor * src0, const ggml_te
     if (src0->ne[0] != src1->ne[0] || src0->ne[0] % QK_IU4 != 0) {
         return false;
     }
-    // Motivating case is decode (batch=1); this kernel is correct for any M
-    // (same M-padding convention as mul_mat_iu4.cu) but the whole point of
-    // the experiment is the matrix-engine-idle-at-batch-1 case, so gate to
-    // decode-shaped calls only.
-    if (src1->ne[1] != 1) {
-        return false;
-    }
+    // Kernel is correct for any M (same M-padding convention as mul_mat_iu4.cu).
+    // 2026-07-17 (card 156): the M<=8 (verify-batch) test showed W4A4 LOSES 40-63% vs
+    // dp4a -- because WMMA is a 16x16 MATRIX engine and at M<=8 you waste >=half the
+    // tile (skinny GEMV on a matrix unit). That is a SHAPE mismatch, not a ternary
+    // problem. The regime where native iu4 WMMA wins is PREFILL / large-M GEMM: the
+    // isolated iu4 selftest measured 2.228x the int8 path at real-GEMM sizes, and our
+    // own decode data trends toward crossover (gap -50%->-41% as M 1->8). So allow ALL
+    // M here and test prefill (pp512) vs the current MMQ int8-activation path. Decode
+    // (M<=8) will now also route here and be slow -- that is expected; the point of
+    // this run is the PREFILL number. Revert the "allow all M" once prefill is measured.
+    // (kept the RDNA4 + Q2_0 + F32 + K%QK_IU4 checks below intact)
     const int device = ggml_cuda_get_device();
     const int cc     = ggml_cuda_info().devices[device].cc;
     return GGML_CUDA_CC_IS_RDNA4(cc);
