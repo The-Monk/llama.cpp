@@ -89,6 +89,20 @@ ggml_add_backend_library(ggml-hip
                          ${GGML_SOURCES_ROCM}
                         )
 
+# Phase-3(B) M-gated int4-weight dispatch (see mul_mat_iu4_ck_wmma.cuh
+# doctrine comment): scoped, OPTIONAL include-path for Composable Kernel's
+# header-only classic (ck::) device-op templates, used ONLY by
+# mul_mat_iu4_ck_wmma.cu. Not a real dependency of the ggml-hip target as a
+# whole -- if CK isn't checked out at this local path the .cu file itself
+# falls back to a stub (__has_include guard), so this is safe to skip on
+# any machine without the local ck-ref research checkout.
+set(GGML_HIP_CK_REF_DIR "$ENV{HOME}/src/ck-ref" CACHE PATH
+    "Optional local Composable Kernel checkout for the experimental int4-weight WMMA route")
+if (EXISTS "${GGML_HIP_CK_REF_DIR}/include")
+    set_source_files_properties(../ggml-cuda/mul_mat_iu4_ck_wmma.cu PROPERTIES
+        INCLUDE_DIRECTORIES "${GGML_HIP_CK_REF_DIR}/include;${GGML_HIP_CK_REF_DIR}/library/include")
+endif()
+
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)
     target_compile_definitions(ggml PUBLIC GGML_USE_CUDA)
