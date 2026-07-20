@@ -75,6 +75,7 @@
 #include "ggml-cuda/mul_mat_q2_0_fp8route_mmq.cuh"
 #include "ggml-cuda/mul_mat_q2_0_wmma.cuh"
 #include "ggml-cuda/mul_mat_q2_0_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_f16_hipblaslt.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2693,6 +2694,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
                 return;
             }
             // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
+        }
+    }
+
+    // Route dense F16/BF16/F32 PREFILL matmuls (M > threshold) through
+    // hipBLASLt's tuned HH_SH/BB_SB/SS_SS Tensile GEMM instead of the existing
+    // ggml_cuda_op_mul_mat_cublas() (hipblasGemmEx) path. Opt-in, env-gated.
+    // On ROCm 7.14 (native gfx1201 Tensile logic) this measures ~+6% bf16 /
+    // +1.6% f16 pp1024 vs hipblasGemmEx; earlier stacks were parity. F32 rides
+    // the same route for coverage (SS_SS is VALU-bound on gfx1201, not a win).
+    {
+        static const bool f16_hipblaslt_prefill_enabled = (getenv("GGML_HIP_F16_HIPBLASLT_PREFILL") != nullptr);
+        if (f16_hipblaslt_prefill_enabled && ggml_cuda_f16_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_f16_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+            // else: hipBLASLt unavailable/failed -> fall through to the
+            // existing mmf/cublas path below.
         }
     }
 
