@@ -1586,6 +1586,16 @@ namespace ggml_cuda_mma {
         int32x8_t * acc = (int32x8_t *) D.x;
         const int32x2_t * a_vec = (const int32x2_t *) A.x;
         const int32x2_t * b_vec = (const int32x2_t *) B.x;
+        // Lane A signed-i4 probe (2026-07-20): tested false,false ("signed")
+        // against the k_mul_mat_iu4_mmq selftest -- FAILS correctness
+        // (max_abs_err ~18000+ on a two's-complement-packed [-8,7] operand
+        // range) while true,true ("unsigned") below is the ONLY flag
+        // combination that reproduces the true signed dot product for this
+        // packing convention (verified: disasm shows the flags select
+        // neg_lo:[1,1,0] vs no modifier -- a real HW difference, not a
+        // no-op -- but the "unsigned" name does not mean what the API
+        // parameter name suggests for this w32 K=32 iu4 builtin on gfx1201).
+        // Do NOT flip this without re-running that selftest.
         acc[0] = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true, a_vec[0], true, b_vec[0], acc[0], true);
 #else
         GGML_UNUSED(D);
