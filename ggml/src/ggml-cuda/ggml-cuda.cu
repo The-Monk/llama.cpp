@@ -72,6 +72,8 @@
 #include "ggml-cuda/mul_mat_2of4_f16.cuh"
 #include "ggml-cuda/mul_mat_iu4.cuh"
 #include "ggml-cuda/mul_mat_iu4_mmq.cuh"
+#include "ggml-cuda/mul_mat_iu4_gemv.cuh"
+#include "ggml-cuda/mul_mat_iu4_ck_wmma.cuh"
 #include "ggml-cuda/mul_mat_q2_0_fp8route_mmq.cuh"
 #include "ggml-cuda/mul_mat_q2_0_wmma.cuh"
 #include "ggml-cuda/mul_mat_q2_0_hipblaslt.cuh"
@@ -2650,6 +2652,40 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             const bool ok = ggml_cuda_op_mul_mat_q2_0_fp8route_mmq(ctx, src0, src1, dst);
             GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_q2_0_fp8route_mmq does not support this tensor shape");
             return;
+        }
+    }
+
+    // Phase-3(B): M-gated (batch-size-gated) int4-weight dispatch switch.
+    // GGML_TYPE_IU4 has two purpose-built kernels covering complementary
+    // batch regimes -- neither is the generic W4A4 WMMA path below:
+    //   M==1        -> mul_mat_iu4_gemv.cu (lean bandwidth-bound GEMV,
+    //                   ~465-566 GB/s measured, see its doctrine comment).
+    //   M in [2,16] -> mul_mat_iu4_ck_wmma.cu (CK int4-weight WMMA GEMM,
+    //                   the batched spec-decode VERIFY regime -- compute
+    //                   density matters more than bandwidth once M>1).
+    //   otherwise   -> falls through to the unconditional W4A4 WMMA
+    //                   intercept immediately below (unchanged default).
+    // Opt-in via GGML_HIP_IU4_MSWITCH so the unmodified GGML_TYPE_IU4 path
+    // (below) stays byte-identical when unset -- same discipline as every
+    // other env-gated intercept in this function. Checked before the
+    // unconditional IU4 intercept so it can claim IU4 first when enabled.
+    {
+        static const bool iu4_mswitch_enabled = (getenv("GGML_HIP_IU4_MSWITCH") != nullptr);
+        if (iu4_mswitch_enabled && src0->type == GGML_TYPE_IU4) {
+            const int64_t m = dst->ne[1];
+            if (m == 1 && ggml_cuda_iu4_gemv_supports(src0, src1, dst)) {
+                const bool ok = ggml_cuda_op_mul_mat_iu4_gemv(ctx, src0, src1, dst);
+                GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_iu4_gemv does not support this tensor shape");
+                return;
+            }
+            if (m >= 2 && m <= 16 && ggml_cuda_iu4_ck_wmma_supports(src0, src1, dst)) {
+                const bool ok = ggml_cuda_op_mul_mat_iu4_ck_wmma(ctx, src0, src1, dst);
+                GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_iu4_ck_wmma does not support this tensor shape");
+                return;
+            }
+            // else: out of the M-switch's scope (M outside {1}u[2,16], or a
+            // shape either route's _supports() rejects) -- fall through to
+            // the unconditional IU4 intercept below, unmodified.
         }
     }
 
@@ -5969,6 +6005,30 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
             mul_mat_iu4_mmq_selftest_ran = true;
             const bool ok = ggml_cuda_mul_mat_iu4_mmq_selftest();
             GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_IU4_MMQ_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // Phase-3(B) M-gated dispatch, M==1 route (mul_mat_iu4_gemv.cu)
+    // correctness self-test. Opt-in only, no model/quant path routes
+    // through it unless GGML_HIP_IU4_MSWITCH is also set. Runs at most
+    // once per process.
+    if (getenv("GGML_HIP_MUL_MAT_IU4_GEMV_SELFTEST") != nullptr) {
+        static bool mul_mat_iu4_gemv_selftest_ran = false;
+        if (!mul_mat_iu4_gemv_selftest_ran) {
+            mul_mat_iu4_gemv_selftest_ran = true;
+            const bool ok = ggml_cuda_mul_mat_iu4_gemv_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_IU4_GEMV_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // Phase-3(B) M-gated dispatch, M in [2,16] route (mul_mat_iu4_ck_wmma.cu)
+    // correctness self-test -- see its doctrine comment: EXPECTED FAIL this
+    // session (packing not yet reconciled), kept as a real, honest,
+    // opt-in-only check rather than removed.
+    if (getenv("GGML_HIP_MUL_MAT_IU4_CK_WMMA_SELFTEST") != nullptr) {
+        static bool mul_mat_iu4_ck_wmma_selftest_ran = false;
+        if (!mul_mat_iu4_ck_wmma_selftest_ran) {
+            mul_mat_iu4_ck_wmma_selftest_ran = true;
+            const bool ok = ggml_cuda_mul_mat_iu4_ck_wmma_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_IU4_CK_WMMA_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
         }
     }
     // RDNA4 2:4-structured-sparse SWMMAC driver-completeness self-test (swmmac24.cu).
