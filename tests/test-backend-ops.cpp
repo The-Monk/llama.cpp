@@ -4054,6 +4054,24 @@ struct test_mul_mat : public test_case {
         if (type_a == GGML_TYPE_IU4) {
             return 1e-2;
         }
+        // Stage 25: F8E4M3's default (always-on since T79) native fp8xfp8
+        // v_dot4_f32_fp8_fp8 decode quantizes BOTH operands to fp8, a
+        // slightly coarser noise floor than the int8/q8_1-activation
+        // baseline the default 5e-4 tolerance assumes -- observed ERR
+        // ~0.00057-0.00059 at K=4096 (just over 5e-4), matching T79's own
+        // disclosed +1.2-1.5% relative PPL cost on real models. Not a bug.
+        if (type_a == GGML_TYPE_F8E4M3) {
+            return 1e-3;
+        }
+        // F8E5M2: default (int8 activation) already clears 5e-4; the
+        // opt-in GGML_HIP_F8E5M2_DOT4=1 bf8xbf8 path (card 137) has a
+        // larger, already-disclosed +2.5% relative PPL cost (e5m2's 2
+        // mantissa bits are a strictly coarser activation quantization
+        // step than F8E4M3's) -- observed ERR ~0.0024-0.0025 with the flag
+        // on. One tolerance covers both configurations.
+        if (type_a == GGML_TYPE_F8E5M2) {
+            return 5e-3;
+        }
         return max_nmse_err();
     }
 
@@ -8481,6 +8499,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 4096,  1, 4096, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 4096,  2, 4096, {1, 1}, {1, 1}));
+
+    // Stage 25: F8E4M3/F8E5M2 had ZERO test-backend-ops MUL_MAT coverage at
+    // all before this (found while re-validating the already-shipped T79/
+    // card-137 native fp8/bf8 V_DOT4 decode paths, vecdotq.cuh) -- same gap
+    // class as IU4 above, just never noticed because these types' real
+    // validation has always been real-model PPL runs, not this harness.
+    // n=1 (M=1, decode) at a real hidden size exercises: F8E4M3 -> the
+    // default/unconditional vec_dot_f8e4m3_f8e4m3_dispatch (T79,
+    // v_dot4_f32_fp8_fp8, always-on since it superseded the int8-activation
+    // path entirely); F8E5M2 -> the DEFAULT int8-activation path unless
+    // GGML_HIP_F8E5M2_DOT4=1 (card 137, opt-in bf8xbf8 v_dot4_f32_bf8_bf8,
+    // off by default on a measured accuracy/speed tradeoff -- see mmvq.cu).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E4M3, GGML_TYPE_F32, 4096,  1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E4M3, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E5M2, GGML_TYPE_F32, 4096,  1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E5M2, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
 
 
 #if 0

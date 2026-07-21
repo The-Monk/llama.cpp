@@ -297,6 +297,17 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
+    [GGML_TYPE_F8E5M2] = {
+        // Stage 25: same "card 151" gap as F8E4M3 above, just missed when
+        // F8E5M2 was added later (T97) -- found the same way as the
+        // Stage-23 IU4 fix: adding a test-backend-ops MUL_MAT case for it
+        // (to validate the already-shipped T79/card-137 native fp8/bf8
+        // dot4 decode paths, vecdotq.cuh) would have hit a NULL vec_dot.
+        .from_float               = quantize_row_f8e5m2,
+        .vec_dot                  = ggml_vec_dot_f8e5m2_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_MXFP6] = {
         // ROC8: same correctness-fallback role as F8E4M3 above -- this type's
         // real compute path is the GPU mmvq decode kernel (dp4a/hardware-dot2

@@ -106,6 +106,41 @@ void ggml_vec_dot_f8e4m3_f32(int n, float * GGML_RESTRICT s, size_t bs, const vo
     *s = sumf;
 }
 
+// Stage 25: same "card 151" gap found again -- GGML_TYPE_F8E5M2 had NO
+// type_traits_cpu entry either (only F8E4M3 got the fallback above; F8E5M2
+// was added later, T97, and this got missed). Found by the same method as
+// the IU4 fix (Stage 23): tried to add a test-backend-ops MUL_MAT case for
+// it and it would have hit a NULL vec_dot. Mechanical mirror of
+// quantize_row_f8e4m3/ggml_vec_dot_f8e4m3_f32 above.
+void quantize_row_f8e5m2(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_f8e5m2_ref(x, y, k);
+}
+
+void ggml_vec_dot_f8e5m2_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+    GGML_ASSERT(nrc == 1);
+    GGML_ASSERT(n % QK_F8E5M2 == 0);
+
+    const block_f8e5m2 * GGML_RESTRICT x = (const block_f8e5m2 *) vx;
+    const float         * GGML_RESTRICT y = (const float         *) vy;
+
+    const int64_t CHUNK = 512; // multiple of QK_F8E5M2 (32)
+    float tmp[CHUNK];
+
+    float sumf = 0.0f;
+    for (int64_t done = 0; done < n; done += CHUNK) {
+        const int64_t this_chunk = done + CHUNK <= n ? CHUNK : (n - done);
+        dequantize_row_f8e5m2(x + done / QK_F8E5M2, tmp, this_chunk);
+        for (int64_t j = 0; j < this_chunk; ++j) {
+            sumf += tmp[j] * y[done + j];
+        }
+    }
+
+    *s = sumf;
+}
+
 // MXFP6 (ROC8): mechanical mirror of ggml_vec_dot_f8e4m3_f32/quantize_row_f8e4m3
 // above -- same "scalar correctness-fallback, not a speed path" role (this
 // type's real compute is the GPU mmvq decode kernel; this only exists so an
