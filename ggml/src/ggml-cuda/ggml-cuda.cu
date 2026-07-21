@@ -2761,6 +2761,27 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
     }
 
+    // Stage-1 (int8-WMMA-for-decode-at-batch research, roc9-int8-wmma-decode,
+    // 2026-07-20): GGML_HIP_FORCE_MMQ_DECODE forces the dp4a-mmvq-vs-mmq
+    // dispatch PRIORITY below to prefer mmq (the tiled, RDNA4-WMMA-
+    // accelerated int8 GEMM -- see amd_wmma_available()'s unconditional
+    // `return true` for RDNA4 in ggml_cuda_should_use_mmq(), mmq.cu) over
+    // mmvq (the dp4a scalar per-value dot) at EVERY M, not just M>
+    // MMVQ_MAX_BATCH_SIZE(8) as the unmodified dispatch order does. This
+    // reuses BOTH kernels completely unchanged (no new device code, no new
+    // correctness surface -- both mmvq and mmq are already-shipped,
+    // already-correct production paths for every quantized type; this
+    // toggle only changes WHICH of the two handles a given (type, M) pair)
+    // -- exactly the "measure the crossover between two already-correct
+    // kernels" question Stage-1 asks. Opt-in, zero effect when unset (the
+    // unmodified `use_mul_mat_vec_q` priority is preserved byte-for-byte).
+    {
+        static const bool force_mmq_decode = (getenv("GGML_HIP_FORCE_MMQ_DECODE") != nullptr);
+        if (force_mmq_decode && use_mul_mat_q) {
+            use_mul_mat_vec_q = false;
+        }
+    }
+
     // debug helpers
     //printf("src0: %8d %8d %8d %8d\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
     //printf("      %8d %8d %8d %8d\n", src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
