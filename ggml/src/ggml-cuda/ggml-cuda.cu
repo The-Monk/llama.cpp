@@ -31,6 +31,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
+#include "ggml-cuda/mmvf_qk.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -2753,6 +2754,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+    // ROC9 GGML_HIP_MMVF_QK (default OFF, see mmvf_qk.cu): K-quant batch=1
+    // decode via direct fp32 dequant-FMA, skipping the int8 q8_1 activation
+    // packing kernel mmvq.cu always pays. Only ever true when the type/cc/
+    // batch gate in ggml_cuda_should_use_mmvf_qk (below) says so; otherwise
+    // this is dead weight and use_mul_mat_vec_q above is unaffected.
+    bool use_mul_mat_vec_qk = ggml_is_quantized(src0->type) && !bad_padding_clear
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+        && src1->ne[1] == 1;
 
     bool any_gpus_with_slow_fp16 = false;
 
@@ -2771,6 +2780,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
             use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
             use_mul_mat_vec_q       = use_mul_mat_vec_q         && ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]);
+            use_mul_mat_vec_qk      = use_mul_mat_vec_qk        && ggml_cuda_should_use_mmvf_qk(src0->type, cc, src1->ne[1]);
             any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
         }
     } else {
@@ -2780,6 +2790,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
         use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
         use_mul_mat_vec_q       = use_mul_mat_vec_q         && ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]);
+        use_mul_mat_vec_qk      = use_mul_mat_vec_qk        && ggml_cuda_should_use_mmvf_qk(src0->type, cc, src1->ne[1]);
         any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
     }
 
@@ -2802,7 +2813,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
-    if (!split && use_mul_mat_vec_f) {
+    if (!split && use_mul_mat_vec_qk) {
+        // ROC9 GGML_HIP_MMVF_QK: direct fp32 dequant-FMA K-quant batch=1
+        // decode, see mmvf_qk.cu. Opt-in; only reachable when the env var is
+        // set AND ggml_cuda_should_use_mmvf_qk gated the type/cc/batch above.
+        ggml_cuda_mul_mat_vec_qk(ctx, src0, src1, dst);
+    } else if (!split && use_mul_mat_vec_f) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
