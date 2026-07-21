@@ -153,3 +153,9 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# --- scratch / run outputs (NOT source; left on disk, never committed) ---
+.rocprofv3/
+Zorin-AI/
+container/loadtest-results/
+lemonade_sdk-*.tar.gz
