@@ -488,14 +488,21 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
 llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
     : llm_graph_context(params) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN35 MTP requires n_layer_nextn > 0");
-    GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN35 MTP currently only supports a single MTP block");
 
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
     // hparams.n_layer includes both main model layers and MTP layers. The MTP
-    // layer is stored immediately after the main layers in model.layers[].
-    const int il = hparams.n_layer();
+    // layers are stored immediately after the main layers in model.layers[],
+    // one per trained head. Multi-block MTP (n_layer_nextn > 1, DeepSeek-V3 /
+    // Step3.5 style): the DECODER_MTP graph runs the head selected by
+    // cparams.nextn_layer_offset (0 = first trained head, chained head->head+1
+    // by the speculative driver for depth>1 drafts). offset 0 keeps
+    // single-block behavior identical to before. See step35.cpp graph_mtp.
+    const int il = hparams.n_layer() + cparams.nextn_layer_offset;
+    GGML_ASSERT(cparams.nextn_layer_offset >= 0 &&
+                cparams.nextn_layer_offset < (int) hparams.n_layer_nextn &&
+                "nextn_layer_offset out of range [0, n_layer_nextn)");
     const auto & layer = model.layers[il];
 
     GGML_ASSERT(layer.nextn.eh_proj && "MTP block missing nextn.eh_proj");
