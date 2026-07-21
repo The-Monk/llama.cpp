@@ -867,6 +867,20 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             if (type == GGML_TYPE_F8E4M3 || type == GGML_TYPE_F8E5M2 || type == GGML_TYPE_Q2_0) {
                 return 3;
             }
+            // Swept 2026-07-20 (Vulkan-decode-gap investigation) on GPU0, llama-bench
+            // tg128 -r5, median-of-3+ reps per point:
+            //   Devstral-13B (Q4_K_M): rpb=2 35.90/35.93/36.01 -> rpb=3 36.86/36.86/37.22
+            //     (+2.9%, clearly outside the rpb=2 noise band).
+            //   Qwen3-8B (Q4_K_M):     rpb=2 92.53/93.07/93.08 -> rpb=3 92.77/93.24/93.40/93.46
+            //     (+0.3%, inside/at the edge of the rpb=2 noise band -- no regression).
+            // pp512 unaffected on both (rpb only changes ncols_dst==1 decode grid shape).
+            // Correctness: test-backend-ops MUL_MAT(q4_K) 43/43 + Paris check both models.
+            // Narrows but does not close the ~13% Vulkan decode lead (isolated
+            // test-backend-ops MUL_MAT perf is noise-flat, so the win is an
+            // occupancy/grid-parallelism effect visible only at full-model scale).
+            if (type == GGML_TYPE_Q4_K) {
+                return 3;
+            }
             return 2;
         }
         return 1;
