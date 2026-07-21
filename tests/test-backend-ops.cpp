@@ -9505,6 +9505,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 4096,  1, 4096, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
 
+    // Stage 26: fp8 native dot4 decode perf (T79 F8E4M3 default, card-137
+    // F8E5M2 opt-in) at the same K=4096, N in {4096,14336}, M=1 shapes --
+    // these had eval coverage (Stage 25) but no perf cases before this.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E4M3, GGML_TYPE_F32, 4096,  1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E4M3, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E5M2, GGML_TYPE_F32, 4096,  1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E5M2, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
+
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
