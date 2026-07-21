@@ -74,6 +74,7 @@
 #include "ggml-cuda/mul_mat_iu4.cuh"
 #include "ggml-cuda/mul_mat_iu4_mmq.cuh"
 #include "ggml-cuda/mmvq_iu4.cuh"
+#include "ggml-cuda/mmvq_dot2f16.cuh"
 #include "ggml-cuda/mul_mat_q2_0_fp8route_mmq.cuh"
 #include "ggml-cuda/mul_mat_q2_0_wmma.cuh"
 #include "ggml-cuda/mul_mat_q2_0_hipblaslt.cuh"
@@ -2671,6 +2672,28 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         if (iu4_mmvq_decode_enabled && ggml_cuda_mmvq_iu4_supports(src0, src1, dst)) {
             const bool ok = ggml_cuda_op_mul_mat_vec_iu4(ctx, src0, src1, dst);
             GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_vec_iu4 does not support this tensor shape");
+            return;
+        }
+    }
+
+    // Stage 25 (completeness-inventory mandate, NOT a production win --
+    // see mmvq_dot2f16.cuh header for the full measured verdict): dormant
+    // v_dot2_f32_f16 F16 decode GEMV, tuning-knob only. Off by default (F16
+    // MUL_MAT keeps using the production mmvf.cu mul_mat_vec_f path
+    // unchanged); GGML_HIP_F16_DOT2_DECODE=1 selects single-issue fdot2,
+    // =2 selects the dual-issue VOPD DOT2ACC inline-asm form. Gated to
+    // src1->ne[1]==1 (M=1) same as the IU4 intercept above -- M>1 always
+    // falls through to mmvf.cu unchanged.
+    {
+        static const int f16_dot2_mode = [](){
+            const char * v = getenv("GGML_HIP_F16_DOT2_DECODE");
+            if (!v) return 0;
+            int m = atoi(v);
+            return (m == 1 || m == 2) ? m : 0;
+        }();
+        if (f16_dot2_mode != 0 && ggml_cuda_mmvq_dot2f16_supports(src0, src1, dst)) {
+            const bool ok = ggml_cuda_op_mul_mat_vec_dot2f16(ctx, src0, src1, dst, f16_dot2_mode);
+            GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_vec_dot2f16 does not support this tensor shape");
             return;
         }
     }
@@ -6019,6 +6042,18 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
             mul_mat_vec_iu4_selftest_ran = true;
             const bool ok = ggml_cuda_mul_mat_vec_iu4_selftest();
             GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_VEC_IU4_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // Stage 25: k_mmvq_dot2f16_{single,dual} (dormant fdot2/DOT2ACC F16
+    // decode GEMV, mmvq_dot2f16.cu) correctness self-test -- covers BOTH
+    // modes. Opt-in only, no model/quant path routes through it by
+    // default. Runs at most once per process.
+    if (getenv("GGML_HIP_MUL_MAT_VEC_DOT2F16_SELFTEST") != nullptr) {
+        static bool mul_mat_vec_dot2f16_selftest_ran = false;
+        if (!mul_mat_vec_dot2f16_selftest_ran) {
+            mul_mat_vec_dot2f16_selftest_ran = true;
+            const bool ok = ggml_cuda_mul_mat_vec_dot2f16_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_VEC_DOT2F16_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
         }
     }
     // RDNA4 2:4-structured-sparse SWMMAC driver-completeness self-test (swmmac24.cu).
