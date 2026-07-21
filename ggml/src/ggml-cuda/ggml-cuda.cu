@@ -75,6 +75,7 @@
 #include "ggml-cuda/mul_mat_iu4_mmq.cuh"
 #include "ggml-cuda/mmvq_iu4.cuh"
 #include "ggml-cuda/mmvq_dot2f16.cuh"
+#include "ggml-cuda/quantize_fp8_sr.cuh"
 #include "ggml-cuda/mul_mat_q2_0_fp8route_mmq.cuh"
 #include "ggml-cuda/mul_mat_q2_0_wmma.cuh"
 #include "ggml-cuda/mul_mat_q2_0_hipblaslt.cuh"
@@ -6054,6 +6055,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
             mul_mat_vec_dot2f16_selftest_ran = true;
             const bool ok = ggml_cuda_mul_mat_vec_dot2f16_selftest();
             GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_VEC_DOT2F16_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // Stage 26: stochastic-rounding fp8 weight quantizer (quantize_fp8_sr.cu)
+    // -- the decisive bias-vs-RMS-error measurement (SR vs RTN, both fp8
+    // formats, 20 random draws each) + a correctness gate (all dequantized
+    // values finite and within the format's representable range). An
+    // ACCURACY lever, not a speed lever -- see quantize_fp8_sr.cuh. Opt-in
+    // only, no model/quant path routes through this by default. Runs at
+    // most once per process.
+    if (getenv("GGML_HIP_FP8_SR_QUANT_SELFTEST") != nullptr) {
+        static bool fp8_sr_quant_test_ran = false;
+        if (!fp8_sr_quant_test_ran) {
+            fp8_sr_quant_test_ran = true;
+            const bool ok = ggml_cuda_fp8_sr_quant_bias_test();
+            GGML_LOG_INFO("%s: GGML_HIP_FP8_SR_QUANT_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
         }
     }
     // RDNA4 2:4-structured-sparse SWMMAC driver-completeness self-test (swmmac24.cu).
