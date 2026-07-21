@@ -2782,6 +2782,35 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
     }
 
+    // Stage-3 refinement (2026-07-20): the blunt GGML_HIP_FORCE_MMQ_DECODE
+    // above forces mmq at EVERY M, including M==1 (the numerically dominant
+    // case throughout a real decode/spec-decode-draft forward pass) where
+    // Stage-1 itself measured mmq LOSING to mmvq (e.g. ffn_gate_up M=1:
+    // 0.1546ms mmvq vs 0.1676ms mmq) -- a real end-to-end spec-decode test
+    // (Bonsai-27B-Q2_0 + dflash draft, n_max=7 so the verify batch hits
+    // M=8) showed the blunt toggle REGRESSING net decode t/s by ~7-9%
+    // (25.3-25.9 vs 27.6-28.1 t/s), because it also de-optimizes every
+    // M==1 call in the draft model and the verifier's own non-batch ops.
+    // GGML_HIP_MMQ_MTHRESH implements the NARROW, boundary-only fix the
+    // FINDINGS.md "KEY ACTIONABLE" entry actually proposes: mmq only
+    // overrides mmvq's priority when M is AT OR ABOVE this threshold
+    // (default 8, matching the measured crossover) -- M below the
+    // threshold is completely unaffected (unmodified mmvq priority).
+    // Mutually exclusive with GGML_HIP_FORCE_MMQ_DECODE in principle (both
+    // set is harmless -- MTHRESH's narrower condition is a subset of
+    // FORCE's, so FORCE just wins for M>=MTHRESH and stays uninvolved
+    // below it either way).
+    {
+        static const int64_t mmq_mthresh = [] () -> int64_t {
+            const char * v = getenv("GGML_HIP_MMQ_MTHRESH");
+            if (!v) return -1; // disabled
+            return (int64_t) atoll(v);
+        }();
+        if (mmq_mthresh >= 0 && src1->ne[1] >= mmq_mthresh && use_mul_mat_q) {
+            use_mul_mat_vec_q = false;
+        }
+    }
+
     // debug helpers
     //printf("src0: %8d %8d %8d %8d\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
     //printf("      %8d %8d %8d %8d\n", src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
