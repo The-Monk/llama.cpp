@@ -72,6 +72,7 @@
 #include "ggml-cuda/mul_mat_2of4_f16.cuh"
 #include "ggml-cuda/mul_mat_iu4.cuh"
 #include "ggml-cuda/mul_mat_iu4_mmq.cuh"
+#include "ggml-cuda/mmvq_iu4.cuh"
 #include "ggml-cuda/mul_mat_q2_0_fp8route_mmq.cuh"
 #include "ggml-cuda/mul_mat_q2_0_wmma.cuh"
 #include "ggml-cuda/mul_mat_q2_0_hipblaslt.cuh"
@@ -2653,13 +2654,34 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
     }
 
+    // T170: dot8 int4-drafter decode path (mmvq_iu4.cu) -- the M=1 (batch=1
+    // decode / spec-decode drafter) GEMV counterpart to the WMMA GEMM kernel
+    // just below. Checked BEFORE the unconditional IU4 intercept so it can
+    // take priority for the shape it targets; ggml_cuda_mmvq_iu4_supports()
+    // itself requires src1->ne[1]==1, so M>1 (prefill) calls always fall
+    // through unchanged to the WMMA path -- this can never regress prefill
+    // even if left enabled. Opt-in via GGML_HIP_IU4_MMVQ_DECODE, same
+    // pattern as every other experimental kernel intercept in this
+    // function (e.g. GGML_HIP_Q2_0_WMMA_DECODE below). See
+    // ~/int4-research/FINDINGS.md Stage 20/23 for the isolated-PoC
+    // validation and in-tree integration results.
+    {
+        static const bool iu4_mmvq_decode_enabled = (getenv("GGML_HIP_IU4_MMVQ_DECODE") != nullptr);
+        if (iu4_mmvq_decode_enabled && ggml_cuda_mmvq_iu4_supports(src0, src1, dst)) {
+            const bool ok = ggml_cuda_op_mul_mat_vec_iu4(ctx, src0, src1, dst);
+            GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_vec_iu4 does not support this tensor shape");
+            return;
+        }
+    }
+
     // T89 driver-completeness run (EXPERIMENTAL, model-blocked -- see
     // block_iu4 comment in ggml-common.h): GGML_TYPE_IU4 (native int4xint4
     // W4A4 WMMA) is NOT wired into the generic mmq/mmvq dispatch below -- it
     // gets its own small dedicated kernel (mul_mat_iu4.cu), hooked here
     // exactly like the GGML_HINT_SRC0_IS_HADAMARD intercept further down.
     // Single-GPU only (no split-buffer handling), MUL_MAT only (no
-    // MUL_MAT_ID).
+    // MUL_MAT_ID). GGML_TYPE_IU4 with M=1 reaches here only when the dot8
+    // decode path immediately above is disabled/not applicable.
     if (src0->type == GGML_TYPE_IU4) {
         const bool ok = ggml_cuda_op_mul_mat_iu4(ctx, src0, src1, dst);
         GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_iu4 does not support this tensor shape");
@@ -5969,6 +5991,18 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
             mul_mat_iu4_mmq_selftest_ran = true;
             const bool ok = ggml_cuda_mul_mat_iu4_mmq_selftest();
             GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_IU4_MMQ_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // T170: k_mmvq_dot8_iu4 (dot8 int4-drafter decode GEMV) correctness
+    // self-test (mmvq_iu4.cu) -- distinct from both IU4 selftests above,
+    // which only cover the WMMA GEMM kernels. Opt-in only, no model/quant
+    // path routes through it. Runs at most once per process.
+    if (getenv("GGML_HIP_MUL_MAT_VEC_IU4_SELFTEST") != nullptr) {
+        static bool mul_mat_vec_iu4_selftest_ran = false;
+        if (!mul_mat_vec_iu4_selftest_ran) {
+            mul_mat_vec_iu4_selftest_ran = true;
+            const bool ok = ggml_cuda_mul_mat_vec_iu4_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_VEC_IU4_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
         }
     }
     // RDNA4 2:4-structured-sparse SWMMAC driver-completeness self-test (swmmac24.cu).

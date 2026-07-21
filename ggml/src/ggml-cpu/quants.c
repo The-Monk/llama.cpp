@@ -140,6 +140,40 @@ void ggml_vec_dot_mxfp6_f32(int n, float * GGML_RESTRICT s, size_t bs, const voi
     *s = sumf;
 }
 
+// T170 / Stage 23: GGML_TYPE_IU4 CPU fallback -- see the comment at
+// ggml_vec_dot_iu4_f32's declaration in quants.h. void*-signature wrapper
+// around quantize_row_iu4_ref, same pattern as quantize_row_mxfp6 above
+// (needed because .from_float's function-pointer type is `void*`, not
+// `block_iu4*`).
+void quantize_row_iu4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_iu4_ref(x, (block_iu4 *) y, k);
+}
+
+void ggml_vec_dot_iu4_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+    GGML_ASSERT(nrc == 1);
+    GGML_ASSERT(n % QK_IU4 == 0);
+
+    const block_iu4 * GGML_RESTRICT x = (const block_iu4 *) vx;
+    const float      * GGML_RESTRICT y = (const float      *) vy;
+
+    const int64_t CHUNK = 512; // multiple of QK_IU4 (32)
+    float tmp[CHUNK];
+
+    float sumf = 0.0f;
+    for (int64_t done = 0; done < n; done += CHUNK) {
+        const int64_t this_chunk = done + CHUNK <= n ? CHUNK : (n - done);
+        dequantize_row_iu4(x + done / QK_IU4, tmp, this_chunk);
+        for (int64_t j = 0; j < this_chunk; ++j) {
+            sumf += tmp[j] * y[done + j];
+        }
+    }
+
+    *s = sumf;
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
