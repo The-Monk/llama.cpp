@@ -4039,6 +4039,21 @@ struct test_mul_mat : public test_case {
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }
+        // T170 / Stage 23: GGML_TYPE_IU4 quantizes BOTH weight AND
+        // activation to signed int4 ([-8,7], amax/7 symmetric per 32-elem
+        // block) -- a coarser noise floor than the int8/q8_1 activations
+        // every other quantized type here compares against, for the same
+        // reason the Blackwell mxfp4 case above needs a looser tolerance.
+        // Measured directly (isolated PoC, Stage 20): ~0.10-0.14 relative
+        // L2 error on random Gaussian data; observed here (real
+        // ggml_tensor path, CPU-reference dequant-and-dot compare):
+        // ~0.0046 ERR at K=4096 -- not a correctness bug (see
+        // ~/int4-research/FINDINGS.md Stage 20/23 for the isolated A/B
+        // that separated int4-quant noise from actual arithmetic bugs,
+        // both on this exact kernel).
+        if (type_a == GGML_TYPE_IU4) {
+            return 1e-2;
+        }
         return max_nmse_err();
     }
 
@@ -8451,6 +8466,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
+    // T170 / Stage 23: dot8 int4-drafter decode path (mmvq_iu4.cu), targeted
+    // MUL_MAT cases at n=1 (M=1, decode/drafter -- routes to the new
+    // v_dot8_i32_iu4 GEMV kernel when GGML_HIP_IU4_MMVQ_DECODE is set) at
+    // the real hidden-size shapes validated in the isolated PoC
+    // (~/int4-research/pocs/dot8-int4-decode/decode_poc.hip, Stage 20:
+    // K=4096, N in {4096, 14336}), plus an n=2 (M=2) case to confirm the
+    // existing WMMA path (mul_mat_iu4.cu) is untouched and still correct
+    // for M>1 regardless of whether the new decode env var is set.
+    // GGML_TYPE_IU4 is EXPERIMENTAL/model-blocked (see block_iu4 comment in
+    // ggml-common.h) -- these cases only run against the CPU reference
+    // backend's own quantize_row_iu4_ref, same as every other quantized
+    // type here, no real GGUF model needed.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 4096,  1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 4096,  2, 4096, {1, 1}, {1, 1}));
+
 
 #if 0
     {
@@ -9432,6 +9463,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+
+    // T170 / Stage 23: dot8 int4-drafter decode path perf, real hidden-size
+    // shapes matching the isolated PoC exactly (K=4096, N in {4096, 14336},
+    // M=1 -- ~/int4-research/pocs/dot8-int4-decode/decode_poc.hip, Stage 20)
+    // so in-tree perf here is directly comparable to that PoC's numbers.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 4096,  1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
