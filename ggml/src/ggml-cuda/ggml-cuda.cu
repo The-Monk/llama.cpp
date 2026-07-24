@@ -70,6 +70,10 @@
 #include "ggml-cuda/iu4_w4a4.cuh"
 #include "ggml-cuda/mxfp8_selftest.cuh"
 #include "ggml-cuda/mul_mat_2of4_fp8.cuh"
+#include "ggml-cuda/mul_mat_2of4_fp8_mmq.cuh"
+#include "ggml-cuda/mul_mat_dense_fp8_v3.cuh"
+#include "ggml-cuda/mul_mat_dense_fp8_mmq.cuh"
+#include "ggml-cuda/int4_24_probe.cuh"
 #include "ggml-cuda/mul_mat_2of4_f16.cuh"
 #include "ggml-cuda/mul_mat_iu4.cuh"
 #include "ggml-cuda/mul_mat_iu4_mmq.cuh"
@@ -2585,9 +2589,44 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // hooked here exactly like the GGML_HINT_SRC0_IS_HADAMARD intercept
     // further down. Single-GPU only (no split-buffer handling), MUL_MAT
     // only (no MUL_MAT_ID).
+    // T162 CAPSTONE: library-grade cooperative-tile/double-buffered-LDS
+    // SWMMAC 2:4 GEMM (mul_mat_2of4_fp8_mmq.cu), checked BEFORE the plain
+    // V3/V2/baseline dispatch below so GGML_HIP_2OF4_FP8_MMQ can select it
+    // without disturbing any of the earlier (already-measured) kernels.
+    if (src0->type == GGML_TYPE_2OF4_FP8 && getenv("GGML_HIP_2OF4_FP8_MMQ") != nullptr) {
+        const bool ok = ggml_cuda_op_mul_mat_2of4_fp8_mmq(ctx, src0, src1, dst);
+        GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_2of4_fp8_mmq does not support this tensor shape");
+        return;
+    }
+
     if (src0->type == GGML_TYPE_2OF4_FP8) {
         const bool ok = ggml_cuda_op_mul_mat_2of4_fp8(ctx, src0, src1, dst);
         GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_2of4_fp8 does not support this tensor shape");
+        return;
+    }
+
+    // T162 follow-up (coordinator directive, "the missing measurement"): a
+    // dense-fp8 TWIN of the 2:4-sparse V3 kernel above -- same hand-written
+    // shape, dense WMMA math instead of sparse SWMMAC. Opt-in only
+    // (GGML_HIP_DENSE_FP8_V3), falls through to the normal production
+    // dense-fp8 MMQ path (mmq.cuh) when unset. See mul_mat_dense_fp8_v3.cuh.
+    if (src0->type == GGML_TYPE_F8E4M3 && src1->type == GGML_TYPE_F32 &&
+            src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+            getenv("GGML_HIP_DENSE_FP8_V3") != nullptr) {
+        const bool ok = ggml_cuda_op_mul_mat_dense_fp8_v3(ctx, src0, src1, dst);
+        GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_dense_fp8_v3 does not support this tensor shape");
+        return;
+    }
+
+    // T162 CAPSTONE: MMQ-grade dense-fp8 twin (mul_mat_dense_fp8_mmq.cu),
+    // same cooperative-tile/double-buffered-LDS shape as the sparse
+    // capstone kernel below, checked first so GGML_HIP_DENSE_FP8_MMQ can
+    // select it independently of GGML_HIP_DENSE_FP8_V3.
+    if (src0->type == GGML_TYPE_F8E4M3 && src1->type == GGML_TYPE_F32 &&
+            src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+            getenv("GGML_HIP_DENSE_FP8_MMQ") != nullptr) {
+        const bool ok = ggml_cuda_op_mul_mat_dense_fp8_mmq(ctx, src0, src1, dst);
+        GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_dense_fp8_mmq does not support this tensor shape");
         return;
     }
 
@@ -6000,6 +6039,28 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
     // the doctrine rationale (accuracy gate on naive W4A4 activation
     // quantization did not clear the bar for an ACTIVE default path). Runs at
     // most once per process. Same pattern as GGML_HIP_SWMMAC24_SELFTEST.
+    // T162 follow-up: isolated per-shape occupancy sweep for the 2:4-sparse
+    // fp8 SWMMAC V3 kernel (mul_mat_2of4_fp8.cu). Opt-in only, no
+    // model/quant path routes through it. Runs at most once per process.
+    if (getenv("GGML_HIP_2OF4_FP8_SHAPE_BENCH") != nullptr) {
+        static bool shape_bench_ran = false;
+        if (!shape_bench_ran) {
+            shape_bench_ran = true;
+            const bool ok = ggml_cuda_mul_mat_2of4_fp8_shape_bench();
+            GGML_LOG_INFO("%s: GGML_HIP_2OF4_FP8_SHAPE_BENCH result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // T162 follow-up: dense-fp8 twin of the isolated per-shape sweep above
+    // -- see mul_mat_dense_fp8_v3.cu. Opt-in only, no model/quant path
+    // routes through it. Runs at most once per process.
+    if (getenv("GGML_HIP_DENSE_FP8_V3_SHAPE_BENCH") != nullptr) {
+        static bool dense_v3_shape_bench_ran = false;
+        if (!dense_v3_shape_bench_ran) {
+            dense_v3_shape_bench_ran = true;
+            const bool ok = ggml_cuda_mul_mat_dense_fp8_v3_shape_bench();
+            GGML_LOG_INFO("%s: GGML_HIP_DENSE_FP8_V3_SHAPE_BENCH result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
     if (getenv("GGML_HIP_IU4_W4A4_SELFTEST") != nullptr) {
         static bool iu4_w4a4_selftest_ran = false;
         if (!iu4_w4a4_selftest_ran) {
@@ -6081,6 +6142,27 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
             swmmac24_selftest_ran = true;
             const bool ok = ggml_cuda_swmmac24_selftest();
             GGML_LOG_INFO("%s: GGML_HIP_SWMMAC24_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // T162 int4-2:4 pivot: idx-encoding-fixed iu4 sparse SWMMAC self-test
+    // (swmmac24_iu4_fixed.cu). Opt-in, does not touch the selftest above.
+    if (getenv("GGML_HIP_SWMMAC24_IU4_FIXED_SELFTEST") != nullptr) {
+        static bool swmmac24_iu4_fixed_selftest_ran = false;
+        if (!swmmac24_iu4_fixed_selftest_ran) {
+            swmmac24_iu4_fixed_selftest_ran = true;
+            const bool ok = ggml_cuda_swmmac24_iu4_fixed_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_SWMMAC24_IU4_FIXED_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // T162 int4-2:4 pivot: isolated MMQ-grade sparse int4 correctness +
+    // throughput probe (int4_24_probe.cu). Opt-in, standalone (no ggml
+    // dispatch path routes through it -- see file header for why).
+    if (getenv("GGML_HIP_INT4_24_PROBE") != nullptr) {
+        static bool int4_24_probe_ran = false;
+        if (!int4_24_probe_ran) {
+            int4_24_probe_ran = true;
+            const bool ok = ggml_cuda_int4_24_probe();
+            GGML_LOG_INFO("%s: GGML_HIP_INT4_24_PROBE result: %s\n", __func__, ok ? "PASS" : "FAIL");
         }
     }
     // ROC8: MXFP8 type-plumbing + kernel correctness self-test (mxfp8_selftest.cu).

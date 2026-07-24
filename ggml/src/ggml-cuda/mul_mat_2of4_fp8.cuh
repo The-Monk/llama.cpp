@@ -24,3 +24,8 @@
 // supported scope (caller should treat that as a hard error -- there is no
 // fallback path for this type).
 bool ggml_cuda_op_mul_mat_2of4_fp8(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
+// T162 follow-up: isolated per-shape occupancy sweep (see mul_mat_2of4_fp8.cu
+// for full rationale). Opt-in via GGML_HIP_2OF4_FP8_SHAPE_BENCH, logs
+// results via GGML_LOG_INFO, does not touch any model/quant path.
+bool ggml_cuda_mul_mat_2of4_fp8_shape_bench();
