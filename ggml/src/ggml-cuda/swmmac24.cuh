@@ -220,3 +220,8 @@ static __global__ void k_swmmac_f16_24_perlane(const v8h * __restrict__ a, const
 // purely a standalone instruction-level self-test, invoked only when opted into via
 // GGML_HIP_SWMMAC24_SELFTEST (see ggml-cuda.cu).
 bool ggml_cuda_swmmac24_selftest();
+
+// T162 int4-2:4 pivot: standalone idx-encoding-fixed iu4 sparse SWMMAC
+// self-test (swmmac24_iu4_fixed.cu). Does not touch/modify the
+// selftest above. Opt-in via GGML_HIP_SWMMAC24_IU4_FIXED_SELFTEST.
+bool ggml_cuda_swmmac24_iu4_fixed_selftest();
