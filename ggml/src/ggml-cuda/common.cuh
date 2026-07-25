@@ -1869,6 +1869,12 @@ struct ggml_backend_cuda_context {
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
 
+    // T180 diagnostic (see mmvq.cu): keyed cache buffer for the quant-dedup
+    // experiment. Declared AFTER pools[] (destroyed before it -- reverse
+    // declaration order).
+    const ggml_tensor * mmvq_quant_cache_tensor = nullptr;
+    std::unique_ptr<ggml_cuda_pool_alloc<char>> mmvq_quant_cache_buf;
+
     static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(int device, int stream_no);
 
     ggml_cuda_pool & pool(int device) {
