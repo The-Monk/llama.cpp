@@ -112,6 +112,21 @@ static bool ggml_cuda_fuse_mmvq_quant_enabled() {
     return enabled;
 }
 
+// T180 (env GGML_HIP_DEDUP_MMVQ_QUANT, default OFF): dedup the
+// quantize_row_q8_1 dispatch across sibling mmvq matmuls that share one
+// input tensor, INSTEAD of fusing the quantize into the mmvq kernel itself
+// (that's GGML_HIP_FUSE_MMVQ_QUANT above, measured -56 to -84% regression on
+// 2026-07-23 -- redundant per-row-block quantize competes with dp4a on the
+// SAME VALU pipe rather than overlapping it). This lever keeps quantize as a
+// separate launch (preserves the packed dp4a path untouched) and only skips
+// launches that would recompute byte-identical output for a sibling matmul
+// reading the exact same activation tensor (e.g. wq/wk/wv, ffn_gate/ffn_up,
+// wqkv/wqkv_gate, ssm_alpha/ssm_beta within one decoder layer).
+static bool ggml_cuda_dedup_mmvq_quant_enabled() {
+    static const bool enabled = getenv("GGML_HIP_DEDUP_MMVQ_QUANT") != nullptr;
+    return enabled;
+}
+
 // Cap on the dynamic shared memory the fused quantizer is allowed to
 // request (one block_q8_1 per 32 activations). Conservative vs. RDNA4's
 // 64KB LDS/block, leaving headroom for the kernel's existing static shared
@@ -2027,8 +2042,25 @@ void ggml_cuda_mul_mat_vec_q(
         (size_t) (ne10 / QK8_1) * sizeof(block_q8_1) <= GGML_HIP_FUSE_MMVQ_QUANT_MAX_SHARED_BYTES;
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), fuse_quant ? 0 : ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    if (!fuse_quant) {
+
+    const bool dedup_quant_eligible_type =
+        src0->type != GGML_TYPE_F8E4M3 &&
+        !(src0->type == GGML_TYPE_F8E5M2 && ggml_cuda_f8e5m2_dot4_enabled());
+    const bool dedup_quant =
+        ggml_cuda_dedup_mmvq_quant_enabled() && !fuse_quant && !ids && ne11 == 1 && dedup_quant_eligible_type;
+    const bool dedup_hit = dedup_quant &&
+        ctx.mmvq_quant_cache_tensor == src1 && ctx.mmvq_quant_cache_buf;
+
+    // dedup_quant (hit OR miss-that-populates) ALWAYS routes data through
+    // ctx.mmvq_quant_cache_buf, never through the local src1_q8_1 -- so the
+    // local buffer must be skipped (size 0) whenever dedup_quant is true,
+    // not just on a hit. (Bug found in first correctness pass: gating this
+    // on dedup_hit alone left the first/miss occurrence's vy_ptr pointing at
+    // an allocated-but-never-written src1_q8_1 buffer -- uninitialized
+    // memory -- while the real quantized data went into the cache buffer
+    // instead. Immediate garbage-token output, not a race.)
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), (fuse_quant || dedup_quant) ? 0 : ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    if (!fuse_quant && !dedup_hit) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
@@ -2054,6 +2086,10 @@ void ggml_cuda_mul_mat_vec_q(
             quantize_row_f8e4m3_for_mmvq_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         } else if (src0->type == GGML_TYPE_F8E5M2 && ggml_cuda_f8e5m2_dot4_enabled()) {
             quantize_row_f8e5m2_for_mmvq_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        } else if (dedup_quant) {
+            ctx.mmvq_quant_cache_buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+            ctx.mmvq_quant_cache_tensor = src1;
+            quantize_row_q8_1_cuda(src1_d, nullptr, ctx.mmvq_quant_cache_buf->get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         } else {
             quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         }
@@ -2084,7 +2120,8 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
-    const void * vy_ptr = fuse_quant ? (const void *) src1_d : (const void *) src1_q8_1.get();
+    const void * vy_ptr = fuse_quant ? (const void *) src1_d :
+        dedup_quant ? (const void *) ctx.mmvq_quant_cache_buf->get() : (const void *) src1_q8_1.get();
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, vy_ptr, ids_d, fusion_local, dst_d, ne00,
