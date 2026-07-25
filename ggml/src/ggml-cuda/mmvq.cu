@@ -127,6 +127,23 @@ static bool ggml_cuda_dedup_mmvq_quant_enabled() {
     return enabled;
 }
 
+// T180-verify (env GGML_HIP_DEDUP_MMVQ_QUANT_BATCH, default OFF, REQUIRES the
+// base GGML_HIP_DEDUP_MMVQ_QUANT flag too): widen the sibling quant-dedup
+// above to ncols_dst>1 (ne11>1) -- i.e. a spec-decode VERIFY pass batching
+// n_draft+1 candidate tokens through the target in one forward, not just the
+// ne11==1 raw single-token decode path the base flag was scoped to. The
+// underlying redundancy is IDENTICAL at any batch size: sibling matmuls
+// (wq/wk/wv, wqkv/wqkv_gate, ssm_alpha/ssm_beta) still read the exact same
+// activation tensor whether it holds 1 token or N -- confirmed reachable via
+// rocprofv3 kernel-trace showing mul_mat_vec_q<type,3,...> (ncols_dst=3) as
+// the dominant kernel during a Q2_0 MTP n_max=2 verify pass. Separate flag
+// (not folded into the base) so the raw single-stream win (shipped,
+// 28ec66b65) and this verify-pass extension can be A/B'd independently.
+static bool ggml_cuda_dedup_mmvq_quant_batch_enabled() {
+    static const bool enabled = getenv("GGML_HIP_DEDUP_MMVQ_QUANT_BATCH") != nullptr;
+    return enabled;
+}
+
 // Cap on the dynamic shared memory the fused quantizer is allowed to
 // request (one block_q8_1 per 32 activations). Conservative vs. RDNA4's
 // 64KB LDS/block, leaving headroom for the kernel's existing static shared
@@ -2043,11 +2060,25 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
 
+    // T180-fp8 (env GGML_HIP_DEDUP_MMVQ_QUANT_FP8, default OFF, REQUIRES the
+    // base flag too): extend dedup caching to the F8E4M3 native quantizer
+    // path (quantize_row_f8e4m3_for_mmvq_cuda). Same principle as the q8_1
+    // case: sibling matmuls sharing one input tensor (e.g. DFlash-target
+    // wq/wk/wv, still fp8 F8E4M3 weights) still redundantly re-quantize that
+    // SAME activation today. Separate opt-in from the q8_1 dedup because the
+    // f8e4m3 quantizer is a DIFFERENT function -- verified it's safe to
+    // reuse the SAME cache-buffer size formula (block_q8_1-sized) because
+    // the existing (pre-T180) code already shares that exact allocation
+    // (src1_q8_1) across all three quantizer variants (q8_1/f8e4m3/f8e5m2)
+    // at this call site, so the size invariant is already proven, not new.
+    const bool dedup_quant_fp8_enabled = getenv("GGML_HIP_DEDUP_MMVQ_QUANT_FP8") != nullptr;
     const bool dedup_quant_eligible_type =
-        src0->type != GGML_TYPE_F8E4M3 &&
+        (src0->type != GGML_TYPE_F8E4M3 || dedup_quant_fp8_enabled) &&
         !(src0->type == GGML_TYPE_F8E5M2 && ggml_cuda_f8e5m2_dot4_enabled());
+    const bool dedup_quant_batch_ok =
+        ne11 == 1 || (ne11 > 1 && ggml_cuda_dedup_mmvq_quant_batch_enabled());
     const bool dedup_quant =
-        ggml_cuda_dedup_mmvq_quant_enabled() && !fuse_quant && !ids && ne11 == 1 && dedup_quant_eligible_type;
+        ggml_cuda_dedup_mmvq_quant_enabled() && !fuse_quant && !ids && dedup_quant_batch_ok && dedup_quant_eligible_type;
     const bool dedup_hit = dedup_quant &&
         ctx.mmvq_quant_cache_tensor == src1 && ctx.mmvq_quant_cache_buf;
 
@@ -2083,7 +2114,13 @@ void ggml_cuda_mul_mat_vec_q(
         // swap here without matching the dispatch swap would silently feed
         // bf8 bytes to a vec_dot that expects int8, or vice versa.
         if (src0->type == GGML_TYPE_F8E4M3) {
-            quantize_row_f8e4m3_for_mmvq_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            if (dedup_quant) {
+                ctx.mmvq_quant_cache_buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+                ctx.mmvq_quant_cache_tensor = src1;
+                quantize_row_f8e4m3_for_mmvq_cuda(src1_d, nullptr, ctx.mmvq_quant_cache_buf->get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            } else {
+                quantize_row_f8e4m3_for_mmvq_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            }
         } else if (src0->type == GGML_TYPE_F8E5M2 && ggml_cuda_f8e5m2_dot4_enabled()) {
             quantize_row_f8e5m2_for_mmvq_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         } else if (dedup_quant) {
