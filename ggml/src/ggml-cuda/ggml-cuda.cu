@@ -92,6 +92,7 @@
 #include "ggml-cuda/mul_mat_mxfp8_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_mxfp6_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_f8e4m3_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_iu4_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_f16_hipblaslt.cuh"
 #include "ggml.h"
 
@@ -2854,6 +2855,22 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
     }
 
+    // IU4 prefill lever (see mul_mat_iu4_hipblaslt.cuh): int4 MODELS have a slow
+    // mmq/dedicated-kernel prefill (~3x below fp8). Sidestep the 23%-walled int4
+    // WMMA entirely: dequant iu4 -> per-channel fp8/int8 -> Tensile GEMM (int4's
+    // 2x COMPUTE is unreachable, but the model still gets the fast prefill route).
+    // Placed BEFORE the unconditional IU4 intercept below so it can win prefill;
+    // decode (M<=threshold) falls through to the dedicated kernel. Opt-in
+    // GGML_HIP_IU4_HIPBLASLT_PREFILL (+ _FP8); soft-fail -> the intercept below.
+    {
+        static const bool iu4_hipblaslt_prefill_enabled = (getenv("GGML_HIP_IU4_HIPBLASLT_PREFILL") != nullptr);
+        if (iu4_hipblaslt_prefill_enabled && ggml_cuda_iu4_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_iu4_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+        }
+    }
+
     // T89 driver-completeness run (EXPERIMENTAL, model-blocked -- see
     // block_iu4 comment in ggml-common.h): GGML_TYPE_IU4 (native int4xint4
     // W4A4 WMMA) is NOT wired into the generic mmq/mmvq dispatch below -- it
@@ -2983,6 +3000,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
         }
     }
+
 
     // Route dense F16/BF16/F32 PREFILL matmuls (M > threshold) through
     // hipBLASLt's tuned HH_SH/BB_SB/SS_SS Tensile GEMM instead of the existing
