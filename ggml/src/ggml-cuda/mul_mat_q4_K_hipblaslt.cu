@@ -423,7 +423,7 @@ bool ggml_cuda_q4_K_hipblaslt_prefill_supports(const ggml_tensor * src0, const g
 
     static const int64_t M_THRESH = [](){
         const char * e = getenv("GGML_HIP_Q4_K_HIPBLASLT_MTHRESH");
-        return e ? (int64_t)atoll(e) : (int64_t)32;
+        return e ? (int64_t)atoll(e) : (int64_t)384;  // was 32: M-sweep showed fp8 route regresses M<256 (-27% M128), k-quant unpack heavy; engage only in win regime
     }();
     if (src1->ne[1] <= M_THRESH) return false;
 
