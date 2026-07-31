@@ -464,7 +464,7 @@ bool ggml_cuda_q1_0_hipblaslt_prefill_supports(const ggml_tensor * src0, const g
     // Prefill only: M must clear the threshold (decode stays on dp4a). Tunable.
     static const int64_t M_THRESH = [](){
         const char * e = getenv("GGML_HIP_Q1_0_HIPBLASLT_MTHRESH");
-        return e ? (int64_t)atoll(e) : (int64_t)32;
+        return e ? (int64_t)atoll(e) : (int64_t)384;  // was 32: M-sweep showed int8 route regresses M<256 (fable review); engage only in the win regime
     }();
     if (src1->ne[1] <= M_THRESH) return false;
 
