@@ -88,6 +88,7 @@
 #include "ggml-cuda/mul_mat_q2_0_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_q1_0_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_q4_K_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_q8_0_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_f16_hipblaslt.cuh"
 #include "ggml.h"
 
@@ -2918,6 +2919,20 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         static const bool q4_K_hipblaslt_prefill_enabled = (getenv("GGML_HIP_Q4_K_HIPBLASLT_PREFILL") != nullptr);
         if (q4_K_hipblaslt_prefill_enabled && ggml_cuda_q4_K_hipblaslt_prefill_supports(src0, src1, dst)) {
             if (ggml_cuda_op_mul_mat_q4_K_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+            // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
+        }
+    }
+
+    // Q8_0 prefill lever (see mul_mat_q8_0_hipblaslt.cuh): route Q8_0 (8.5bpw,
+    // 32-elem block, symmetric int8 x per-block scale) large-M matmuls through
+    // hipBLASLt int8 (GGML_HIP_Q8_0_HIPBLASLT_PREFILL) or fp8 (+ _FP8). Opt-in;
+    // soft-fail -> mmq/dp4a.
+    {
+        static const bool q8_0_hipblaslt_prefill_enabled = (getenv("GGML_HIP_Q8_0_HIPBLASLT_PREFILL") != nullptr);
+        if (q8_0_hipblaslt_prefill_enabled && ggml_cuda_q8_0_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_q8_0_hipblaslt(ctx, src0, src1, dst)) {
                 return;
             }
             // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
