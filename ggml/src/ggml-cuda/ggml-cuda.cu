@@ -91,6 +91,7 @@
 #include "ggml-cuda/mul_mat_q8_0_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_mxfp8_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_mxfp6_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_f8e4m3_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_f16_hipblaslt.cuh"
 #include "ggml.h"
 
@@ -2963,6 +2964,20 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         static const bool mxfp6_hipblaslt_prefill_enabled = (getenv("GGML_HIP_MXFP6_HIPBLASLT_PREFILL") != nullptr);
         if (mxfp6_hipblaslt_prefill_enabled && ggml_cuda_mxfp6_hipblaslt_prefill_supports(src0, src1, dst)) {
             if (ggml_cuda_op_mul_mat_mxfp6_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+            // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
+        }
+    }
+
+    // F8E4M3 prefill lever (see mul_mat_f8e4m3_hipblaslt.cuh): route F8E4M3
+    // (signed e4m3 elems + per-block fp16 scale) large-M matmuls through hipBLASLt
+    // int8/fp8. fp8 is the natural path (native e4m3). Opt-in
+    // GGML_HIP_F8E4M3_HIPBLASLT_PREFILL (+ _FP8); soft-fail -> mmq/dp4a.
+    {
+        static const bool f8e4m3_hipblaslt_prefill_enabled = (getenv("GGML_HIP_F8E4M3_HIPBLASLT_PREFILL") != nullptr);
+        if (f8e4m3_hipblaslt_prefill_enabled && ggml_cuda_f8e4m3_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_f8e4m3_hipblaslt(ctx, src0, src1, dst)) {
                 return;
             }
             // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
