@@ -366,6 +366,8 @@ const cached_w * try_cache_weight(const void * key, const char * wdata, int64_t 
 
     const size_t need = (size_t)N * K + (size_t)N * sizeof(float);
     if (g_wcache_bytes + need > wcache_budget_bytes()) return nullptr;
+    { size_t freeb = 0, totb = 0;   // VRAM-adaptive: keep headroom for the transient pool bufs
+      if (hipMemGetInfo(&freeb, &totb) == hipSuccess && freeb < need + (size_t)(2ull << 30)) return nullptr; }
 
     cached_w c;
     if (hipMalloc(&c.q8, (size_t)N * K) != hipSuccess) return nullptr;
@@ -421,6 +423,16 @@ bool ggml_cuda_op_mul_mat_q8_0_hipblaslt(ggml_backend_cuda_context & ctx, const 
     ggml_cuda_pool_alloc<float>  wsc_pool;
     const cached_w * cw = try_cache_weight(src0->data, (const char *)src0->data, src0->nb[1],
                                            N, K, n_blocks, mode, stream);
+    // Pre-flight VRAM guard: fall back to mmq (return false) instead of letting a pool
+    // alloc OOM-abort when a near-full model leaves too little free VRAM for the transient
+    // int8/fp8 + accumulator + GEMM-workspace buffers.
+    {
+        size_t freeb = 0, totb = 0;
+        const size_t wq8_need  = cw ? 0 : (size_t)N * K;   // pool alloc for weight only on cache miss
+        const size_t transient = wq8_need + (size_t)K*M + (size_t)N*M*4 + (size_t)M*4
+                               + LT_WS_BYTES + (size_t)(64ull << 20);
+        if (hipMemGetInfo(&freeb, &totb) == hipSuccess && freeb < transient) return false;
+    }
     if (cw) {
         wq8_ptr = cw->q8;
         wsc_ptr = cw->wscale;
