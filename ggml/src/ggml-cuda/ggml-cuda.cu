@@ -89,6 +89,7 @@
 #include "ggml-cuda/mul_mat_q1_0_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_q4_K_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_q8_0_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_mxfp8_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_f16_hipblaslt.cuh"
 #include "ggml.h"
 
@@ -2933,6 +2934,20 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         static const bool q8_0_hipblaslt_prefill_enabled = (getenv("GGML_HIP_Q8_0_HIPBLASLT_PREFILL") != nullptr);
         if (q8_0_hipblaslt_prefill_enabled && ggml_cuda_q8_0_hipblaslt_prefill_supports(src0, src1, dst)) {
             if (ggml_cuda_op_mul_mat_q8_0_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+            // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
+        }
+    }
+
+    // MXFP8 prefill lever (see mul_mat_mxfp8_hipblaslt.cuh): route MXFP8 (OCP MX
+    // e4m3 elems + per-32-block UE8M0 scale) large-M matmuls through hipBLASLt
+    // int8/fp8 GEMM. Fully dequants (e4m3*e8m0) -> per-channel operand. Opt-in
+    // GGML_HIP_MXFP8_HIPBLASLT_PREFILL (+ _FP8); soft-fail -> mmq/dp4a.
+    {
+        static const bool mxfp8_hipblaslt_prefill_enabled = (getenv("GGML_HIP_MXFP8_HIPBLASLT_PREFILL") != nullptr);
+        if (mxfp8_hipblaslt_prefill_enabled && ggml_cuda_mxfp8_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_mxfp8_hipblaslt(ctx, src0, src1, dst)) {
                 return;
             }
             // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
