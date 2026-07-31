@@ -86,6 +86,8 @@
 #include "ggml-cuda/mul_mat_q2_0_fp8route_mmq.cuh"
 #include "ggml-cuda/mul_mat_q2_0_wmma.cuh"
 #include "ggml-cuda/mul_mat_q2_0_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_q1_0_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_q4_K_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_f16_hipblaslt.cuh"
 #include "ggml.h"
 
@@ -2887,6 +2889,35 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         static const bool q2_0_hipblaslt_prefill_enabled = (getenv("GGML_HIP_Q2_0_HIPBLASLT_PREFILL") != nullptr);
         if (q2_0_hipblaslt_prefill_enabled && ggml_cuda_q2_0_hipblaslt_prefill_supports(src0, src1, dst)) {
             if (ggml_cuda_op_mul_mat_q2_0_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+            // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
+        }
+    }
+
+    // Q1_0 prefill lever (see mul_mat_q1_0_hipblaslt.cuh): route Q1_0 (binary
+    // {-1,+1}) large-M matmuls through hipBLASLt int8 (GGML_HIP_Q1_0_HIPBLASLT_PREFILL)
+    // or fp8/e4m3 (+ GGML_HIP_Q1_0_HIPBLASLT_FP8, selected inside the kernel).
+    // MEASURED winner for Q1_0 prefill: int8 +26% pp1024 (2026-07-31). Opt-in;
+    // soft-fail falls through to the unmodified dp4a/mmq path below.
+    {
+        static const bool q1_0_hipblaslt_prefill_enabled = (getenv("GGML_HIP_Q1_0_HIPBLASLT_PREFILL") != nullptr);
+        if (q1_0_hipblaslt_prefill_enabled && ggml_cuda_q1_0_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_q1_0_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+            // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
+        }
+    }
+
+    // Q4_K prefill lever (see mul_mat_q4_K_hipblaslt.cuh): route Q4_K (4.5bpw
+    // k-quant) large-M matmuls through hipBLASLt int8 (GGML_HIP_Q4_K_HIPBLASLT_PREFILL)
+    // or fp8/e4m3 (+ GGML_HIP_Q4_K_HIPBLASLT_FP8). Fully dequants (min folded in) ->
+    // per-channel int8, then the tuned int8 GEMM. Opt-in; soft-fail -> mmq/dp4a.
+    {
+        static const bool q4_K_hipblaslt_prefill_enabled = (getenv("GGML_HIP_Q4_K_HIPBLASLT_PREFILL") != nullptr);
+        if (q4_K_hipblaslt_prefill_enabled && ggml_cuda_q4_K_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_q4_K_hipblaslt(ctx, src0, src1, dst)) {
                 return;
             }
             // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
