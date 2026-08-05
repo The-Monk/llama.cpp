@@ -444,6 +444,15 @@ bool ggml_cuda_q4_K_hipblaslt_prefill_supports(const ggml_tensor * src0, const g
     if (src0->ne[0] != src1->ne[0] || src0->ne[0] % QKK != 0) return false;
 
     static const int64_t M_THRESH = [](){
+        // THRESHOLD NOTE (2026-08-05). This constant is deliberately conservative and
+        // it is model-dependent -- two measurements disagree in SIGN at M=128:
+        //   Devstral-24B-Q4_K_M      -27%   (why it was raised 32 -> 384)
+        //   sparse-llama-8B-Q4_K     +8.3%, and +30.9% at M=256
+        // Both are real. A single global constant cannot satisfy both, so 384 is chosen
+        // to never regress, at the cost of forgoing wins on models like the second.
+        // The principled fix is to measure it per model at load time, the way
+        // scripts/auto-batch-serve.sh already does for continuous-batching -np, rather
+        // than ship a constant. Until then, override per model with the env var below.
         const char * e = getenv("GGML_HIP_Q4_K_HIPBLASLT_MTHRESH");
         return e ? (int64_t)atoll(e) : (int64_t)384;  // was 32: M-sweep showed fp8 route regresses M<256 (-27% M128), k-quant unpack heavy; engage only in win regime
     }();

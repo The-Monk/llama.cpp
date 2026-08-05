@@ -457,6 +457,15 @@ bool ggml_cuda_q2_0_hipblaslt_prefill_supports(const ggml_tensor * src0, const g
 
     // Prefill only: M must clear the threshold (decode stays on dp4a). Tunable.
     static const int64_t M_THRESH = [](){
+        // THRESHOLD NOTE (2026-08-05). This constant is deliberately conservative and
+        // it is model-dependent -- two measurements disagree in SIGN at M=128:
+        //   Q2_0 campaign model       -23% at M=32, -9.5% at M=64   (why it was raised 32 -> 384)
+        //   sweep model              +6.0% at M=128, +40.8% at M=256
+        // Both are real. A single global constant cannot satisfy both, so 384 is chosen
+        // to never regress, at the cost of forgoing wins on models like the second.
+        // The principled fix is to measure it per model at load time, the way
+        // scripts/auto-batch-serve.sh already does for continuous-batching -np, rather
+        // than ship a constant. Until then, override per model with the env var below.
         const char * e = getenv("GGML_HIP_Q2_0_HIPBLASLT_MTHRESH");
         return e ? (int64_t)atoll(e) : (int64_t)384;  // was 32: M-sweep showed int8 route regresses M<256 (fable review); engage only in the win regime
     }();

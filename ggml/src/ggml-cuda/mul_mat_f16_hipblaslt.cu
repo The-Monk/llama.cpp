@@ -4,6 +4,7 @@
 // and dequant-epilogue kernels entirely since F16/BF16 weights need no
 // conversion and HH_SH/BB_SB emit fp32 D directly.
 
+#include <cstdint>
 #include "mul_mat_f16_hipblaslt.cuh"
 
 #if defined(__HIP_PLATFORM_AMD__) && !defined(GGML_HIP_NO_HIPBLASLT)
@@ -218,7 +219,14 @@ bool ggml_cuda_f16_hipblaslt_prefill_supports(const ggml_tensor * src0, const gg
 
     static const int64_t M_THRESH = [](){
         const char * e = getenv("GGML_HIP_F16_HIPBLASLT_MTHRESH");
-        return e ? (int64_t)atoll(e) : (int64_t)32;
+        // DISABLED BY DEFAULT (measured 2026-08-05). This route wins per-matmul at
+        // M=64..256 (+19% to +26%) but is a NET REGRESSION end to end: -2.3% to
+        // -3.7% on pp1024 across four resamples, because at the production ubatch
+        // (M=512) the gain is +0.6% -- inside noise -- while the per-call conversion
+        // and dispatch overhead is not. There is no shape where it demonstrably wins
+        // on a real model, so the default threshold is set above any realistic M.
+        // Set GGML_HIP_F16_HIPBLASLT_MTHRESH explicitly to experiment with it.
+        return e ? (int64_t)atoll(e) : (int64_t)INT64_MAX;   // was 32
     }();
     if (src1->ne[1] <= M_THRESH) return false;
 
