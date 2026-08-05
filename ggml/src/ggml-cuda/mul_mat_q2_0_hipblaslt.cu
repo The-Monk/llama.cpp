@@ -4,6 +4,7 @@
 // and the fp8 front-end are Stage 4.
 
 #include "mul_mat_q2_0_hipblaslt.cuh"
+#include "hipblaslt_wcache.cuh"
 
 // Real implementation only on the AMD/HIP build (hipBLASLt is a ROCm lib).
 // On a CUDA build these become stubs so the globbed source is a no-op.
@@ -423,6 +424,27 @@ const cached_w * try_cache_weight(const void * key, const char * wdata, int64_t 
     auto res = g_wcache.emplace(key, c);
     return &res.first->second;
 }
+
+// Drop cached conversions whose weight pointer falls inside a buffer being freed.
+// Without this the cache key (a raw device address) can be reused by a later
+// allocation and silently return the previous model's converted weights.
+void wcache_invalidate_range(const void * base, size_t size) {
+    std::lock_guard<std::mutex> lk(g_wcache_mtx);
+    const char * b = (const char *) base;
+    for (auto it = g_wcache.begin(); it != g_wcache.end(); ) {
+        const char * k = (const char *) it->first;
+        if (k >= b && k < b + size) {
+            if (it->second.q8) hipFree(it->second.q8);
+            if (it->second.wscale) hipFree(it->second.wscale);
+            g_wcache_bytes -= it->second.bytes;
+            it = g_wcache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+struct wcache_registrar { wcache_registrar() { ggml_hipblaslt_wcache_register(wcache_invalidate_range); } };
+wcache_registrar g_wcache_registrar;
 
 } // namespace
 

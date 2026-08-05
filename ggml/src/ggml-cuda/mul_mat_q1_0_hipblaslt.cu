@@ -6,6 +6,7 @@
 // QK1_0=128, 1 bit/weight. Dequant: bit=1 -> +d, bit=0 -> -d.
 
 #include "mul_mat_q1_0_hipblaslt.cuh"
+#include "hipblaslt_wcache.cuh"
 
 // Real implementation only on the AMD/HIP build (hipBLASLt is a ROCm lib).
 // On a CUDA build these become stubs so the globbed source is a no-op.
@@ -451,6 +452,34 @@ const cached_w_f8 * try_cache_weight_f8(const void * key, const char * wdata, in
     auto res = g_wcache_f8.emplace(key, c);
     return &res.first->second;
 }
+
+// Drop cached conversions whose weight pointer falls inside a buffer being freed.
+// Q1_0 keeps two caches (int8 and fp8 modes); both key on the raw device address
+// and both must be purged, or a reused allocation returns stale weights.
+void wcache_invalidate_range(const void * base, size_t size) {
+    std::lock_guard<std::mutex> lk(g_wcache_mtx);
+    const char * b = (const char *) base;
+    for (auto it = g_wcache_i8.begin(); it != g_wcache_i8.end(); ) {
+        const char * k = (const char *) it->first;
+        if (k >= b && k < b + size) {
+            if (it->second.q8)     hipFree(it->second.q8);
+            if (it->second.wscale) hipFree(it->second.wscale);
+            g_wcache_bytes -= it->second.bytes;
+            it = g_wcache_i8.erase(it);
+        } else { ++it; }
+    }
+    for (auto it = g_wcache_f8.begin(); it != g_wcache_f8.end(); ) {
+        const char * k = (const char *) it->first;
+        if (k >= b && k < b + size) {
+            if (it->second.q8f8)   hipFree(it->second.q8f8);
+            if (it->second.wscale) hipFree(it->second.wscale);
+            g_wcache_bytes -= it->second.bytes;
+            it = g_wcache_f8.erase(it);
+        } else { ++it; }
+    }
+}
+struct wcache_registrar { wcache_registrar() { ggml_hipblaslt_wcache_register(wcache_invalidate_range); } };
+wcache_registrar g_wcache_registrar;
 
 } // namespace
 

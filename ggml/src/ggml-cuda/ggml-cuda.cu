@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
+#include "ggml-cuda/hipblaslt_wcache.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -669,6 +670,9 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    // Purge any hipBLASLt converted-weight cache entries pointing into this buffer.
+    // The caches key on the raw device address, which a later allocation can reuse.
+    ggml_hipblaslt_wcache_invalidate(ctx->dev_ptr, buffer->size);
     delete ctx;
 }
 
