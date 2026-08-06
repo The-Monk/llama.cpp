@@ -28,7 +28,7 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODEL_DIR = "/aipool/models/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca"
-CORPUS = "/tmp/claude-1000/-home-jmonk/2d8fce00-a6a8-4e54-9b57-2208490f4803/scratchpad/int4-gate/corpus.txt"
+CORPUS = os.environ.get("SCRATCH", "./scratch") + "/int4-gate/corpus.txt"
 GROUP = 32
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -190,7 +190,7 @@ def main():
     for k, v in results.items():
         print(f"{k:32s} ppl={v:8.4f}  delta_vs_bf16={(v/base-1)*100:+7.2f}%")
 
-    with open("/tmp/claude-1000/-home-jmonk/2d8fce00-a6a8-4e54-9b57-2208490f4803/scratchpad/int4-gate/results.json", "w") as f:
+    with open(os.environ.get("SCRATCH", "./scratch") + "/int4-gate/results.json", "w") as f:
         json.dump(results, f, indent=2)
 
 if __name__ == "__main__":

@@ -160,8 +160,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mxfp8-native", action="store_true",
         help="Preserve MLX mx.quantize(mode='mxfp8') OCP Microscaling FP8 source weights "
-             "(e.g. OsaurusAI's Qwen3.6-*-MXFP8-MTP bundles) directly into native MXFP8 "
-             "blocks without dequantizing. Sets outtype MXFP8. (ROC8)",
+             "(e.g. OsaurusAI's Qwen3.6-*-MXFP8-MTP bundles), or a Quark mx/e4m3 "
+             "(group_size=32, e8m0) source if one exists, directly into native MXFP8 "
+             "blocks without dequantizing. Sets outtype MXFP8. (ROC8; Quark arm added T185, "
+             "not producible by Quark 0.12.post1 -- see T185 notes)",
+    )
+    parser.add_argument(
+        "--mxfp6-native", action="store_true",
+        help="Preserve a Quark OCP MXFP6 (E3M2, dtype=fp6_e3m2, group_size=32, "
+             "scale_format=e8m0) source directly into native MXFP6 blocks without "
+             "dequantizing. Sets outtype MXFP6. (T184)",
+    )
+    parser.add_argument(
+        "--mxfp4-native", action="store_true",
+        help="Preserve a Quark OCP MXFP4 (E2M1, dtype=fp4, group_size=32, "
+             "scale_format=e8m0) source directly into native MXFP4 blocks without "
+             "dequantizing (repacks Quark's sequential nibble pairs into ggml's "
+             "split-half interleave; same OCP E2M1 codebook, no requant). Sets "
+             "outtype MXFP4. (T185)",
+    )
+    parser.add_argument(
+        "--nvfp4-native", action="store_true",
+        help="Enable Quark-produced NVFP4 (FP4Block16ScaleE4M3Scheme: fp4 "
+             "per_group/group_size=16 weight + fp8_e4m3 scale-of-scale) as an "
+             "NVFP4 source, reusing the existing ModelOpt NVFP4 repacker "
+             "(byte-identical wire format). Off by default so an ordinary Quark "
+             "checkpoint is never silently reinterpreted. (T185)",
     )
 
     parser.add_argument(
@@ -250,6 +274,12 @@ def main() -> None:
         if args.mxfp8_native:
             # Preserved MLX mxfp8 is written as native MXFP8 blocks; advertise it. (ROC8)
             output_type = gguf.LlamaFileType.MOSTLY_MXFP8
+        if args.mxfp6_native:
+            # Preserved Quark MXFP6 is written as native MXFP6 blocks; advertise it. (T184)
+            output_type = gguf.LlamaFileType.MOSTLY_MXFP6
+        if args.mxfp4_native:
+            # Preserved Quark MXFP4 is written as native MXFP4 blocks; advertise it. (T185)
+            output_type = gguf.LlamaFileType.MOSTLY_MXFP4
         model_type = ModelType.MMPROJ if args.mmproj else ModelType.TEXT
         hparams = ModelBase.load_hparams(dir_model, is_mistral_format)
         if not is_mistral_format:
@@ -300,6 +330,9 @@ def main() -> None:
                                      fp8_as_q8=args.fp8_as_q8,
                                      fp8_native=args.fp8_native,
                                      mxfp8_native=args.mxfp8_native,
+                                     mxfp6_native=args.mxfp6_native,
+                                     mxfp4_native=args.mxfp4_native,
+                                     nvfp4_native=args.nvfp4_native,
                                      )
 
         if args.vocab_only:

@@ -671,6 +671,96 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
 
         return weight, scale
 
+    def _transform_mxfp6_weight(self, name: str, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor]:
+        """T184 twin of _transform_mxfp8_weight above: the SAME V-head
+        grouped->tiled row/col reorder problem, but MXFP6 packs 4 six-bit E3M2
+        codes per 3 bytes (24 bytes/32-value block) instead of 1 byte/value.
+        Row reorders (whole output rows) are byte-width-agnostic -- reorder_rows
+        below is functionally identical to MXFP8's version, just operating on a
+        packed-byte tensor with a different row stride. The out_proj column
+        reorder only ever permutes WHOLE 32-element groups (apply_col_perm_mxfp8's
+        own alignment assertions upstream guarantee a group is never split), and
+        each 32-value group is exactly one 24-byte packed chunk here, so the
+        column reorder can operate at 24-byte BLOCK granularity via index_select
+        on a reshaped [rows, nblk, 24] view -- no bit-level unpack/repack needed
+        (unlike NVFP4's nibble pack/unpack dance)."""
+        if not name.endswith((
+            ".linear_attn.in_proj_qkv.weight",
+            ".linear_attn.in_proj_z.weight",
+            ".linear_attn.in_proj_a.weight",
+            ".linear_attn.in_proj_b.weight",
+            ".linear_attn.out_proj.weight",
+        )):
+            return weight, scale
+
+        num_k_heads = self.hparams["linear_num_key_heads"]
+        num_v_heads = self.hparams["linear_num_value_heads"]
+        head_k_dim = self.hparams["linear_key_head_dim"]
+        head_v_dim = self.hparams["linear_value_head_dim"]
+        num_v_per_k = num_v_heads // num_k_heads
+        GS = 32          # ggml QK_MXFP6
+        BLK_BYTES = 24   # QK_MXFP6*6/8
+
+        def reorder_rows(qs: Tensor, scales: Tensor, head_dim: int) -> tuple[Tensor, Tensor]:
+            row_perm = self._reorder_v_heads(
+                torch.arange(num_v_heads * head_dim, dtype=torch.long).unsqueeze(-1),
+                0, num_k_heads, num_v_per_k, head_dim,
+            ).squeeze(-1)
+            return (
+                qs.index_select(0, row_perm.to(device=qs.device)),
+                scales.index_select(0, row_perm.to(device=scales.device)),
+            )
+
+        def apply_col_perm_mxfp6(qs: Tensor, scales: Tensor, col_perm: Tensor) -> tuple[Tensor, Tensor]:
+            k = col_perm.numel()
+            assert k % GS == 0
+            assert qs.shape[-1] == (k // GS) * BLK_BYTES, \
+                f"mxfp6-native: packed byte width {qs.shape[-1]} does not match {k}//{GS}*{BLK_BYTES}"
+
+            group_cols = col_perm.reshape(-1, GS)
+            group_starts = group_cols[:, 0]
+            expected = group_starts.unsqueeze(1) + torch.arange(GS, dtype=col_perm.dtype)
+            assert torch.equal(group_cols, expected), \
+                "MXFP6 out_proj column reorder does not preserve 32-element group alignment"
+            assert torch.all(group_starts % GS == 0)
+
+            group_perm = (group_starts // GS).to(dtype=torch.long)
+            expected_groups = torch.arange(scales.shape[-1], dtype=torch.long)
+            assert group_perm.numel() == scales.shape[-1]
+            assert torch.equal(torch.sort(group_perm).values, expected_groups)
+
+            nblk = qs.shape[-1] // BLK_BYTES
+            qs = qs.reshape(*qs.shape[:-1], nblk, BLK_BYTES)
+            qs = qs.index_select(-2, group_perm.to(device=qs.device))
+            qs = qs.reshape(*qs.shape[:-2], nblk * BLK_BYTES)
+            scales = scales.index_select(-1, group_perm.to(device=scales.device))
+            return qs, scales
+
+        if name.endswith(".linear_attn.in_proj_qkv.weight"):
+            q_dim = head_k_dim * num_k_heads
+            k_dim = head_k_dim * num_k_heads
+            q = weight[:q_dim]
+            k = weight[q_dim:q_dim + k_dim]
+            v = weight[q_dim + k_dim:]
+            q_scale = scale[:q_dim]
+            k_scale = scale[q_dim:q_dim + k_dim]
+            v_scale = scale[q_dim + k_dim:]
+            v, v_scale = reorder_rows(v, v_scale, head_v_dim)
+            return torch.cat([q, k, v], dim=0), torch.cat([q_scale, k_scale, v_scale], dim=0)
+
+        if name.endswith(".linear_attn.in_proj_z.weight"):
+            weight, scale = reorder_rows(weight, scale, head_v_dim)
+        elif name.endswith((".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_b.weight")):
+            weight, scale = reorder_rows(weight, scale, 1)
+        elif name.endswith(".linear_attn.out_proj.weight"):
+            col_perm = self._reorder_v_heads(
+                torch.arange(num_v_heads * head_v_dim, dtype=torch.long).unsqueeze(0),
+                1, num_k_heads, num_v_per_k, head_v_dim,
+            ).squeeze(0)
+            weight, scale = apply_col_perm_mxfp6(weight, scale, col_perm)
+
+        return weight, scale
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         num_k_heads = self.hparams.get("linear_num_key_heads", 0)
         num_v_heads = self.hparams.get("linear_num_value_heads", 0)

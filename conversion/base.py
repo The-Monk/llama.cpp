@@ -124,7 +124,10 @@ class ModelBase:
                  fuse_gate_up_exps: bool = False,
                  fp8_as_q8: bool = False,
                  fp8_native: bool = False,
-                 mxfp8_native: bool = False):
+                 mxfp8_native: bool = False,
+                 mxfp6_native: bool = False,
+                 mxfp4_native: bool = False,
+                 nvfp4_native: bool = False):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -157,6 +160,9 @@ class ModelBase:
         self._fp8_as_q8 = fp8_as_q8
         self._fp8_native = fp8_native
         self._mxfp8_native = mxfp8_native
+        self._mxfp6_native = mxfp6_native
+        self._mxfp4_native = mxfp4_native
+        self._nvfp4_native = nvfp4_native
         self._fp8_dequantized: set[str] = set()
 
         # Apply heuristics to figure out typical tensor encoding based on first tensor's dtype
@@ -584,6 +590,22 @@ class ModelBase:
                             self._fp8_dequantized.add(weight_name)
                     if name.endswith((".input_scale", ".k_scale", ".v_scale")):
                         tensors_to_remove.append(name)
+            elif quant_method == "quark":
+                # T185: AMD Quark's native export ("quark" quant_method, not
+                # compressed-tensors/fp8/modelopt). Every Quark dtype this fork
+                # can actually preserve (fp8_e4m3/fp8_e5m2 via _fp8_native,
+                # mx/e4m3 MXFP8 via _mxfp8_native, fp6_e3m2 MXFP6 and fp4 MXFP4
+                # via their own --*-native flags) is detected and fully consumed
+                # in prepare_tensors() BEFORE dequant_model() runs (see the
+                # is_quark_* blocks there) -- so by the time we get here there is
+                # nothing left to dequantize for those paths; no-op is correct.
+                # A Quark tensor in a dtype we have NOT wired a bridge for yet
+                # (e.g. int4/uint4, nvfp4 without --nvfp4-native) is deliberately
+                # left untouched here rather than silently mis-dequantized --
+                # it will surface as a real error downstream (an unconverted
+                # non-float tensor reaching gguf_writer.add_tensor) instead of a
+                # silently wrong model.
+                pass
             elif quant_method is not None:
                 raise NotImplementedError(f"Quant method is not yet supported: {quant_method!r}")
 
@@ -901,9 +923,15 @@ class ModelBase:
             else:
                 continue
             weight = LazyTorchTensor.to_eager(self.model_tensors[name]())
-            # Only e4m3fn weights belong to us; leave non-fp8 to existing paths.
-            if weight.dtype != torch.float8_e4m3fn:
+            # e4m3fn or e5m2 weights belong to us (block_f8e4m3/block_f8e5m2 are
+            # byte-identical structs -- pack_f8e4m3_preserve is dtype-agnostic,
+            # it just re-blocks raw 1-byte-per-value + scale, so it packs e5m2
+            # bytes correctly too; only raw_dtype at add_tensor() differs).
+            # Leave non-fp8 to existing paths.
+            if weight.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
                 continue
+            raw_dtype = (gguf.GGMLQuantizationType.F8E5M2 if weight.dtype == torch.float8_e5m2
+                         else gguf.GGMLQuantizationType.F8E4M3)
             scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
             weight, scale = self._transform_fp8_weight(name, weight, scale)
             if bdims is None:
@@ -914,7 +942,7 @@ class ModelBase:
                 sarr = scale.reshape(-1).float().cpu().numpy()
             else:
                 sarr = scale.float().cpu().numpy()                  # 2D block grid [RT, CT]
-            wbytes = weight.view(torch.uint8).cpu().numpy()          # raw e4m3fn bytes, verbatim
+            wbytes = weight.view(torch.uint8).cpu().numpy()          # raw fp8 bytes, verbatim
             consumed += [name, scale_name]
 
             m = re.search(r'\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$', name)
@@ -930,13 +958,13 @@ class ModelBase:
                 bid = int(bid_m.group(1)) if bid_m else 0
                 key = (bid, m.group(2))
                 expert_parts.setdefault(key, []).append((int(m.group(1)), wbytes, sarr))
-                expert_bdims[key] = bdims
+                expert_bdims[key] = (bdims, raw_dtype)
                 if len(expert_parts[key]) >= n_experts:
                     self._flush_fp8_experts(key, expert_parts, expert_bdims)
             else:
                 new_name = self.map_tensor_name(name)
                 raw = gguf.quants.pack_f8e4m3_preserve(wbytes, sarr, block_dims=bdims)
-                self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.F8E4M3)
+                self.gguf_writer.add_tensor(new_name, raw, raw_dtype=raw_dtype)
 
         for key in list(expert_parts.keys()):
             self._flush_fp8_experts(key, expert_parts, expert_bdims)  # fallback flush if n_experts unknown
@@ -947,14 +975,14 @@ class ModelBase:
     def _flush_fp8_experts(self, key, expert_parts, expert_bdims):
         bid, proj = key
         parts = expert_parts.pop(key)
-        bdims = expert_bdims.pop(key, None)
+        bdims, raw_dtype = expert_bdims.pop(key, (None, gguf.GGMLQuantizationType.F8E4M3))
         parts.sort(key=lambda x: x[0])                              # order by expert id
         weights = np.stack([p[1] for p in parts], axis=0)          # [n_expert, rows, cols]
         scales = np.stack([p[2] for p in parts], axis=0)           # [n_expert, rows] or [n_expert, RT, CT]
         raw = gguf.quants.pack_f8e4m3_preserve(weights, scales, block_dims=bdims)  # one vectorized pack
         new_name = self.map_tensor_name(f"model.layers.{bid}.mlp.experts.{proj}.weight")
-        logger.info(f"fp8-native: packed {new_name} [{weights.shape[0]} experts] as F8E4M3 (preserved)")
-        self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.F8E4M3)
+        logger.info(f"fp8-native: packed {new_name} [{weights.shape[0]} experts] as {raw_dtype.name} (preserved)")
+        self.gguf_writer.add_tensor(new_name, raw, raw_dtype=raw_dtype)
 
     def _transform_fp8_weight(self, name: str, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor]:
         """Hook for arch-specific row/col reorders that must be applied to a
@@ -973,6 +1001,211 @@ class ModelBase:
         problem _transform_nvfp4_weight already solves for NVFP4, just simpler
         (MXFP8 is 1 byte/value, no nibble pack/unpack needed)."""
         return weight, scale
+
+    def _transform_mxfp6_weight(self, name: str, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor]:
+        """Hook for arch-specific row/col reorders that must be applied to a
+        preserved MXFP6 tensor before packing (T184). No-op by default;
+        overridden by _LinearAttentionVReorderBase (conversion/qwen.py) for the
+        GatedDeltaNet linear-attention V-head reorder -- the block-packed (6-bit,
+        4-per-3-bytes) twin of _transform_mxfp8_weight above."""
+        return weight, scale
+
+    def _flush_mxfp6_experts(self, key, expert_parts, n_expert_hint: int | None = None):
+        bid, proj = key
+        parts = expert_parts.pop(key)
+        parts.sort(key=lambda x: x[0])                              # order by expert id
+        weights = np.stack([p[1] for p in parts], axis=0)          # [n_expert, rows, cols_packed]
+        scales = np.stack([p[2] for p in parts], axis=0)           # [n_expert, rows, nblk]
+        raw = gguf.quants.pack_mxfp6_preserve(weights, scales)
+        new_name = self.map_tensor_name(f"model.layers.{bid}.mlp.experts.{proj}.weight")
+        logger.info(f"mxfp6-native: packed {new_name} [{weights.shape[0]} experts] as MXFP6 (preserved)")
+        self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.MXFP6)
+
+    def _generate_mxfp6_preserve_tensors(self):
+        """T184 (Ornith-1.0-35B MXFP6 bridge): re-block a Quark OCP MXFP6 (E3M2,
+        dtype="fp6_e3m2", per_group/group_size=32, scale_format="e8m0") source
+        straight into ggml block_mxfp6 WITHOUT dequantizing.
+
+        Quark stores `<name>.weight` as packed uint8 (4 six-bit E3M2 codes per 3
+        bytes, Pack_fp6 -- selected because quant_config.weight.dtype is the
+        literal string "fp6_e3m2", NOT "mx", so create_pack_method takes the
+        Pack_fp6 branch, not the embedded-scale Pack_mxfp6 branch) and a SEPARATE
+        `<name>.weight_scale` uint8 tensor shaped [rows, cols/32] -- one e8m0 byte
+        per 32-element group, a 1:1 match with the ggml block grid (same shape
+        contract as MXFP8's `.scales` sibling in _generate_mxfp8_preserve_tensors,
+        just a different suffix). Verified empirically (2026-07-24) that Quark's
+        Pack_fp6 byte order is BIT-IDENTICAL to ggml's block_mxfp6 qs[] layout
+        (unpacked a real checkpoint block through both Quark's own Pack_fp6.unpack
+        and the ggml bit formula: all 32 E3M2 floats matched exactly) -- so this
+        is a pure re-layout, no float math, mirroring pack_mxfp8_preserve's
+        interleave-and-copy shape conventions via pack_mxfp6_preserve.
+
+        Two things MXFP8's dense-only pass didn't need to handle:
+          - MoE experts ARE supported here (Ornith is MoE): stacked via the same
+            per-(layer,proj) accumulation pattern as _generate_fp8_preserve_tensors.
+          - The GatedDeltaNet depthwise conv1d weight (`linear_attn.conv1d.weight`)
+            is quantized by Quark at an irregular PER-ELEMENT scale granularity
+            (kernel_size=4 < group_size=32, so weight_scale has one byte per raw
+            element, not per 32-block) -- block_mxfp6 requires block_size=32, so
+            this one tensor can't be preserved. Dequantize it back to float32 in
+            place (exact reconstruction: e3m2_value * 2^(e8m0-127), a lossless
+            round-trip of whatever Quark quantized) and drop its scale, so the
+            normal (non-preserve) modify_tensors path picks it up, squeezes the
+            [out,1,k] shape, and applies the V-channel reorder exactly like the
+            fp8-native / bf16 paths do -- mirrors _generate_fp8_preserve_tensors's
+            conv1d special case.
+        """
+        n_experts = self.find_hparam(["num_local_experts", "num_experts", "n_routed_experts"], optional=True) or 0
+        expert_parts: dict[tuple[int, str], list[tuple[int, np.ndarray, np.ndarray]]] = {}
+        consumed: list[str] = []
+
+        def e8m0_dequant(codes: np.ndarray, escale: np.ndarray) -> np.ndarray:
+            # codes: uint8 6-bit E3M2 value (0..63), escale: uint8 biased-127 pow2 exponent
+            sign = (codes >> 5) & 1
+            exp = (codes >> 2) & 0x7
+            mant = (codes & 0x3).astype(np.float32)
+            normal = (1.0 + mant / 4.0) * np.exp2(exp.astype(np.float32) - 3.0)
+            subnormal = (mant / 4.0) * np.exp2(np.float32(1 - 3))
+            val = np.where(exp == 0, subnormal, normal)
+            val = np.where(sign == 1, -val, val)
+            return val * np.exp2(escale.astype(np.float32) - 127.0)
+
+        for name in list(self.model_tensors.keys()):
+            if not name.endswith(".weight"):
+                continue
+            scale_name = name + "_scale"
+            if scale_name not in self.model_tensors:
+                continue
+            weight_t = LazyTorchTensor.to_eager(self.model_tensors[name]())
+            if weight_t.dtype != torch.uint8:
+                continue
+
+            if "conv1d" in name:
+                # Irregular per-element scale (see docstring) -- dequant to f32 in
+                # place instead of preserving, then let the normal path reshape
+                # and reorder it.
+                w = weight_t.cpu().numpy()
+                s = LazyTorchTensor.to_eager(self.model_tensors[scale_name]()).cpu().numpy()
+                orig_shape = w.shape           # [out_ch, 1, kernel_packed_bytes]
+                nvals = s.size
+                packed_flat = w.reshape(-1, w.shape[-1])
+                # unpack each row's 6-bit codes (row length is a multiple of 3
+                # bytes -- kernel dims here are always 4 elements/group per Quark)
+                nrows, nbytes = packed_flat.shape
+                assert nbytes % 3 == 0, f"mxfp6-native: conv1d packed row {nbytes} not a multiple of 3 bytes"
+                ngroups = nbytes // 3
+                b0 = packed_flat[:, 0::3].astype(np.uint16)
+                b1 = packed_flat[:, 1::3].astype(np.uint16)
+                b2 = packed_flat[:, 2::3].astype(np.uint16)
+                v0 = b0 & 0x3F
+                v1 = ((b0 >> 6) & 0x3) | ((b1 & 0xF) << 2)
+                v2 = ((b1 >> 4) & 0xF) | ((b2 & 0x3) << 4)
+                v3 = (b2 >> 2) & 0x3F
+                codes = np.stack([v0, v1, v2, v3], axis=-1).reshape(nrows, ngroups * 4).astype(np.uint8)
+                codes = codes[:, :nvals // nrows] if nrows else codes
+                escale = s.reshape(nrows, -1)
+                deq = e8m0_dequant(codes, escale).reshape(orig_shape[0], orig_shape[1], -1)
+                deq_t = torch.from_numpy(deq).to(torch.bfloat16)
+                self.model_tensors[name] = (lambda t=deq_t: t)
+                self.model_tensors.pop(scale_name, None)
+                logger.info(f"mxfp6-native: dequantized depthwise conv1d {name} -> bf16 (arch reshape path)")
+                continue
+
+            wbytes = weight_t.cpu().numpy()
+            sarr = LazyTorchTensor.to_eager(self.model_tensors[scale_name]()).cpu().numpy().astype(np.uint8)
+            consumed += [name, scale_name]
+
+            m = re.search(r'\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$', name)
+            if m and n_experts > 0:
+                bid_m = re.search(r'\.layers\.(\d+)\.', name)
+                bid = int(bid_m.group(1)) if bid_m else 0
+                key = (bid, m.group(2))
+                expert_parts.setdefault(key, []).append((int(m.group(1)), wbytes, sarr))
+                if len(expert_parts[key]) >= n_experts:
+                    self._flush_mxfp6_experts(key, expert_parts)
+            else:
+                wbytes_t = torch.from_numpy(wbytes)
+                sarr_t = torch.from_numpy(sarr)
+                wbytes_t, sarr_t = self._transform_mxfp6_weight(name, wbytes_t, sarr_t)
+                wbytes2 = wbytes_t.numpy()
+                sarr2 = sarr_t.numpy()
+                new_name = self.map_tensor_name(name)
+                raw = gguf.quants.pack_mxfp6_preserve(wbytes2, sarr2)
+                logger.info(f"mxfp6-native: packed {new_name} {list(wbytes2.shape)} as MXFP6 (preserved)")
+                self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.MXFP6)
+
+        for key in list(expert_parts.keys()):
+            self._flush_mxfp6_experts(key, expert_parts)  # fallback flush if n_experts unknown
+
+        for name in consumed:
+            self.model_tensors.pop(name, None)
+
+    def _flush_mxfp4_experts(self, key, expert_parts):
+        bid, proj = key
+        parts = expert_parts.pop(key)
+        parts.sort(key=lambda x: x[0])                              # order by expert id
+        weights = np.stack([p[1] for p in parts], axis=0)          # [n_expert, rows, cols_packed]
+        scales = np.stack([p[2] for p in parts], axis=0)           # [n_expert, rows, nblk]
+        raw = gguf.quants.pack_mxfp4_preserve(weights, scales)
+        new_name = self.map_tensor_name(f"model.layers.{bid}.mlp.experts.{proj}.weight")
+        logger.info(f"mxfp4-native: packed {new_name} [{weights.shape[0]} experts] as MXFP4 (preserved)")
+        self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
+
+    def _generate_mxfp4_preserve_tensors(self):
+        """T185: re-block a Quark OCP MXFP4 (E2M1, dtype="fp4", per_group/
+        group_size=32, scale_format="e8m0") source straight into ggml
+        block_mxfp4 WITHOUT dequantizing. Dense/MoE-symmetric twin of
+        _generate_mxfp6_preserve_tensors, but the packing delta is a PURE
+        nibble-interleave reshuffle rather than a bit-identical copy (see
+        pack_mxfp4_preserve's docstring): Quark's Pack_fp4 packs 2 codes/byte
+        SEQUENTIALLY (code[2i]|code[2i+1]<<4), ggml's block_mxfp4 packs them
+        SPLIT-HALF (code[j]|code[j+16]<<4) -- verified bit-exact round-trip
+        against Quark's own scaled_real_quantize output (2026-07-24, both
+        codebooks are the identical OCP E2M1 grid {0,.5,1,1.5,2,3,4,6} at
+        the SAME 4-bit code, so this is a repack, not a requant).
+
+        No conv1d/irregular-scale special case has been observed for MXFP4
+        sources (unlike MXFP6's GatedDeltaNet case) -- if a group_size<32
+        tensor turns up, pack_mxfp4_preserve's shape assert will fail loudly
+        rather than silently mis-packing it.
+        """
+        n_experts = self.find_hparam(["num_local_experts", "num_experts", "n_routed_experts"], optional=True) or 0
+        expert_parts: dict[tuple[int, str], list[tuple[int, np.ndarray, np.ndarray]]] = {}
+        consumed: list[str] = []
+
+        for name in list(self.model_tensors.keys()):
+            if not name.endswith(".weight"):
+                continue
+            scale_name = name + "_scale"
+            if scale_name not in self.model_tensors:
+                continue
+            weight_t = LazyTorchTensor.to_eager(self.model_tensors[name]())
+            if weight_t.dtype != torch.uint8:
+                continue
+
+            wbytes = weight_t.cpu().numpy()
+            sarr = LazyTorchTensor.to_eager(self.model_tensors[scale_name]()).cpu().numpy().astype(np.uint8)
+            consumed += [name, scale_name]
+
+            m = re.search(r'\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$', name)
+            if m and n_experts > 0:
+                bid_m = re.search(r'\.layers\.(\d+)\.', name)
+                bid = int(bid_m.group(1)) if bid_m else 0
+                key = (bid, m.group(2))
+                expert_parts.setdefault(key, []).append((int(m.group(1)), wbytes, sarr))
+                if len(expert_parts[key]) >= n_experts:
+                    self._flush_mxfp4_experts(key, expert_parts)
+            else:
+                new_name = self.map_tensor_name(name)
+                raw = gguf.quants.pack_mxfp4_preserve(wbytes, sarr)
+                logger.info(f"mxfp4-native: packed {new_name} {list(wbytes.shape)} as MXFP4 (preserved)")
+                self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
+
+        for key in list(expert_parts.keys()):
+            self._flush_mxfp4_experts(key, expert_parts)  # fallback flush if n_experts unknown
+
+        for name in consumed:
+            self.model_tensors.pop(name, None)
 
     def _generate_mxfp8_preserve_tensors(self):
         """ROC8: re-block MLX `mx.quantize(mode="mxfp8")` tensors (group_size=32,
@@ -1050,6 +1283,43 @@ class ModelBase:
         for name in consumed:
             self.model_tensors.pop(name, None)
 
+    def _generate_mxfp8_preserve_tensors_quark(self):
+        """T185: Quark-native twin of _generate_mxfp8_preserve_tensors, for a
+        hypothetical Quark mx/e4m3 (per_group=32, e8m0) export -- NOT reachable
+        with Quark 0.12.post1 (see the is_quark_mxfp8 comment in
+        prepare_tensors: the installed real-quantize kernel has no per_group
+        path for fp8_e4m3), but written and unit-tested against a synthetic
+        tensor so the GGUF-side half of the bridge is proven-correct and ready
+        the moment a Quark version adds MX-fp8 support. Unlike MLX's mxfp8
+        (uint32-packed, 4 bytes/word, `.scales` sibling), a Quark fp8_e4m3
+        tensor is already 1 raw byte/value (torch.float8_e4m3fn, same as
+        _generate_fp8_preserve_tensors) with a `.weight_scale` sibling -- so
+        this is the fp8-byte-layout arm of _generate_mxfp8_preserve_tensors,
+        reusing the same pack_mxfp8_preserve(e4m3_bytes, e8m0_scale) packer.
+        """
+        consumed: list[str] = []
+        for name in list(self.model_tensors.keys()):
+            if not name.endswith(".weight"):
+                continue
+            scale_name = name + "_scale"
+            if scale_name not in self.model_tensors:
+                continue
+            weight = LazyTorchTensor.to_eager(self.model_tensors[name]())
+            if weight.dtype != torch.float8_e4m3fn:
+                continue
+            scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
+            if scale.dtype != torch.uint8:
+                continue
+            wbytes = weight.view(torch.uint8).cpu().numpy()
+            sarr = scale.contiguous().cpu().numpy().astype(np.uint8)
+            consumed += [name, scale_name]
+            new_name = self.map_tensor_name(name)
+            raw = gguf.quants.pack_mxfp8_preserve(wbytes, sarr)
+            logger.info(f"mxfp8-native (quark): packed {new_name} as MXFP8 (preserved)")
+            self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.MXFP8)
+        for name in consumed:
+            self.model_tensors.pop(name, None)
+
     def prepare_tensors(self):
         # detect NVFP4 quantization (ModelOpt and Compressed-tensors formats)
         quantization_config = self.hparams.get("quantization_config") or {}
@@ -1092,6 +1362,33 @@ class ModelBase:
         self._is_nvfp4 = quant_algo == "NVFP4"
         self._is_mxfp4 = quant_method == "mxfp4"
 
+        # NVFP4-native (T185: Quark's own FP4Block16ScaleE4M3Scheme / "nvfp4"
+        # scheme). Quark CAN produce genuine NVFP4 -- confirmed empirically
+        # 2026-07-24, correcting an earlier "this Quark install has no nvfp4
+        # pack path" finding (that check apparently missed the ScaleQuantSpec
+        # two-stage scheme). Its file2file wire format is a two-stage
+        # QTensorConfig list (stage0: dtype=fp4, qscheme=per_group,
+        # group_size=16; stage1: dtype=fp8_e4m3, is_scale_quant=True) and it
+        # writes tensors named exactly like NVIDIA ModelOpt's NVFP4 (`<name>.
+        # weight` u8 nibble-packed group16, `<name>.weight_scale` F8_E4M3
+        # per-group block scale, `<name>.weight_scale_2` F32 per-tensor global
+        # scale) -- BYTE-IDENTICAL to what _generate_nvfp4_tensors/_nvfp4_pack
+        # already consume for ModelOpt, so no new packer was needed, only this
+        # detection branch. Gated behind --nvfp4-native (unlike ModelOpt's
+        # always-on quant_algo=="NVFP4" detection above) so an ordinary Quark
+        # int4/uint4 or other checkpoint is never silently reinterpreted.
+        gqc_weight = (quantization_config.get("global_quant_config") or {}).get("weight") \
+            if isinstance(quantization_config, dict) else None
+        is_quark_nvfp4 = (
+            quant_method == "quark"
+            and isinstance(gqc_weight, list) and len(gqc_weight) == 2
+            and isinstance(gqc_weight[0], dict) and isinstance(gqc_weight[1], dict)
+            and gqc_weight[0].get("dtype") == "fp4" and gqc_weight[0].get("qscheme") == "per_group"
+            and gqc_weight[1].get("is_scale_quant") is True
+        )
+        if self._nvfp4_native and is_quark_nvfp4:
+            self._is_nvfp4 = True
+
         # NVFP4 weights are repacked and written directly to gguf_writer.
         # This must run before dequant_model so NVFP4 tensors are removed
         # from model_tensors, leaving only non-NVFP4 (e.g. FP8) for dequant.
@@ -1123,7 +1420,17 @@ class ModelBase:
         # FP8-native (Quark bridge): preserve vendor e4m3 into block_f8e4m3 before
         # dequant_model would otherwise dequantize it. Must run before dequant_model
         # so the packed tensors are removed from model_tensors.
-        if self._fp8_native and quant_method in ("compressed-tensors", "fp8", "modelopt"):
+        # "quark" added (T185): Quark's own per-tensor/per-channel fp8_e4m3 or
+        # fp8_e5m2 weight-only export (file2file quantize_model_per_safetensor,
+        # FP8E4M3/FP8E5M2 *PerTensorSpec) lands here with real torch.float8_e4m3fn/
+        # e5m2 tensors + a scalar/per-channel "<name>.weight_scale" sibling --
+        # byte-for-byte the same shape contract _generate_fp8_preserve_tensors
+        # already handles for compressed-tensors/modelopt (the function's own
+        # internal dtype guard, `weight.dtype not in (e4m3fn, e5m2): continue`,
+        # already no-ops on anything else Quark might tag "quark", e.g. a
+        # per-group MX or fp6/fp4 weight -- those are handled by the dedicated
+        # is_quark_mxfp8/is_quark_mxfp6/is_quark_mxfp4 branches below).
+        if self._fp8_native and quant_method in ("compressed-tensors", "fp8", "modelopt", "quark"):
             self._generate_fp8_preserve_tensors()
 
         # MXFP8-native (ROC8): MLX `mx.quantize(mode="mxfp8")` sources (e.g.
@@ -1138,6 +1445,70 @@ class ModelBase:
         )
         if self._mxfp8_native and is_mlx_mxfp8:
             self._generate_mxfp8_preserve_tensors()
+
+        # MXFP6-native (T184: Quark OCP MXFP6 E3M2 bridge, e.g. Ornith-1.0-35B).
+        # Detected off the standard "quantization_config" key (unlike MLX MXFP8's
+        # nonstandard "quantization" key above) -- Quark's per_group/e8m0 fp6_e3m2
+        # weight config is what create_pack_method uses to select Pack_fp6.
+        # NOTE: gqc_weight (computed above, for the NVFP4 stage-list check) is
+        # a LIST for the two-stage NVFP4 scheme -- global_wcfg here must stay
+        # dict-only (single-stage fp6/fp4/fp8 schemes), so guard the type
+        # rather than reusing gqc_weight directly.
+        global_wcfg = gqc_weight if isinstance(gqc_weight, dict) else {}
+        is_quark_mxfp6 = (
+            quant_method == "quark"
+            and global_wcfg.get("dtype") == "fp6_e3m2"
+            and global_wcfg.get("scale_format") == "e8m0"
+            and global_wcfg.get("group_size") == 32
+        )
+        if self._mxfp6_native and is_quark_mxfp6:
+            self._generate_mxfp6_preserve_tensors()
+            # dequant_model() has no "quark" branch (only bitnet/fp8/gptq/
+            # compressed-tensors/modelopt) and its catch-all raises
+            # NotImplementedError for any unrecognized quant_method that is
+            # still set -- but _generate_mxfp6_preserve_tensors already fully
+            # consumed every fp6_e3m2 .weight/.weight_scale pair (T184), so
+            # neutralize quant_method to make the no-op fall-through explicit
+            # instead of tripping that catch-all on a checkpoint we've already
+            # handled.
+            quantization_config["quant_method"] = None
+
+        # MXFP4-native (T185: Quark OCP MXFP4 E2M1 bridge). Quark's own
+        # OCP_MXFP4Spec sets dtype="fp4" (NOT dtype="mx"/mx_element_dtype="fp4"
+        # -- create_pack_method's `dtype == "mx"` branch is never taken for this
+        # scheme, see pack_mxfp4_preserve docstring), per_group/group_size=32,
+        # scale_format="e8m0" -- structurally identical detection shape to
+        # is_quark_mxfp6 above, just a different dtype string.
+        is_quark_mxfp4 = (
+            quant_method == "quark"
+            and global_wcfg.get("dtype") == "fp4"
+            and global_wcfg.get("scale_format") == "e8m0"
+            and global_wcfg.get("group_size") == 32
+        )
+        if self._mxfp4_native and is_quark_mxfp4:
+            self._generate_mxfp4_preserve_tensors()
+
+        # MXFP8-native (T185: Quark mx/e4m3 bridge attempt). NOTE: as of Quark
+        # 0.12.post1, this dtype combination cannot actually be PRODUCED by
+        # Quark's own real-quantize kernel -- DTYPE_TO_REAL_QUANTIZE_FUNCS maps
+        # Dtype.fp8_e4m3 unconditionally to real_quantize_fp8_e4m3, which only
+        # implements per_tensor/per_channel (raises ValueError on qscheme=
+        # per_group); the separate MX per-group path (non_scaled_real_quantize/
+        # real_quantize_mxfp) is hard-asserted to mx_element_dtype in
+        # {fp4, fp6_e2m3, fp6_e3m2} only, excluding fp8_e4m3/e5m2 entirely.
+        # This detection branch is wired (mirrors is_quark_mxfp6/mxfp4 exactly)
+        # so the bridge is READY the moment a Quark version adds MX-fp8 support,
+        # but it is UNREACHABLE with the installed Quark and therefore NOT
+        # serve-verified -- see the T185 per-format table (do not claim this
+        # path works from code presence alone).
+        is_quark_mxfp8 = (
+            quant_method == "quark"
+            and global_wcfg.get("dtype") == "fp8_e4m3"
+            and global_wcfg.get("scale_format") == "e8m0"
+            and global_wcfg.get("group_size") == 32
+        )
+        if self._mxfp8_native and is_quark_mxfp8:
+            self._generate_mxfp8_preserve_tensors_quark()
 
         self.dequant_model()
 
@@ -1249,6 +1620,23 @@ class ModelBase:
                         # FP8-native: quantized weights are preserved as F8E4M3 in
                         # _generate_fp8_preserve_tensors; anything reaching here is a
                         # non-quantized (vendor 'ignore') tensor -> keep it in F16.
+                        data_qtype = gguf.GGMLQuantizationType.F16
+                    elif self.ftype == gguf.LlamaFileType.MOSTLY_MXFP8:
+                        # MXFP8-native: same story as F8E4M3 above.
+                        data_qtype = gguf.GGMLQuantizationType.F16
+                    elif self.ftype == gguf.LlamaFileType.MOSTLY_MXFP6:
+                        # MXFP6-native (T184): quantized weights are preserved as
+                        # MXFP6 in _generate_mxfp6_preserve_tensors; anything
+                        # reaching here is a non-quantized ("exclude" list: token
+                        # embeddings, lm_head, MoE router gate) tensor -> keep F16.
+                        data_qtype = gguf.GGMLQuantizationType.F16
+                    elif self.ftype == gguf.LlamaFileType.MOSTLY_MXFP4:
+                        # MXFP4-native (T185): quantized weights are preserved as
+                        # MXFP4 in _generate_mxfp4_preserve_tensors; anything
+                        # reaching here is a non-quantized (excluded) tensor ->
+                        # keep F16. (Distinct from the pre-existing gpt-oss
+                        # MOSTLY_MXFP4_MOE path / self._is_mxfp4, which is a
+                        # different detection+ftype for a different source format.)
                         data_qtype = gguf.GGMLQuantizationType.F16
                     else:
                         raise ValueError(f"Unknown file type: {self.ftype.name}")
