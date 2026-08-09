@@ -98,7 +98,15 @@ ggml_add_backend_library(ggml-hip
 # any machine without the local ck-ref research checkout.
 set(GGML_HIP_CK_REF_DIR "$ENV{HOME}/src/ck-ref" CACHE PATH
     "Optional local Composable Kernel checkout for the experimental int4-weight WMMA route")
-if (EXISTS "${GGML_HIP_CK_REF_DIR}/include")
+# Test for the GENERATED header, not just include/: a partially-configured CK
+# checkout has include/ck/config.h.in but no generated config.h, and ck.hpp
+# unconditionally #includes "ck/config.h". Keying on include/ alone opts this
+# TU into the CK path, __has_include then finds the CK device-op header, and
+# the build dies on 'ck/config.h file not found' from a fresh clone on any
+# machine with an unconfigured ~/src/ck-ref. Requiring the generated header
+# means an unconfigured checkout is skipped -> __has_include falls back to the
+# stub (safe: ggml_cuda_iu4_ck_wmma_supports() is unconditionally false).
+if (EXISTS "${GGML_HIP_CK_REF_DIR}/include/ck/config.h")
     set_source_files_properties(../ggml-cuda/mul_mat_iu4_ck_wmma.cu PROPERTIES
         INCLUDE_DIRECTORIES "${GGML_HIP_CK_REF_DIR}/include;${GGML_HIP_CK_REF_DIR}/library/include")
 endif()
