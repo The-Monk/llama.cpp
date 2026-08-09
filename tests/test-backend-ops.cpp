@@ -8475,6 +8475,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 2, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
+    // fp8 MoE (MUL_MAT_ID): the Quacken-*-A3B-FP8 GGUFs published to HF route
+    // their experts through this path, and F8E4M3 was only ever in test_mul_mat
+    // (dense), never test_mul_mat_id -- so the shipped fp8-MoE correctness had
+    // no automated gate. n=1 exercises the decode (per-token expert) path, n=8
+    // a small verify/prefill batch. If the ROCm backend does not support
+    // MUL_MAT_ID for F8E4M3 the case is skipped (not failed), so this is safe.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F8E4M3, GGML_TYPE_F32, 128, 8, false, 768, 1, 2048)); // Qwen3.6-35B-A3B-style fp8 MoE
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F8E4M3, GGML_TYPE_F32, 128, 8, false, 768, 8, 2048)); // Qwen3.6-35B-A3B-style fp8 MoE
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
@@ -8520,6 +8528,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E4M3, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E5M2, GGML_TYPE_F32, 4096,  1, 4096, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E5M2, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
+
+    // MXFP6 (OCP MX, e3m2 + per-32 e8m0 scale): the advertised decode-role
+    // format ("the only decode win"), and it rides the e4m3 fp8 compute path.
+    // It has a FULL CPU reference -- ggml_vec_dot_mxfp6_f32 + quantize_row_mxfp6
+    // (ggml-cpu.c type_traits_cpu) -- so the suite CAN build the comparison,
+    // unlike Q2_0/MXFP8 (which lack a CPU vec_dot and are correctly excluded
+    // above). It had ZERO coverage before this: same gate-blind-spot class as
+    // the fp8/IU4 cases above. n=1 decode + n=2 batch at real hidden sizes.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP6, GGML_TYPE_F32, 4096,  1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP6, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP6, GGML_TYPE_F32, 4096,  2, 4096, {1, 1}, {1, 1}));
 
 
 #if 0
