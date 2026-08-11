@@ -429,8 +429,15 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_Q2_0    = 42, // PrismML ternary 2-bit (g128)
+        GGML_TYPE_F8E4M3  = 43, // signed e4m3 weights + per-block fp16 scale (Path X)
+        GGML_TYPE_F8E5M2  = 44, // signed e5m2 (bf8) weights + per-block fp16 scale (T97)
+        GGML_TYPE_2OF4_FP8 = 45, // RDNA4 2:4-structured-sparse fp8 (SWMMAC driver-completeness run)
+        GGML_TYPE_MXFP8   = 46, // MXFP8 (OCP MX): e4m3 weights + per-32-block e8m0 shared scale (mx.quantize)
+        GGML_TYPE_IU4     = 47, // signed int4 x int4 W4A4, native RDNA4 WMMA -- EXPERIMENTAL, model-blocked (see comment at IU4 kernel registration)
+        GGML_TYPE_2OF4_F16 = 48, // RDNA4 2:4-structured-sparse fp16 (card 141, native SWMMAC f16 A/B, fp32 accumulate)
+        GGML_TYPE_MXFP6   = 49, // MXFP6 (OCP MX): e3m2 weights (6-bit packed) + per-32-block e8m0 shared scale, rides the e4m3 fp8 compute path (mx.quantize)
+        GGML_TYPE_COUNT   = 50,
     };
 
     // precision
@@ -474,7 +481,14 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
-        GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_F8E4M3  = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_F8E5M2  = 29, // except 1d tensors
+        GGML_FTYPE_MOSTLY_2OF4_FP8 = 30, // except 1d tensors (RDNA4 2:4-sparse SWMMAC)
+        GGML_FTYPE_MOSTLY_MXFP8   = 31, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IU4     = 32, // except 1d tensors -- EXPERIMENTAL, model-blocked
+        GGML_FTYPE_MOSTLY_2OF4_F16 = 33, // except 1d tensors (card 141, RDNA4 2:4-sparse SWMMAC fp16)
+        GGML_FTYPE_MOSTLY_MXFP6   = 34, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q2_0    = 35, // except 1d tensors (PrismML ternary 2-bit g128)
     };
 
     // available tensor operations:

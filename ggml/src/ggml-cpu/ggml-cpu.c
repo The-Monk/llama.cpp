@@ -295,6 +295,55 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    [GGML_TYPE_F8E4M3] = {
+        // card 151: correctness-fallback CPU entry -- see quants.c for why
+        // this exists (was NULL -> SIGSEGV whenever the backend scheduler
+        // kept a small-batch fp8 matmul on the CPU). vec_dot_type = F32 (no
+        // activation-quantization step) since this path trades speed for
+        // simplicity/correctness; it's not meant to be fast.
+        .from_float               = quantize_row_f8e4m3,
+        .vec_dot                  = ggml_vec_dot_f8e4m3_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_F8E5M2] = {
+        // Stage 25: same "card 151" gap as F8E4M3 above, just missed when
+        // F8E5M2 was added later (T97) -- found the same way as the
+        // Stage-23 IU4 fix: adding a test-backend-ops MUL_MAT case for it
+        // (to validate the already-shipped T79/card-137 native fp8/bf8
+        // dot4 decode paths, vecdotq.cuh) would have hit a NULL vec_dot.
+        .from_float               = quantize_row_f8e5m2,
+        .vec_dot                  = ggml_vec_dot_f8e5m2_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_MXFP6] = {
+        // ROC8: same correctness-fallback role as F8E4M3 above -- this type's
+        // real compute path is the GPU mmvq decode kernel (dp4a/hardware-dot2
+        // over e4m3-upconverted E3M2 weights); this CPU entry only exists so
+        // an accidental CPU-side dispatch dequantizes-and-dots instead of
+        // hitting a NULL vec_dot (card 151 lesson).
+        .from_float               = quantize_row_mxfp6,
+        .vec_dot                  = ggml_vec_dot_mxfp6_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_IU4] = {
+        // T170 / Stage 23: found the SAME "card 151" class of bug live --
+        // GGML_TYPE_IU4 had NO entry here at all (NULL vec_dot) until this,
+        // which SIGSEGV'd the moment a real ggml_tensor-based MUL_MAT test
+        // case (test-backend-ops' GPU-vs-CPU correctness comparison) was
+        // added for it for the first time; every prior IU4 validation
+        // bypassed the CPU reference entirely via hand-packed selftests.
+        // This type's real compute path is the GPU (mmvq_iu4.cu's dot8
+        // decode kernel at M=1, or mul_mat_iu4{,_mmq}.cu's WMMA GEMM at
+        // M>1); this CPU entry exists purely so an accidental/test-harness
+        // CPU-side dispatch dequantizes-and-dots instead of crashing.
+        .from_float               = quantize_row_iu4,
+        .vec_dot                  = ggml_vec_dot_iu4_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q2_K] = {
         .from_float               = quantize_row_q2_K,
         .vec_dot                  = ggml_vec_dot_q2_K_q8_K,

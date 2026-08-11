@@ -4263,6 +4263,39 @@ struct test_mul_mat : public test_case {
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }
+        // T170 / Stage 23: GGML_TYPE_IU4 quantizes BOTH weight AND
+        // activation to signed int4 ([-8,7], amax/7 symmetric per 32-elem
+        // block) -- a coarser noise floor than the int8/q8_1 activations
+        // every other quantized type here compares against, for the same
+        // reason the Blackwell mxfp4 case above needs a looser tolerance.
+        // Measured directly (isolated PoC, Stage 20): ~0.10-0.14 relative
+        // L2 error on random Gaussian data; observed here (real
+        // ggml_tensor path, CPU-reference dequant-and-dot compare):
+        // ~0.0046 ERR at K=4096 -- not a correctness bug (see
+        // ~/int4-research/FINDINGS.md Stage 20/23 for the isolated A/B
+        // that separated int4-quant noise from actual arithmetic bugs,
+        // both on this exact kernel).
+        if (type_a == GGML_TYPE_IU4) {
+            return 1e-2;
+        }
+        // Stage 25: F8E4M3's default (always-on since T79) native fp8xfp8
+        // v_dot4_f32_fp8_fp8 decode quantizes BOTH operands to fp8, a
+        // slightly coarser noise floor than the int8/q8_1-activation
+        // baseline the default 5e-4 tolerance assumes -- observed ERR
+        // ~0.00057-0.00059 at K=4096 (just over 5e-4), matching T79's own
+        // disclosed +1.2-1.5% relative PPL cost on real models. Not a bug.
+        if (type_a == GGML_TYPE_F8E4M3) {
+            return 1e-3;
+        }
+        // F8E5M2: default (int8 activation) already clears 5e-4; the
+        // opt-in GGML_HIP_F8E5M2_DOT4=1 bf8xbf8 path (card 137) has a
+        // larger, already-disclosed +2.5% relative PPL cost (e5m2's 2
+        // mantissa bits are a strictly coarser activation quantization
+        // step than F8E4M3's) -- observed ERR ~0.0024-0.0025 with the flag
+        // on. One tolerance covers both configurations.
+        if (type_a == GGML_TYPE_F8E5M2) {
+            return 5e-3;
+        }
         return max_nmse_err();
     }
 
@@ -7997,6 +8030,11 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q1_0,
     GGML_TYPE_Q2_0,
     GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
+    // NOT ADDABLE YET: GGML_TYPE_Q2_0 and GGML_TYPE_MXFP8 have type_traits
+    // entries but NO CPU vec_dot/quantize implementation, so the suite cannot
+    // build the reference it compares against and segfaults on the first case.
+    // This is why those two types have zero coverage -- and why a route over them
+    // can drift undetected. Adding them requires writing the CPU reference first.
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
     GGML_TYPE_Q6_K,
@@ -8856,6 +8894,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 2, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
+    // fp8 MoE (MUL_MAT_ID): the Quacken-*-A3B-FP8 GGUFs published to HF route
+    // their experts through this path, and F8E4M3 was only ever in test_mul_mat
+    // (dense), never test_mul_mat_id -- so the shipped fp8-MoE correctness had
+    // no automated gate. n=1 exercises the decode (per-token expert) path, n=8
+    // a small verify/prefill batch. If the ROCm backend does not support
+    // MUL_MAT_ID for F8E4M3 the case is skipped (not failed), so this is safe.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F8E4M3, GGML_TYPE_F32, 128, 8, false, 768, 1, 2048)); // Qwen3.6-35B-A3B-style fp8 MoE
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F8E4M3, GGML_TYPE_F32, 128, 8, false, 768, 8, 2048)); // Qwen3.6-35B-A3B-style fp8 MoE
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
@@ -8874,6 +8920,49 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n : {1, 7, 8, 9, 16, 128, 512}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 2048, {1, 1}, {1, 1}));
     }
+    // T170 / Stage 23: dot8 int4-drafter decode path (mmvq_iu4.cu), targeted
+    // MUL_MAT cases at n=1 (M=1, decode/drafter -- routes to the new
+    // v_dot8_i32_iu4 GEMV kernel when GGML_HIP_IU4_MMVQ_DECODE is set) at
+    // the real hidden-size shapes validated in the isolated PoC
+    // (~/int4-research/pocs/dot8-int4-decode/decode_poc.hip, Stage 20:
+    // K=4096, N in {4096, 14336}), plus an n=2 (M=2) case to confirm the
+    // existing WMMA path (mul_mat_iu4.cu) is untouched and still correct
+    // for M>1 regardless of whether the new decode env var is set.
+    // GGML_TYPE_IU4 is EXPERIMENTAL/model-blocked (see block_iu4 comment in
+    // ggml-common.h) -- these cases only run against the CPU reference
+    // backend's own quantize_row_iu4_ref, same as every other quantized
+    // type here, no real GGUF model needed.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 4096,  1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 4096,  2, 4096, {1, 1}, {1, 1}));
+
+    // Stage 25: F8E4M3/F8E5M2 had ZERO test-backend-ops MUL_MAT coverage at
+    // all before this (found while re-validating the already-shipped T79/
+    // card-137 native fp8/bf8 V_DOT4 decode paths, vecdotq.cuh) -- same gap
+    // class as IU4 above, just never noticed because these types' real
+    // validation has always been real-model PPL runs, not this harness.
+    // n=1 (M=1, decode) at a real hidden size exercises: F8E4M3 -> the
+    // default/unconditional vec_dot_f8e4m3_f8e4m3_dispatch (T79,
+    // v_dot4_f32_fp8_fp8, always-on since it superseded the int8-activation
+    // path entirely); F8E5M2 -> the DEFAULT int8-activation path unless
+    // GGML_HIP_F8E5M2_DOT4=1 (card 137, opt-in bf8xbf8 v_dot4_f32_bf8_bf8,
+    // off by default on a measured accuracy/speed tradeoff -- see mmvq.cu).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E4M3, GGML_TYPE_F32, 4096,  1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E4M3, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E5M2, GGML_TYPE_F32, 4096,  1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E5M2, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
+
+    // MXFP6 (OCP MX, e3m2 + per-32 e8m0 scale): the advertised decode-role
+    // format ("the only decode win"), and it rides the e4m3 fp8 compute path.
+    // It has a FULL CPU reference -- ggml_vec_dot_mxfp6_f32 + quantize_row_mxfp6
+    // (ggml-cpu.c type_traits_cpu) -- so the suite CAN build the comparison,
+    // unlike Q2_0/MXFP8 (which lack a CPU vec_dot and are correctly excluded
+    // above). It had ZERO coverage before this: same gate-blind-spot class as
+    // the fp8/IU4 cases above. n=1 decode + n=2 batch at real hidden sizes.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP6, GGML_TYPE_F32, 4096,  1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP6, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP6, GGML_TYPE_F32, 4096,  2, 4096, {1, 1}, {1, 1}));
+
 
 #if 0
     {
@@ -9932,6 +10021,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+
+    // T170 / Stage 23: dot8 int4-drafter decode path perf, real hidden-size
+    // shapes matching the isolated PoC exactly (K=4096, N in {4096, 14336},
+    // M=1 -- ~/int4-research/pocs/dot8-int4-decode/decode_poc.hip, Stage 20)
+    // so in-tree perf here is directly comparable to that PoC's numbers.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 4096,  1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
+
+    // Stage 26: fp8 native dot4 decode perf (T79 F8E4M3 default, card-137
+    // F8E5M2 opt-in) at the same K=4096, N in {4096,14336}, M=1 shapes --
+    // these had eval coverage (Stage 25) but no perf cases before this.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E4M3, GGML_TYPE_F32, 4096,  1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E4M3, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E5M2, GGML_TYPE_F32, 4096,  1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8E5M2, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {

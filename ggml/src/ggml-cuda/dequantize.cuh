@@ -28,11 +28,9 @@ static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const in
 
     const float d = x[ib].d;
 
-    // Q2_0: 2 bits per element, 4 elements per byte.
-    // Stored code c in {0,1,2,3} maps to symbol s = c - 1 in {-1, 0, +1, +2}.
-    const int byte_index_0 = iqs / 4;
-    const int bit_offset_0 = (iqs % 4) * 2;
-
+    // Q2_0: 2 bits per element, 4 elements per byte. code c in {0,1,2,3} -> symbol c-1 in {-1,0,+1,+2}
+    const int byte_index_0 = iqs       / 4;
+    const int bit_offset_0 = (iqs      % 4) * 2;
     const int byte_index_1 = (iqs + 1) / 4;
     const int bit_offset_1 = ((iqs + 1) % 4) * 2;
 
@@ -449,4 +447,55 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
         y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] & 0xf]*0.5f);
         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
     }
+static __device__ __forceinline__ void dequantize_f8e4m3(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_f8e4m3 * x = (const block_f8e4m3 *) vx;
+
+    const float d = x[ib].d;
+
+    v.x = ggml_cuda_e4m3_to_fp32(x[ib].qs[iqs + 0]) * d;
+    v.y = ggml_cuda_e4m3_to_fp32(x[ib].qs[iqs + 1]) * d;
+}
+
+static __device__ __forceinline__ void dequantize_f8e5m2(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_f8e5m2 * x = (const block_f8e5m2 *) vx;
+
+    const float d = x[ib].d;
+
+    v.x = ggml_cuda_e5m2_to_fp32(x[ib].qs[iqs + 0]) * d;
+    v.y = ggml_cuda_e5m2_to_fp32(x[ib].qs[iqs + 1]) * d;
+}
+
+// MXFP8 (ROC8): mechanical mirror of dequantize_f8e4m3 above -- same e4m3 leaf
+// decode, only the scale source differs (shared e8m0 byte, not a per-block
+// fp16 half).
+static __device__ __forceinline__ void dequantize_mxfp8(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_mxfp8 * x = (const block_mxfp8 *) vx;
+
+    const float d = ggml_cuda_e8m0_to_fp32(x[ib].e);
+
+    v.x = ggml_cuda_e4m3_to_fp32(x[ib].qs[iqs + 0]) * d;
+    v.y = ggml_cuda_e4m3_to_fp32(x[ib].qs[iqs + 1]) * d;
+}
+
+// ROC8: MXFP6 -- same shared e8m0 scale as MXFP8 above, but the qs[] payload
+// is 6-bit-packed (4 codes / 3 bytes), not byte-per-value. `iqs` here is
+// always even (the dequantize_block_cont_cuda caller processes elements in
+// pairs) and (iqs, iqs+1) always fall in the SAME 4-value group (group size
+// 4 divides evenly into the stride-2 iteration), so one mxfp6_unpack4 call
+// covers both -- decode via the same lossless e3m2->e4m3->fp32 chain the
+// GPU vec_dot uses (ggml_cuda_e3m2_to_e4m3, mirrors ggml_e3m2_to_fp32 on the
+// CPU side bit-for-bit).
+static __device__ __forceinline__ void dequantize_mxfp6(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_mxfp6 * x = (const block_mxfp6 *) vx;
+
+    const float d = ggml_cuda_e8m0_to_fp32(x[ib].e);
+
+    const int g = iqs >> 2;
+    const int r = iqs & 3;
+
+    uint8_t codes[4];
+    mxfp6_unpack4(x[ib].qs + 3*g, codes);
+
+    v.x = ggml_cuda_e4m3_to_fp32(ggml_cuda_e3m2_to_e4m3(codes[r + 0])) * d;
+    v.y = ggml_cuda_e4m3_to_fp32(ggml_cuda_e3m2_to_e4m3(codes[r + 1])) * d;
 }

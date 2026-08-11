@@ -62,6 +62,157 @@ void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_nvfp4_ref(x, y, k);
 }
 
+// card 151: roc8 fp8 CPU reference fallback. type_traits_cpu[GGML_TYPE_F8E4M3]
+// previously had no entry at all (zero-initialized) -- .vec_dot was a NULL
+// function pointer, .vec_dot_type was 0 (== GGML_TYPE_F32 numerically, but
+// with .from_float also NULL so nothing actually converted anything). Any op
+// the ggml backend scheduler kept on the CPU (ggml_backend_cuda_device_
+// offload_op gates GPU offload on batch size >= GGML_OP_OFFLOAD_MIN_BATCH,
+// default 32 -- DFlash's mask-block draft matmul crosses under that
+// threshold once spec-draft-n-max >= 10, see mmvq.cu / card 151) called
+// straight into address 0 -> SIGSEGV inside ggml_compute_forward_mul_mat.
+//
+// This is a scalar, non-SIMD correctness fallback, NOT a speed path -- these
+// ops are supposed to run on the GPU (roc8's native fp8 WMMA/dp4a kernels);
+// this only exists so the rare small-batch CPU fallback degrades gracefully
+// instead of crashing. vec_dot_type is plain F32 (no activation-quantization
+// step) to keep this simple: dequantize src0's f8e4m3 row on the fly (reusing
+// the existing reference dequantize_row_f8e4m3, so it's bit-for-bit the same
+// math as the GPU path's dequant) and dot it against the f32 src1 row.
+void quantize_row_f8e4m3(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_f8e4m3_ref(x, y, k);
+}
+
+void ggml_vec_dot_f8e4m3_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+    GGML_ASSERT(nrc == 1);
+    GGML_ASSERT(n % QK_F8E4M3 == 0);
+
+    const block_f8e4m3 * GGML_RESTRICT x = (const block_f8e4m3 *) vx;
+    const float        * GGML_RESTRICT y = (const float        *) vy;
+
+    // dequantize in bounded chunks rather than a single n-sized VLA/alloca --
+    // n can be a full embedding/FFN row (thousands of elements).
+    const int64_t CHUNK = 512; // multiple of QK_F8E4M3 (32)
+    float tmp[CHUNK];
+
+    float sumf = 0.0f;
+    for (int64_t done = 0; done < n; done += CHUNK) {
+        const int64_t this_chunk = done + CHUNK <= n ? CHUNK : (n - done);
+        dequantize_row_f8e4m3(x + done / QK_F8E4M3, tmp, this_chunk);
+        for (int64_t j = 0; j < this_chunk; ++j) {
+            sumf += tmp[j] * y[done + j];
+        }
+    }
+
+    *s = sumf;
+}
+
+// Stage 25: same "card 151" gap found again -- GGML_TYPE_F8E5M2 had NO
+// type_traits_cpu entry either (only F8E4M3 got the fallback above; F8E5M2
+// was added later, T97, and this got missed). Found by the same method as
+// the IU4 fix (Stage 23): tried to add a test-backend-ops MUL_MAT case for
+// it and it would have hit a NULL vec_dot. Mechanical mirror of
+// quantize_row_f8e4m3/ggml_vec_dot_f8e4m3_f32 above.
+void quantize_row_f8e5m2(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_f8e5m2_ref(x, y, k);
+}
+
+void ggml_vec_dot_f8e5m2_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+    GGML_ASSERT(nrc == 1);
+    GGML_ASSERT(n % QK_F8E5M2 == 0);
+
+    const block_f8e5m2 * GGML_RESTRICT x = (const block_f8e5m2 *) vx;
+    const float         * GGML_RESTRICT y = (const float         *) vy;
+
+    const int64_t CHUNK = 512; // multiple of QK_F8E5M2 (32)
+    float tmp[CHUNK];
+
+    float sumf = 0.0f;
+    for (int64_t done = 0; done < n; done += CHUNK) {
+        const int64_t this_chunk = done + CHUNK <= n ? CHUNK : (n - done);
+        dequantize_row_f8e5m2(x + done / QK_F8E5M2, tmp, this_chunk);
+        for (int64_t j = 0; j < this_chunk; ++j) {
+            sumf += tmp[j] * y[done + j];
+        }
+    }
+
+    *s = sumf;
+}
+
+// MXFP6 (ROC8): mechanical mirror of ggml_vec_dot_f8e4m3_f32/quantize_row_f8e4m3
+// above -- same "scalar correctness-fallback, not a speed path" role (this
+// type's real compute is the GPU mmvq decode kernel; this only exists so an
+// accidental CPU fallback dequantizes-and-dots instead of crashing on a NULL
+// vec_dot, per the card 151 lesson documented on the F8E4M3 entry).
+void quantize_row_mxfp6(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp6_ref(x, y, k);
+}
+
+void ggml_vec_dot_mxfp6_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+    GGML_ASSERT(nrc == 1);
+    GGML_ASSERT(n % QK_MXFP6 == 0);
+
+    const block_mxfp6 * GGML_RESTRICT x = (const block_mxfp6 *) vx;
+    const float        * GGML_RESTRICT y = (const float        *) vy;
+
+    const int64_t CHUNK = 512; // multiple of QK_MXFP6 (32)
+    float tmp[CHUNK];
+
+    float sumf = 0.0f;
+    for (int64_t done = 0; done < n; done += CHUNK) {
+        const int64_t this_chunk = done + CHUNK <= n ? CHUNK : (n - done);
+        dequantize_row_mxfp6(x + done / QK_MXFP6, tmp, this_chunk);
+        for (int64_t j = 0; j < this_chunk; ++j) {
+            sumf += tmp[j] * y[done + j];
+        }
+    }
+
+    *s = sumf;
+}
+
+// T170 / Stage 23: GGML_TYPE_IU4 CPU fallback -- see the comment at
+// ggml_vec_dot_iu4_f32's declaration in quants.h. void*-signature wrapper
+// around quantize_row_iu4_ref, same pattern as quantize_row_mxfp6 above
+// (needed because .from_float's function-pointer type is `void*`, not
+// `block_iu4*`).
+void quantize_row_iu4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_iu4_ref(x, (block_iu4 *) y, k);
+}
+
+void ggml_vec_dot_iu4_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+    GGML_ASSERT(nrc == 1);
+    GGML_ASSERT(n % QK_IU4 == 0);
+
+    const block_iu4 * GGML_RESTRICT x = (const block_iu4 *) vx;
+    const float      * GGML_RESTRICT y = (const float      *) vy;
+
+    const int64_t CHUNK = 512; // multiple of QK_IU4 (32)
+    float tmp[CHUNK];
+
+    float sumf = 0.0f;
+    for (int64_t done = 0; done < n; done += CHUNK) {
+        const int64_t this_chunk = done + CHUNK <= n ? CHUNK : (n - done);
+        dequantize_row_iu4(x + done / QK_IU4, tmp, this_chunk);
+        for (int64_t j = 0; j < this_chunk; ++j) {
+            sumf += tmp[j] * y[done + j];
+        }
+    }
+
+    *s = sumf;
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //

@@ -5039,7 +5039,16 @@ class GGMLQuantizationType(IntEnum):
     MXFP4   = 39
     NVFP4   = 40
     Q1_0    = 41
-    Q2_0    = 42
+    Q2_0    = 42  # PrismML ternary 2-bit (g128), see GGML_TYPE_Q2_0 in ggml.h -- missing from
+                  # gguf-py until now; blocked gguf_dump/GGUFReader on every Bonsai/Ternary gguf
+                  # (card 147 MTP-warm-start POC hit this first while reading target_layers).
+    F8E4M3  = 43
+    F8E5M2  = 44
+    TWO_OF_FOUR_FP8 = 45
+    MXFP8   = 46
+    IU4     = 47  # EXPERIMENTAL, model-blocked (see GGML_TYPE_IU4 comment in ggml.h)
+    TWO_OF_FOUR_F16 = 48  # card 141, RDNA4 2:4-sparse SWMMAC fp16
+    MXFP6   = 49  # ROC8: OCP MX e3m2 (6-bit packed) + per-32-block e8m0 scale (T184)
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -5095,7 +5104,14 @@ class LlamaFileType(IntEnum):
     MOSTLY_MXFP4_MOE     = 38  # except 1d tensors
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
-    MOSTLY_Q2_0          = 41  # except 1d tensors
+    MOSTLY_F8E4M3        = 41  # except 1d tensors
+    MOSTLY_F8E5M2        = 42  # except 1d tensors
+    MOSTLY_2OF4_FP8      = 43  # except 1d tensors (RDNA4 2:4-sparse SWMMAC)
+    MOSTLY_MXFP8         = 44  # except 1d tensors
+    MOSTLY_IU4           = 45  # except 1d tensors -- EXPERIMENTAL, model-blocked
+    MOSTLY_2OF4_F16      = 46  # except 1d tensors (card 141, RDNA4 2:4-sparse SWMMAC fp16)
+    MOSTLY_MXFP6         = 47  # except 1d tensors (ROC8: e3m2 6-bit, rides the e4m3 fp8 compute path, T184)
+    MOSTLY_MXFP4         = 48  # except 1d tensors (T185: Quark-native dense/MoE OCP MXFP4, distinct from gpt-oss's MOSTLY_MXFP4_MOE=38)
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -5227,7 +5243,14 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.MXFP4:   (32, 1 + 16),
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
-    GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.Q2_0:    (128, 2 + 32),  # block_q2_0: ggml_half d + 128*2bits/8 = 2 + 32 bytes
+    GGMLQuantizationType.F8E4M3: (32, 2 + 32),
+    GGMLQuantizationType.F8E5M2: (32, 2 + 32),
+    GGMLQuantizationType.TWO_OF_FOUR_FP8: (32, 2 + 16 + 4),
+    GGMLQuantizationType.MXFP8:  (32, 1 + 32),
+    GGMLQuantizationType.IU4:    (32, 2 + 16),
+    GGMLQuantizationType.TWO_OF_FOUR_F16: (32, 16 + 4),
+    GGMLQuantizationType.MXFP6: (32, 1 + 32 * 6 // 8),  # block_mxfp6: e8m0 e + 24 packed 6-bit qs (T184)
 }
 
 

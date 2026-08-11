@@ -959,15 +959,31 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         n_embd_dec    = llama_model_n_embd(model_dft);
         n_embd_enc    = (int32_t) target_layer_ids_n * n_embd_tgt;
 
-        // read the trained block size from the dflash.block_size metadata key
+        // read the trained block size from the model's metadata key. DFlash-family
+        // models use a flat "<arch>.block_size"; DSpark uses a nested
+        // "<arch>.dspark.block_size" instead -- try both rather than requiring the
+        // caller to know which family this draft model belongs to.
         block_size = 16;
         {
             char buf[32] = {};
             if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {
                 block_size = std::atoi(buf);
+            } else if (llama_model_meta_val_str(model_dft, "dspark.dspark.block_size", buf, sizeof(buf)) >= 0) {
+                block_size = std::atoi(buf);
             }
         }
+
+        // the tokenizer-level mask token works for DFlash; DSpark ships with
+        // tokenizer.ggml.model=none (no vocab of its own, dummy tokens only), so
+        // llama_vocab_mask() always returns LLAMA_TOKEN_NULL for it -- fall back
+        // to its own "<arch>.dspark.mask_token_id" metadata key in that case.
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
+        if (mask_token_id == LLAMA_TOKEN_NULL) {
+            char buf[32] = {};
+            if (llama_model_meta_val_str(model_dft, "dspark.dspark.mask_token_id", buf, sizeof(buf)) >= 0) {
+                mask_token_id = std::atoi(buf);
+            }
+        }
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);

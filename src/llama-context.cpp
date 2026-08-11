@@ -240,6 +240,17 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
+    // [DIAG] SSM/GatedDeltaNet split-decode investigation: allow forcing off the
+    // fused GDN paths (autoregressive T=1 and/or chunked T>1) to isolate whether a
+    // batched-vs-sequential numerics gap comes from the fused custom op or from the
+    // graph-based reference (build_delta_net_autoregressive / build_delta_net_chunking).
+    // Diagnostic-only, opt-in via env, no effect unless set. Safe to leave in.
+    if (const char * e = getenv("LLAMA_SSM_DEBUG_NO_FUSED_AR")) {
+        if (e[0] == '1') { cparams.fused_gdn_ar = false; cparams.auto_fgdn = false; }
+    }
+    if (const char * e = getenv("LLAMA_SSM_DEBUG_NO_FUSED_CH")) {
+        if (e[0] == '1') { cparams.fused_gdn_ch = false; cparams.auto_fgdn = false; }
+    }
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;

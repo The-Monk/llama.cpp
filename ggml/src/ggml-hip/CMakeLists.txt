@@ -46,6 +46,7 @@ endif()
 find_package(hip     REQUIRED)
 find_package(hipblas REQUIRED)
 find_package(rocblas REQUIRED)
+find_package(hipblaslt REQUIRED)   # Q2_0 prefill int8 GEMM route (mul_mat_q2_0_hipblaslt.cu)
 
 if (GGML_HIP_RCCL)
     find_package(rccl REQUIRED)
@@ -79,13 +80,36 @@ else()
         ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
+        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-f8e4m3-f8e4m3.cu)
 endif()
 
 ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
                          ${GGML_SOURCES_ROCM}
                         )
+
+# Phase-3(B) M-gated int4-weight dispatch (see mul_mat_iu4_ck_wmma.cuh
+# doctrine comment): scoped, OPTIONAL include-path for Composable Kernel's
+# header-only classic (ck::) device-op templates, used ONLY by
+# mul_mat_iu4_ck_wmma.cu. Not a real dependency of the ggml-hip target as a
+# whole -- if CK isn't checked out at this local path the .cu file itself
+# falls back to a stub (__has_include guard), so this is safe to skip on
+# any machine without the local ck-ref research checkout.
+set(GGML_HIP_CK_REF_DIR "$ENV{HOME}/src/ck-ref" CACHE PATH
+    "Optional local Composable Kernel checkout for the experimental int4-weight WMMA route")
+# Test for the GENERATED header, not just include/: a partially-configured CK
+# checkout has include/ck/config.h.in but no generated config.h, and ck.hpp
+# unconditionally #includes "ck/config.h". Keying on include/ alone opts this
+# TU into the CK path, __has_include then finds the CK device-op header, and
+# the build dies on 'ck/config.h file not found' from a fresh clone on any
+# machine with an unconfigured ~/src/ck-ref. Requiring the generated header
+# means an unconfigured checkout is skipped -> __has_include falls back to the
+# stub (safe: ggml_cuda_iu4_ck_wmma_supports() is unconditionally false).
+if (EXISTS "${GGML_HIP_CK_REF_DIR}/include/ck/config.h")
+    set_source_files_properties(../ggml-cuda/mul_mat_iu4_ck_wmma.cu PROPERTIES
+        INCLUDE_DIRECTORIES "${GGML_HIP_CK_REF_DIR}/include;${GGML_HIP_CK_REF_DIR}/library/include")
+endif()
 
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)
@@ -113,6 +137,16 @@ endif()
 if (GGML_HIP_NO_VMM)
     add_compile_definitions(GGML_HIP_NO_VMM)
 endif()
+
+if (GGML_HIP_ROCWMMA_FATTN)
+    add_compile_definitions(GGML_HIP_ROCWMMA_FATTN)
+endif()
+
+# Card 120: the mixed fp8(e4m3 weight) x bf8(e5m2 activation) WMMA prefill
+# path is now a RUNTIME toggle (GGML_HIP_FP8_ACT=bf8 env var, read once and
+# cached, mmq.cu) instead of a build-time CMake option -- both the fp8_fp8
+# and fp8_bf8 opcode paths are always compiled in. No build flag needed here
+# anymore; kept as a comment so the history is discoverable.
 
 if (NOT GGML_HIP_MMQ_MFMA)
     add_compile_definitions(GGML_HIP_NO_MMQ_MFMA)
@@ -153,4 +187,4 @@ if (GGML_HIP_RCCL)
     target_link_libraries(ggml-hip PRIVATE ggml-base roc::rccl)
 endif()
 
-target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas roc::hipblaslt)

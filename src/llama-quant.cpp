@@ -366,6 +366,58 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     return quantize;
 }
 
+// RDNA4 2:4-structured-sparse SWMMAC driver-completeness run: does this
+// tensor's raw data actually look 2:4-structured-sparse along ne[0] (the
+// reduction/K axis)? Scans every 4-element group; a group counts as "clean"
+// if it has AT MOST 2 nonzero values (0 or 1 nonzero also count -- the
+// sparse format can represent those losslessly, just with wasted kept
+// slots). Requires >= min_ratio of all groups to be clean before the caller
+// trusts the tensor to the lossy-on-violation block_2of4_fp8 quantizer;
+// tensors that fail (dense embeddings/lm_head, small aux tensors, etc.)
+// should fall back to a dense type instead of being force-compressed.
+// `tensor->data` must already be readable (mmap'd or loaded) by the caller.
+static float tensor_2of4_sparsity_ratio(const ggml_tensor * tensor) {
+    if (tensor->type != GGML_TYPE_F16 && tensor->type != GGML_TYPE_F32) {
+        return 0.0f; // unknown source dtype -- can't inspect, treat as "not sparse"
+    }
+    const int64_t ne0 = tensor->ne[0];
+    if (ne0 % 4 != 0 || tensor->data == nullptr) {
+        return 0.0f;
+    }
+    const int64_t nrows          = ggml_nrows(tensor);
+    const int64_t groups_per_row = ne0 / 4;
+    const int64_t total_groups   = groups_per_row * nrows;
+    if (total_groups == 0) {
+        return 0.0f;
+    }
+
+    int64_t clean_groups = 0;
+    const uint8_t * base = (const uint8_t *) tensor->data;
+    for (int64_t r = 0; r < nrows; ++r) {
+        const uint8_t * row = base + r * tensor->nb[1];
+        for (int64_t g = 0; g < groups_per_row; ++g) {
+            int nz = 0;
+            for (int j = 0; j < 4; ++j) {
+                float v;
+                if (tensor->type == GGML_TYPE_F16) {
+                    ggml_fp16_t h;
+                    memcpy(&h, row + (g*4 + j) * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
+                    v = ggml_fp16_to_fp32(h);
+                } else {
+                    memcpy(&v, row + (g*4 + j) * sizeof(float), sizeof(float));
+                }
+                if (v != 0.0f) {
+                    ++nz;
+                }
+            }
+            if (nz <= 2) {
+                ++clean_groups;
+            }
+        }
+    }
+    return (float) clean_groups / (float) total_groups;
+}
+
 //
 // tensor type selection
 //
@@ -400,6 +452,13 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
+            case GGML_TYPE_F8E4M3:  return_type = GGML_TYPE_F16;    break;
+            case GGML_TYPE_F8E5M2:  return_type = GGML_TYPE_F16;    break;
+            case GGML_TYPE_2OF4_FP8: return_type = GGML_TYPE_F8E4M3; break;
+            case GGML_TYPE_2OF4_F16: return_type = GGML_TYPE_F16;    break; // card 141: dense fp16 fallback, mirrors 2OF4_FP8 -> F8E4M3
+            case GGML_TYPE_MXFP8:   return_type = GGML_TYPE_F16;    break;
+            case GGML_TYPE_MXFP6:   return_type = GGML_TYPE_F16;    break;
+            case GGML_TYPE_IU4:     return_type = GGML_TYPE_F16;    break; // EXPERIMENTAL, model-blocked
             default:
                 throw std::runtime_error(format("no tensor type fallback is defined for type %s",
                                                 ggml_type_name(target_type)));
@@ -814,6 +873,13 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_ALL_F32:     return GGML_TYPE_F32;
         case LLAMA_FTYPE_MOSTLY_Q1_0: return GGML_TYPE_Q1_0;
         case LLAMA_FTYPE_MOSTLY_Q2_0: return GGML_TYPE_Q2_0;
+        case LLAMA_FTYPE_MOSTLY_F8E4M3: return GGML_TYPE_F8E4M3;
+        case LLAMA_FTYPE_MOSTLY_F8E5M2: return GGML_TYPE_F8E5M2;
+        case LLAMA_FTYPE_MOSTLY_2OF4_FP8: return GGML_TYPE_2OF4_FP8;
+        case LLAMA_FTYPE_MOSTLY_2OF4_F16: return GGML_TYPE_2OF4_F16; // card 141
+        case LLAMA_FTYPE_MOSTLY_MXFP8:  return GGML_TYPE_MXFP8;
+        case LLAMA_FTYPE_MOSTLY_MXFP6:  return GGML_TYPE_MXFP6;
+        case LLAMA_FTYPE_MOSTLY_IU4:    return GGML_TYPE_IU4; // EXPERIMENTAL, model-blocked
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
 
@@ -1046,6 +1112,43 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         if (metadata[i].allows_quantization) {
             metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
+
+            // RDNA4 2:4-structured-sparse SWMMAC driver-completeness run: the
+            // sparse block_2of4_fp8 quantizer is lossy on any 4-group with
+            // >2 nonzero values. Peek at the tensor's real (mmap'd) data --
+            // load_data_for() is a cheap pointer-set under mmap, safe to call
+            // again later in the main loop -- and only trust tensors that are
+            // actually >=98% cleanly 2:4-sparse; everything else (dense
+            // embeddings/lm_head, small aux tensors, or a tensor this prune
+            // simply didn't touch) falls back to dense F8E4M3 instead of
+            // being force-compressed. Don't force it.
+            if (metadata[i].target_type == GGML_TYPE_2OF4_FP8) {
+                ml.load_data_for(it->tensor);
+                const float ratio = tensor_2of4_sparsity_ratio(it->tensor);
+                constexpr float k_min_2of4_ratio = 0.98f;
+                if (ratio < k_min_2of4_ratio) {
+                    LLAMA_LOG_WARN("%s: %-40s - not cleanly 2:4-sparse (%.1f%% of groups <=2 nonzero, need >=%.0f%%)"
+                                   " -> falling back to F8E4M3\n",
+                                   __func__, ggml_get_name(tensor), 100.0f*ratio, 100.0f*k_min_2of4_ratio);
+                    metadata[i].target_type = GGML_TYPE_F8E4M3;
+                }
+            }
+
+            // card 141: same lossy-on-violation gate as block_2of4_fp8 above, for
+            // the fp16-valued sparse type. Falls back to dense F16 (not F8E4M3 --
+            // no reason to also take a precision hit on a tensor the prune didn't
+            // cleanly touch).
+            if (metadata[i].target_type == GGML_TYPE_2OF4_F16) {
+                ml.load_data_for(it->tensor);
+                const float ratio = tensor_2of4_sparsity_ratio(it->tensor);
+                constexpr float k_min_2of4_ratio = 0.98f;
+                if (ratio < k_min_2of4_ratio) {
+                    LLAMA_LOG_WARN("%s: %-40s - not cleanly 2:4-sparse (%.1f%% of groups <=2 nonzero, need >=%.0f%%)"
+                                   " -> falling back to F16\n",
+                                   __func__, ggml_get_name(tensor), 100.0f*ratio, 100.0f*k_min_2of4_ratio);
+                    metadata[i].target_type = GGML_TYPE_F16;
+                }
+            }
         } else {
             metadata[i].target_type = tensor->type;
         }

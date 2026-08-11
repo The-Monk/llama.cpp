@@ -24,6 +24,16 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
 void quantize_row_mxfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 
+// card 151: roc8 fp8 CPU reference fallback -- these types previously had NO
+// entry at all in type_traits_cpu[], so any op the backend scheduler kept on
+// CPU (small-batch DFlash draft matmuls at spec-draft-n-max>=10 were the
+// trigger) called a NULL vec_dot function pointer -> SIGSEGV. See quants.c
+// for the correctness-over-speed scalar implementation.
+void quantize_row_f8e4m3(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+void quantize_row_f8e5m2(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+void quantize_row_mxfp6(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+void quantize_row_iu4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+
 void quantize_row_q2_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_q3_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_q4_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
@@ -48,6 +58,29 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
 void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+
+// card 151: scalar dequant+dot against a plain f32 activation row (vec_dot_type
+// = F32, no activation quantization step) -- correctness fallback, not a fast
+// path. See quants.c.
+void ggml_vec_dot_f8e4m3_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+
+// Stage 25: GGML_TYPE_F8E5M2 CPU fallback -- same role/caveats as
+// ggml_vec_dot_f8e4m3_f32 above (this one was simply missed when F8E5M2
+// was added later, T97).
+void ggml_vec_dot_f8e5m2_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+
+// ROC8: MXFP6 CPU fallback, same role/caveats as ggml_vec_dot_f8e4m3_f32 above.
+void ggml_vec_dot_mxfp6_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+
+// T170 / Stage 23: GGML_TYPE_IU4 had NO type_traits_cpu entry at all before
+// this -- its real compute path is the GPU (dot8 mmvq_iu4.cu decode kernel
+// or mul_mat_iu4{,_mmq}.cu WMMA GEMM); this CPU entry only exists so an
+// accidental/test-harness CPU-side dispatch (test-backend-ops' GPU-vs-CPU
+// correctness comparison, in particular) dequantizes-and-dots instead of
+// segfaulting on a NULL vec_dot (same "card 151 lesson" as
+// ggml_vec_dot_mxfp6_f32 above -- found the same way: a real crash, not a
+// hypothetical).
+void ggml_vec_dot_iu4_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
 void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);

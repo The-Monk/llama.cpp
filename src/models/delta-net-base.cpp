@@ -602,5 +602,37 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
 
+    // [FIX card SSM-ROLLBACK-1] ggml_gated_delta_net() can only ever produce
+    // n_written = min(n_seq_tokens, K) snapshots -- a rollback depth deeper than
+    // n_seq_tokens would need history this op call was never given (it starts
+    // from the single collapsed state `s`, not a K-deep stack). When the caller
+    // sizes n_rs_seq to the draft block width (the common spec-decode case,
+    // n_rs_seq == draft.n_max), n_seq_tokens is *always* <= n_rs_seq, so
+    // n_written < K on *every* verify call and slot index n_written (rollback ==
+    // "reject every token this call produced", the ordinary full-block-reject
+    // path) was left permanently unwritten -- reading it returned whatever
+    // stale/garbage data happened to occupy that row. Measured effect (see
+    // ssm-rollback-repro): max|Δlogit| ~1.7 on a full-block-reject rollback vs.
+    // ~0.1 baseline chunked-vs-sequential fp noise -- a state-corruption bug,
+    // not rounding.
+    //
+    // Fix: slot n_written (and, defensively, every slot beyond it up to K-1,
+    // which a well-formed caller should never reach since rollback is always
+    // bounded by the width of the *most recent* call) is exactly "zero new
+    // tokens from this call applied" == the untouched input state `s`. Carry it
+    // forward unchanged into those trailing slots so a full-block-reject
+    // rollback reads back the true pre-call state instead of stale memory.
+    if (n_written < K) {
+        ggml_tensor * s_flat = ggml_reshape_2d(ctx0, s, D, n_seqs);
+
+        for (int64_t slot = n_written; slot < K; ++slot) {
+            ggml_tensor * dst_carry = ggml_view_2d(ctx0, ssm_states_all,
+                D, n_seqs, ssm_states_all->nb[1],
+                (size_t) (kv_head + (uint32_t) slot * mem_size) * row_size);
+
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, s_flat, dst_carry));
+        }
+    }
+
     return output;
 }

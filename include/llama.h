@@ -155,7 +155,14 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
-        LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_F8E4M3        = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_F8E5M2        = 42, // except 1d tensors (T97)
+        LLAMA_FTYPE_MOSTLY_2OF4_FP8      = 43, // except 1d tensors (RDNA4 2:4-sparse SWMMAC)
+        LLAMA_FTYPE_MOSTLY_MXFP8         = 44, // except 1d tensors (ROC8)
+        LLAMA_FTYPE_MOSTLY_IU4           = 45, // except 1d tensors -- EXPERIMENTAL, model-blocked (T89, see ggml.h GGML_TYPE_IU4 comment)
+        LLAMA_FTYPE_MOSTLY_2OF4_F16      = 46, // except 1d tensors (card 141, RDNA4 2:4-sparse SWMMAC fp16)
+        LLAMA_FTYPE_MOSTLY_MXFP6         = 47, // except 1d tensors (ROC8: e3m2 6-bit, rides the e4m3 fp8 compute path)
+        LLAMA_FTYPE_MOSTLY_Q2_0          = 48, // except 1d tensors (PrismML ternary 2-bit g128)
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

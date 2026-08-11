@@ -552,6 +552,235 @@ static inline uint8_t ggml_fp32_to_ue4m3(float x) {
     return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
 }
 
+// E4M3 (signed, OCP e4m3fn): 1 sign, 4 exp bits (bias=7), 3 mantissa bits.
+// No infinities; S.1111.111 (0x7F / 0xFF) is the sole NaN encoding.
+// Used for GGML_TYPE_F8E4M3 weight values (Path X, ggml-common.h:block_f8e4m3).
+static inline float ggml_e4m3_to_fp32(uint8_t x) {
+    const int sign = (x >> 7) & 1;
+    const int exp  = (x >> 3) & 0xF;
+    const int man  = x & 0x7;
+    if (exp == 0xF && man == 0x7) {
+        return sign ? -NAN : NAN;
+    }
+    float raw;
+    if (exp == 0) {
+        raw = ldexpf((float) man, -9); // subnormal: man * 2^-9
+    } else {
+        raw = ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    }
+    return sign ? -raw : raw;
+}
+
+static inline uint8_t ggml_fp32_to_e4m3(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    const int sign = (bits >> 31) & 1;
+
+    if (x != x) { // NaN in -> NaN out
+        return (uint8_t) ((sign << 7) | 0x7F);
+    }
+
+    float ax = fabsf(x);
+    if (ax > 448.0f) {
+        ax = 448.0f; // clamp, e4m3fn has no infinity
+    }
+    if (!(ax > 0.0f)) {
+        return (uint8_t) (sign << 7); // +-0
+    }
+
+    memcpy(&bits, &ax, 4);
+    int fp32_exp = ((bits >> 23) & 0xFF) - 127;
+    int fp32_man = (bits >> 20) & 0x7;
+    int e4_exp   = fp32_exp + 7;
+
+    if (e4_exp <= 0) {
+        // subnormal: value = man * 2^-9, man = round(ax * 2^9)
+        int man = (int) (ax * 512.0f + 0.5f);
+        if (man > 7) {
+            man = 7;
+        }
+        if (man < 1) {
+            return (uint8_t) (sign << 7);
+        }
+        return (uint8_t) ((sign << 7) | man);
+    }
+
+    int round_bit = (bits >> 19) & 1;
+    int e4_man = fp32_man + round_bit;
+    if (e4_man > 7) {
+        e4_man = 0;
+        e4_exp++;
+    }
+    if (e4_exp >= 15 && e4_man == 7) {
+        // never emit the NaN pattern (S.1111.111) from rounding: clamp to max finite
+        e4_exp = 15;
+        e4_man = 6;
+    } else if (e4_exp > 15) {
+        e4_exp = 15;
+        e4_man = 6;
+    }
+    return (uint8_t) ((sign << 7) | (e4_exp << 3) | e4_man);
+}
+
+// E3M2 (OCP MX FP6 element format, ROC8): 1 sign, 3 exp bits (bias=3), 2
+// mantissa bits. NO Inf/NaN encoding (OCP MX FP6 spec: every one of the 64
+// bit patterns is finite) -- max finite magnitude is 28.0
+// ((1+3/4)*2^(7-3)). Packed into the low 6 bits of a byte (bit5=sign,
+// bits4-2=exp, bits1-0=mantissa) before 4-per-3-byte packing
+// (ggml-common.h:block_mxfp6).
+static inline uint8_t ggml_fp32_to_e3m2(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    const int sign = (bits >> 31) & 1;
+
+    float ax = fabsf(x);
+    if (x != x) { // NaN in -> clamp to max finite (no NaN encoding available)
+        ax = 28.0f;
+    }
+    if (ax > 28.0f) {
+        ax = 28.0f;
+    }
+    if (!(ax > 0.0f)) {
+        return (uint8_t) (sign << 5); // +-0
+    }
+
+    memcpy(&bits, &ax, 4);
+    int fp32_exp = ((bits >> 23) & 0xFF) - 127;
+    int fp32_man = (bits >> 21) & 0x3; // top 2 mantissa bits
+    int e3_exp   = fp32_exp + 3;
+
+    if (e3_exp <= 0) {
+        // subnormal: value = man2 * 2^-4, man2 = round(ax * 2^4)
+        int man = (int) (ax * 16.0f + 0.5f);
+        if (man > 3) {
+            man = 3;
+        }
+        if (man < 1) {
+            return (uint8_t) (sign << 5);
+        }
+        return (uint8_t) ((sign << 5) | man);
+    }
+
+    const int round_bit = (bits >> 20) & 1;
+    int e3_man = fp32_man + round_bit;
+    if (e3_man > 3) {
+        e3_man = 0;
+        e3_exp++;
+    }
+    if (e3_exp > 7) {
+        e3_exp = 7;
+        e3_man = 3; // clamp to max finite (28.0), never overflow (no Inf)
+    }
+    return (uint8_t) ((sign << 5) | (e3_exp << 2) | e3_man);
+}
+
+// E3M2 -> e4m3fn: LOSSLESS bit-level widening (E3M2's value set is a strict
+// subset of e4m3's -- see the block_mxfp6 comment in ggml-common.h). Normal
+// E3M2 values (exp3 != 0) are a pure exponent-bias shift (+4) and a 1-bit
+// mantissa left-shift (append a 0 LSB). E3M2 subnormals (exp3==0, man2 in
+// {1,2,3}) land in e4m3's *normal* range (e4m3's wider exponent has the
+// headroom), so those 3 codes are hand-renormalized; man2==0 is +-0.
+// Mirrored bit-for-bit in ggml_cuda_e3m2_to_e4m3 (ggml-cuda/common.cuh) for
+// the GPU decode path -- keep the two in sync.
+static inline uint8_t ggml_e3m2_to_e4m3(uint8_t code) {
+    const int sign = (code >> 5) & 1;
+    const int exp3 = (code >> 2) & 0x7;
+    const int man2 = code & 0x3;
+
+    if (exp3 == 0) {
+        if (man2 == 0) {
+            return (uint8_t) (sign << 7); // +-0
+        }
+        const int exp4 = (man2 == 1) ? 3 : 4;
+        const int man3 = (man2 == 3) ? 4 : 0;
+        return (uint8_t) ((sign << 7) | (exp4 << 3) | man3);
+    }
+
+    const int exp4 = exp3 + 4;  // bias shift: (exp3-3)+7 = exp3+4
+    const int man3 = man2 << 1; // 2-bit mantissa -> 3-bit (append 0 LSB)
+    return (uint8_t) ((sign << 7) | (exp4 << 3) | man3);
+}
+
+static inline float ggml_e3m2_to_fp32(uint8_t code) {
+    return ggml_e4m3_to_fp32(ggml_e3m2_to_e4m3(code));
+}
+
+// E5M2 (signed, OCP bf8): 1 sign, 5 exp bits (bias=15), 2 mantissa bits.
+// Unlike e4m3fn, standard OCP e5m2 DOES have real infinities: exp==0x1F,
+// man==0 -> +-Inf; exp==0x1F, man!=0 -> NaN. Wider dynamic range than e4m3
+// (max finite ~57344 vs 448), fewer mantissa bits (2 vs 3) -- less precision,
+// more headroom before overflow. gfx1201/gfx1200 implement OCP (not FNUZ)
+// bf8 (HIP_FP8_TYPE_OCP=1 in amd_hip_fp8.h), so this layout is bit-for-bit
+// what the RDNA4 hardware v_cvt_*_bf8 instructions consume/produce (T97
+// ISA-verified, see ggml-cuda/common.cuh).
+// Used for GGML_TYPE_F8E5M2 weight values (ggml-common.h:block_f8e5m2).
+static inline float ggml_e5m2_to_fp32(uint8_t x) {
+    const int sign = (x >> 7) & 1;
+    const int exp  = (x >> 2) & 0x1F;
+    const int man  = x & 0x3;
+    if (exp == 0x1F) {
+        if (man == 0) {
+            return sign ? -INFINITY : INFINITY;
+        }
+        return sign ? -NAN : NAN;
+    }
+    float raw;
+    if (exp == 0) {
+        raw = ldexpf((float) man, -16); // subnormal: man * 2^-16
+    } else {
+        raw = ldexpf(1.0f + (float) man / 4.0f, exp - 15);
+    }
+    return sign ? -raw : raw;
+}
+
+static inline uint8_t ggml_fp32_to_e5m2(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    const int sign = (bits >> 31) & 1;
+
+    if (x != x) { // NaN in -> NaN out
+        return (uint8_t) ((sign << 7) | 0x7F);
+    }
+
+    float ax = fabsf(x);
+    if (!(ax > 0.0f)) {
+        return (uint8_t) (sign << 7); // +-0
+    }
+
+    memcpy(&bits, &ax, 4);
+    int fp32_exp = ((bits >> 23) & 0xFF) - 127;
+    int fp32_man = (bits >> 21) & 0x3;
+    int e5_exp   = fp32_exp + 15;
+
+    if (e5_exp <= 0) {
+        // subnormal: value = man * 2^-16, man = round(ax * 2^16)
+        int man = (int) (ax * 65536.0f + 0.5f);
+        if (man > 3) {
+            man = 3;
+        }
+        if (man < 1) {
+            return (uint8_t) (sign << 7);
+        }
+        return (uint8_t) ((sign << 7) | man);
+    }
+    if (e5_exp >= 31) {
+        // overflow (includes +-Inf input, whose fp32_exp is huge): OCP e5m2
+        // has real infinities, unlike e4m3fn, so round up rather than clamp.
+        return (uint8_t) ((sign << 7) | 0x7C);
+    }
+
+    const int round_bit = (bits >> 20) & 1;
+    int e5_man = fp32_man + round_bit;
+    if (e5_man > 3) {
+        e5_man = 0;
+        e5_exp++;
+    }
+    if (e5_exp >= 31) {
+        return (uint8_t) ((sign << 7) | 0x7C); // rounds up into +-Inf
+    }
+    return (uint8_t) ((sign << 7) | (e5_exp << 2) | e5_man);
+}
+
 /**
  * Converts brain16 to float32.
  *

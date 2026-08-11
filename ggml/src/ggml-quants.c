@@ -79,7 +79,6 @@ void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_REST
     const int nb = k / qk;
 
     for (int i = 0; i < nb; i++) {
-        // Compute scale as max absolute value in the block
         float amax = 0.0f;
         for (int j = 0; j < qk; j++) {
             const float a = fabsf(x[i*qk + j]);
@@ -90,13 +89,11 @@ void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_REST
 
         y[i].d = GGML_FP32_TO_FP16(d);
 
-        // Clear quant bytes
         for (int j = 0; j < qk / 4; ++j) {
             y[i].qs[j] = 0;
         }
 
-        // Encode 2-bit values: round(w/d) clamped to [-1, 2], then add 1
-        // 00 (-1) = -scale, 01 (0) = 0, 10 (+1) = +scale, 11 (+2) = 2*scale
+        // 2-bit code c = round(w/d)+1 clamped to [0,3]; symbol s = c-1 in {-1,0,+1,+2}
         for (int j = 0; j < qk; ++j) {
             const float w = x[i*qk + j];
             int q = (int)roundf(w * id) + 1;
@@ -450,7 +447,7 @@ void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRI
             const int byte_index = j / 4;
             const int bit_offset = (j % 4) * 2;
             const uint8_t q = (x[i].qs[byte_index] >> bit_offset) & 0x03;
-            // 00=-1, 01=0, 10=+1, 11=+2
+            // code {0,1,2,3} -> symbol {-1,0,+1,+2}
             y[i*qk + j] = ((int)q - 1) * d;
         }
     }
@@ -607,6 +604,483 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
                 yb[j + 0       ] = v0*d;
                 yb[j + qk_sub/2] = v1*d;
             }
+        }
+    }
+}
+
+// reference implementation for deterministic creation of model files
+void quantize_row_f8e4m3_ref(const float * GGML_RESTRICT x, block_f8e4m3 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_F8E4M3;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            amax = MAX(amax, fabsf(v));
+        }
+
+        // e4m3 max finite magnitude is 448; scale so the block's amax maps onto it
+        const float d = amax / 448.0f;
+        const float id = d ? 1.0f/d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        for (int j = 0; j < qk; ++j) {
+            const float x0 = x[i*qk + j]*id;
+            y[i].qs[j] = ggml_fp32_to_e4m3(x0);
+        }
+    }
+}
+
+void dequantize_row_f8e4m3(const block_f8e4m3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_F8E4M3;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = ggml_e4m3_to_fp32(x[i].qs[j]) * d;
+        }
+    }
+}
+
+// RDNA4 2:4-structured-sparse SWMMAC driver-completeness run: per 4-element
+// group, keep the (up to) 2 largest-magnitude values (ties broken by lower
+// index winning "first"), record their in-group positions (idx0 < idx1) as
+// 2-bit metadata, and e4m3-encode just the 16 kept values under one
+// per-block (32-elem) scale. Groups with <2 nonzero values still emit a
+// valid (idx0,idx1) pair (default 0,1) with 0.0 e4m3-encoded (exact) at
+// whichever of those positions is actually zero -- the sparse format always
+// carries exactly 2 kept slots per group of 4, by hardware contract.
+// Groups with >2 nonzero values (not cleanly 2:4 -- see
+// tensor_is_2of4_sparse() in llama-quant.cpp, which gates which tensors
+// reach this quantizer at all) silently drop the smallest-magnitude extras;
+// this is a lossy fallback for the rare non-conforming group, not the
+// common case.
+void quantize_row_2of4_fp8_ref(const float * GGML_RESTRICT x, block_2of4_fp8 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_2OF4_FP8;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float   kept_vals[QK_2OF4_FP8/2];
+        uint8_t idx0[QK_2OF4_FP8/4];
+        uint8_t idx1[QK_2OF4_FP8/4];
+
+        for (int g = 0; g < QK_2OF4_FP8/4; ++g) {
+            const float * grp = x + i*qk + g*4;
+
+            int   best0 = -1, best1 = -1;
+            float best0v = -1.0f, best1v = -1.0f;
+            for (int j = 0; j < 4; ++j) {
+                const float av = fabsf(grp[j]);
+                if (av > best0v) {
+                    best1v = best0v; best1 = best0;
+                    best0v = av;     best0 = j;
+                } else if (av > best1v) {
+                    best1v = av; best1 = j;
+                }
+            }
+            if (best0 < 0) { best0 = 0; }
+            if (best1 < 0) { best1 = (best0 == 0) ? 1 : 0; }
+
+            const int lo = best0 < best1 ? best0 : best1;
+            const int hi = best0 < best1 ? best1 : best0;
+
+            idx0[g] = (uint8_t) lo;
+            idx1[g] = (uint8_t) hi;
+            kept_vals[2*g + 0] = grp[lo];
+            kept_vals[2*g + 1] = grp[hi];
+        }
+
+        float amax = 0.0f;
+        for (int j = 0; j < QK_2OF4_FP8/2; ++j) {
+            amax = MAX(amax, fabsf(kept_vals[j]));
+        }
+
+        // e4m3 max finite magnitude is 448; scale so the block's amax maps onto it
+        const float d  = amax / 448.0f;
+        const float id = d ? 1.0f/d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        for (int j = 0; j < QK_2OF4_FP8/2; ++j) {
+            y[i].qs[j] = ggml_fp32_to_e4m3(kept_vals[j]*id);
+        }
+
+        for (int g = 0; g < QK_2OF4_FP8/4; ++g) {
+            const uint8_t nib = (uint8_t) ((idx0[g] & 0x3) | ((idx1[g] & 0x3) << 2));
+            if ((g & 1) == 0) {
+                y[i].meta[g/2] = nib;
+            } else {
+                y[i].meta[g/2] = (uint8_t) (y[i].meta[g/2] | (nib << 4));
+            }
+        }
+    }
+}
+
+void dequantize_row_2of4_fp8(const block_2of4_fp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_2OF4_FP8;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = 0.0f;
+        }
+
+        for (int g = 0; g < QK_2OF4_FP8/4; ++g) {
+            const uint8_t byte = x[i].meta[g/2];
+            const uint8_t nib  = ((g & 1) == 0) ? (uint8_t) (byte & 0x0F) : (uint8_t) (byte >> 4);
+            const int idx0 = nib & 0x3;
+            const int idx1 = (nib >> 2) & 0x3;
+
+            y[i*qk + g*4 + idx0] = ggml_e4m3_to_fp32(x[i].qs[2*g + 0]) * d;
+            y[i*qk + g*4 + idx1] = ggml_e4m3_to_fp32(x[i].qs[2*g + 1]) * d;
+        }
+    }
+}
+
+// card 141: sparse-fp16 2:4 -- identical group-argmax "keep top-2-of-4 by
+// magnitude" selection as quantize_row_2of4_fp8_ref, but the kept values are
+// stored as RAW fp16 (no block scale -- fp16's native 5-bit exponent already
+// covers the dynamic range, unlike e4m3 which needs the extra scale to reach
+// useful precision). See block_2of4_f16 comment in ggml-common.h.
+void quantize_row_2of4_f16_ref(const float * GGML_RESTRICT x, block_2of4_f16 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_2OF4_F16;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float   kept_vals[QK_2OF4_F16/2];
+        uint8_t idx0[QK_2OF4_F16/4];
+        uint8_t idx1[QK_2OF4_F16/4];
+
+        for (int g = 0; g < QK_2OF4_F16/4; ++g) {
+            const float * grp = x + i*qk + g*4;
+
+            int   best0 = -1, best1 = -1;
+            float best0v = -1.0f, best1v = -1.0f;
+            for (int j = 0; j < 4; ++j) {
+                const float av = fabsf(grp[j]);
+                if (av > best0v) {
+                    best1v = best0v; best1 = best0;
+                    best0v = av;     best0 = j;
+                } else if (av > best1v) {
+                    best1v = av; best1 = j;
+                }
+            }
+            if (best0 < 0) { best0 = 0; }
+            if (best1 < 0) { best1 = (best0 == 0) ? 1 : 0; }
+
+            const int lo = best0 < best1 ? best0 : best1;
+            const int hi = best0 < best1 ? best1 : best0;
+
+            idx0[g] = (uint8_t) lo;
+            idx1[g] = (uint8_t) hi;
+            kept_vals[2*g + 0] = grp[lo];
+            kept_vals[2*g + 1] = grp[hi];
+        }
+
+        for (int j = 0; j < QK_2OF4_F16/2; ++j) {
+            y[i].qs[j] = GGML_FP32_TO_FP16(kept_vals[j]);
+        }
+
+        for (int g = 0; g < QK_2OF4_F16/4; ++g) {
+            const uint8_t nib = (uint8_t) ((idx0[g] & 0x3) | ((idx1[g] & 0x3) << 2));
+            if ((g & 1) == 0) {
+                y[i].meta[g/2] = nib;
+            } else {
+                y[i].meta[g/2] = (uint8_t) (y[i].meta[g/2] | (nib << 4));
+            }
+        }
+    }
+}
+
+void dequantize_row_2of4_f16(const block_2of4_f16 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_2OF4_F16;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = 0.0f;
+        }
+
+        for (int g = 0; g < QK_2OF4_F16/4; ++g) {
+            const uint8_t byte = x[i].meta[g/2];
+            const uint8_t nib  = ((g & 1) == 0) ? (uint8_t) (byte & 0x0F) : (uint8_t) (byte >> 4);
+            const int idx0 = nib & 0x3;
+            const int idx1 = (nib >> 2) & 0x3;
+
+            y[i*qk + g*4 + idx0] = GGML_FP16_TO_FP32(x[i].qs[2*g + 0]);
+            y[i*qk + g*4 + idx1] = GGML_FP16_TO_FP32(x[i].qs[2*g + 1]);
+        }
+    }
+}
+
+// T89 driver-completeness run: plain RTN symmetric int4 quantizer for
+// block_iu4. amax/7 per-block scale (matches the design doc exactly), round
+// to nearest, clamp to [-8,7]. NO imatrix weighting, NO rotation/SmoothQuant
+// -- quality is explicitly out of scope for this test, only that the packed
+// bytes are a faithful [-8,7] encoding of x[] under the SAME nibble
+// convention ggml_cuda_iu4_w4a4.cu's pack_row_i4() uses (low nibble of byte
+// b = element 2*b, high nibble = element 2*b+1 -- NOT block_q4_0's
+// split-half convention).
+// EXPERIMENTAL / model-blocked (see block_iu4 comment in ggml-common.h):
+// plain RTN here is a placeholder until a rotation-free W4A4 producer model
+// exists; it is not expected to be production-quality.
+void quantize_row_iu4_ref(const float * GGML_RESTRICT x, block_iu4 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_IU4;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            amax = MAX(amax, fabsf(v));
+        }
+
+        const float d  = amax / 7.0f;
+        const float id = d ? 1.0f/d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        for (int b = 0; b < qk/2; ++b) {
+            int q0 = (int) lrintf(x[i*qk + 2*b    ] * id);
+            int q1 = (int) lrintf(x[i*qk + 2*b + 1] * id);
+            q0 = q0 < -8 ? -8 : (q0 > 7 ? 7 : q0);
+            q1 = q1 < -8 ? -8 : (q1 > 7 ? 7 : q1);
+            y[i].qs[b] = (uint8_t) ((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+        }
+    }
+}
+
+void dequantize_row_iu4(const block_iu4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_IU4;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int b = 0; b < qk/2; ++b) {
+            const uint8_t byte = x[i].qs[b];
+            const int q0 = ((int8_t) (byte << 4)) >> 4;   // sign-extend low nibble
+            const int q1 = ((int8_t) (byte & 0xF0)) >> 4; // sign-extend high nibble
+            y[i*qk + 2*b    ] = q0 * d;
+            y[i*qk + 2*b + 1] = q1 * d;
+        }
+    }
+}
+
+// T97: reference implementation for deterministic creation of model files
+void quantize_row_f8e5m2_ref(const float * GGML_RESTRICT x, block_f8e5m2 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_F8E5M2;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            amax = MAX(amax, fabsf(v));
+        }
+
+        // e5m2 max finite magnitude is 57344; scale so the block's amax maps onto it
+        const float d = amax / 57344.0f;
+        const float id = d ? 1.0f/d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        for (int j = 0; j < qk; ++j) {
+            const float x0 = x[i*qk + j]*id;
+            y[i].qs[j] = ggml_fp32_to_e5m2(x0);
+        }
+    }
+}
+
+void dequantize_row_f8e5m2(const block_f8e5m2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_F8E5M2;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = ggml_e5m2_to_fp32(x[i].qs[j]) * d;
+        }
+    }
+}
+
+// MXFP8 (ROC8): reference implementation for deterministic creation of model
+// files. Mechanical mirror of quantize_row_f8e4m3_ref -- only the scale is
+// different: OCP MX's shared per-block scale is UE8M0 (unsigned 8-bit
+// power-of-2, biased-127), NOT a continuous fp16 delta, so amax is rounded UP
+// to the nearest representable power-of-two exponent that keeps qs within
+// e4m3's finite range (448), rather than mapped exactly like f8e4m3's `d`.
+// This mirrors the real mx.quantize convention (MLX/OCP MX spec): the shared
+// scale is chosen so shifted values are anywhere in-range, never so it
+// exactly saturates amax to 448 (that would require a non-power-of-2 scale).
+void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP8;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            amax = MAX(amax, fabsf(v));
+        }
+
+        // Choose the smallest power-of-two scale d = 2^e such that amax/d <= 448
+        // (e4m3 max finite magnitude), i.e. e = ceil(log2(amax/448)), clamped to
+        // the UE8M0 exponent range [0, 254] (bias 127 -> real exponent [-127, 127]).
+        uint8_t e = 0;
+        float d = 1.0f; // 2^(0-127) folded in below via ggml_e8m0_to_fp32
+        if (amax > 0.0f) {
+            int exp2;
+            const float mant = frexpf(amax / 448.0f, &exp2); // amax/448 = mant * 2^exp2, mant in [0.5,1)
+            // mant == 0.5 exactly means amax/448 is itself already a power of two --
+            // no need to round up a further step (exp2-1 already satisfies amax/d<=448).
+            int biased = (mant <= 0.5f) ? (exp2 - 1 + 127) : (exp2 + 127);
+            if (biased < 0)   biased = 0;
+            if (biased > 254) biased = 254; // keep 0xFF free (not used as a scale value here)
+            e = (uint8_t) biased;
+            d = ggml_e8m0_to_fp32(e);
+        }
+        const float id = d ? 1.0f/d : 0.0f;
+
+        y[i].e = e;
+
+        for (int j = 0; j < qk; ++j) {
+            const float x0 = x[i*qk + j]*id;
+            y[i].qs[j] = ggml_fp32_to_e4m3(x0);
+        }
+    }
+}
+
+void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP8;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_e8m0_to_fp32(x[i].e);
+
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = ggml_e4m3_to_fp32(x[i].qs[j]) * d;
+        }
+    }
+}
+
+// MXFP6 (ROC8): mechanical mirror of quantize_row_mxfp8_ref -- same
+// power-of-2 shared-scale search, but the leaf format is 6-bit E3M2 (max
+// finite 28.0), not 8-bit e4m3 (max finite 448.0), and 4 leaf values are bit-
+// packed into 3 bytes instead of 1 byte each. See block_mxfp6 (ggml-common.h)
+// for the full design rationale (E3M2 subset-of-e4m3 lossless GPU upconvert).
+void quantize_row_mxfp6_ref(const float * GGML_RESTRICT x, block_mxfp6 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP6;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    uint8_t codes[QK_MXFP6];
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            amax = MAX(amax, fabsf(v));
+        }
+
+        // Smallest power-of-two scale d = 2^e such that amax/d <= 28.0
+        // (E3M2 max finite magnitude), same UE8M0 convention as
+        // quantize_row_mxfp8_ref above (see that function for the frexpf
+        // derivation), just against MXFP6's own finite ceiling.
+        uint8_t e = 0;
+        float d = 1.0f;
+        if (amax > 0.0f) {
+            int exp2;
+            const float mant = frexpf(amax / 28.0f, &exp2);
+            int biased = (mant <= 0.5f) ? (exp2 - 1 + 127) : (exp2 + 127);
+            if (biased < 0)   biased = 0;
+            if (biased > 254) biased = 254;
+            e = (uint8_t) biased;
+            d = ggml_e8m0_to_fp32(e);
+        }
+        const float id = d ? 1.0f/d : 0.0f;
+
+        y[i].e = e;
+
+        for (int j = 0; j < qk; ++j) {
+            const float x0 = x[i*qk + j]*id;
+            codes[j] = ggml_fp32_to_e3m2(x0);
+        }
+
+        // Pack 32 six-bit codes into 24 bytes, 4 values per 3 bytes (see
+        // block_mxfp6 comment, ggml-common.h, for the bit layout).
+        for (int g = 0; g < qk/4; ++g) {
+            const uint8_t v0 = codes[4*g+0];
+            const uint8_t v1 = codes[4*g+1];
+            const uint8_t v2 = codes[4*g+2];
+            const uint8_t v3 = codes[4*g+3];
+            y[i].qs[3*g+0] = (uint8_t) ((v0 & 0x3F) | ((v1 & 0x03) << 6));
+            y[i].qs[3*g+1] = (uint8_t) (((v1 >> 2) & 0x0F) | ((v2 & 0x0F) << 4));
+            y[i].qs[3*g+2] = (uint8_t) (((v2 >> 4) & 0x03) | ((v3 & 0x3F) << 2));
+        }
+    }
+}
+
+void dequantize_row_mxfp6(const block_mxfp6 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP6;
+
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_e8m0_to_fp32(x[i].e);
+
+        for (int g = 0; g < qk/4; ++g) {
+            const uint8_t b0 = x[i].qs[3*g+0];
+            const uint8_t b1 = x[i].qs[3*g+1];
+            const uint8_t b2 = x[i].qs[3*g+2];
+
+            const uint8_t v0 = (uint8_t) (b0 & 0x3F);
+            const uint8_t v1 = (uint8_t) (((b0 >> 6) & 0x03) | ((b1 & 0x0F) << 2));
+            const uint8_t v2 = (uint8_t) (((b1 >> 4) & 0x0F) | ((b2 & 0x03) << 4));
+            const uint8_t v3 = (uint8_t) ((b2 >> 2) & 0x3F);
+
+            y[i*qk + 4*g+0] = ggml_e3m2_to_fp32(v0) * d;
+            y[i*qk + 4*g+1] = ggml_e3m2_to_fp32(v1) * d;
+            y[i*qk + 4*g+2] = ggml_e3m2_to_fp32(v2) * d;
+            y[i*qk + 4*g+3] = ggml_e3m2_to_fp32(v3) * d;
         }
     }
 }
@@ -2110,6 +2584,10 @@ size_t quantize_q1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     return nrow * row_size;
 }
 
+// PrismML ternary 2-bit (g128): code {0,1,2,3} -> symbol {-1,0,+1,+2} * d.
+// Mechanical mirror of quantize_q1_0 -- wraps the existing quantize_row_q2_0_ref
+// (round-trip-inverse of dequantize_row_q2_0). imatrix is ignored, same as the
+// q1_0 ref path (the ref quantizer picks its own per-block scale).
 size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     if (!quant_weights) {
         quantize_row_q2_0_ref(src, dst, (int64_t)nrow*n_per_row);
@@ -2124,6 +2602,7 @@ size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     }
     return nrow * row_size;
 }
+
 
 size_t quantize_q4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     if (!quant_weights) {
@@ -2309,6 +2788,51 @@ size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     GGML_UNUSED(quant_weights);
     quantize_row_nvfp4_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_NVFP4, n_per_row);
+}
+
+size_t quantize_f8e4m3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_f8e4m3_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_F8E4M3, n_per_row);
+}
+
+size_t quantize_f8e5m2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_f8e5m2_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_F8E5M2, n_per_row);
+}
+
+size_t quantize_mxfp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_mxfp8_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_MXFP8, n_per_row);
+}
+
+size_t quantize_mxfp6(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_mxfp6_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_MXFP6, n_per_row);
+}
+
+size_t quantize_2of4_fp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_2of4_fp8_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_2OF4_FP8, n_per_row);
+}
+
+size_t quantize_2of4_f16(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_2of4_f16_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_2OF4_F16, n_per_row);
+}
+
+// T89 driver-completeness run: plain RTN, no imatrix weighting on purpose --
+// this is a "does the kernel execute" test, not an accuracy exercise.
+// EXPERIMENTAL / model-blocked, see block_iu4 comment in ggml-common.h.
+size_t quantize_iu4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_iu4_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_IU4, n_per_row);
 }
 
 // ====================== Ternary (de)-quantization (BitNet b1.58 and TriLMs)
@@ -5557,9 +6081,57 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q8_0, data, nb);
             } break;
+        case GGML_TYPE_F8E4M3:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_f8e4m3, data, nb);
+            } break;
+        case GGML_TYPE_F8E5M2:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_f8e5m2, data, nb);
+            } break;
+        case GGML_TYPE_2OF4_FP8:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_2of4_fp8, data, nb);
+            } break;
+        case GGML_TYPE_2OF4_F16:
+            {
+                // no block scale field to validate (see block_2of4_f16 comment) --
+                // check every kept fp16 value directly, same as VALIDATE_ROW_DATA_D_F16_IMPL
+                // does for a block's `.d` scale.
+                const block_2of4_f16 * q = (const block_2of4_f16 *) (data);
+                for (size_t i = 0; i < (nb); ++i) {
+                    for (int j = 0; j < QK_2OF4_F16/2; ++j) {
+                        if (!validate_fp16(q[i].qs[j], i)) {
+                            return false;
+                        }
+                    }
+                }
+            } break;
+        case GGML_TYPE_IU4:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_iu4, data, nb);
+            } break;
         case GGML_TYPE_MXFP4:
             {
                 VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp4, data, nb);
+            } break;
+        case GGML_TYPE_MXFP8:
+            {
+                // Same e8m0 shared-scale validation as MXFP4 -- block_mxfp8's
+                // scale field is also named `e`, so the macro applies unchanged.
+                // The e4m3 qs[] bytes need no separate validation (unlike
+                // block_f8e4m3's fp16 `d`, e4m3 payload bytes have no NaN/Inf
+                // encoding relevant here -- same rationale NVFP4 documents above
+                // for its own uint8 payload).
+                VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp8, data, nb);
+            } break;
+        case GGML_TYPE_MXFP6:
+            {
+                // Same e8m0 shared-scale validation as MXFP8 -- block_mxfp6's
+                // scale field is also named `e`. The packed 6-bit E3M2 qs[]
+                // bytes need no separate validation (no NaN/Inf encoding in
+                // E3M2 at all -- every one of the 64 codes is finite).
+                VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp6, data, nb);
             } break;
         case GGML_TYPE_NVFP4:
             {

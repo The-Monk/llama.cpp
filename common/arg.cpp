@@ -311,6 +311,7 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_F8E4M3, // T80: fork-only KV cache type, RDNA4/gfx1201 FA vec kernel only
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {

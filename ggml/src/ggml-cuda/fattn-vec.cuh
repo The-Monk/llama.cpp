@@ -73,7 +73,39 @@ static __global__ void flash_attn_ext_vec(
 
 #ifdef GGML_USE_HIP
 #ifdef RDNA
-    constexpr int nthreads_KQ_q = 2;
+    // Card 137 fix 1 (register spills): the flat RDNA nthreads_KQ_q=2 tuning
+    // was chosen for the plain int8-decode KV types (Q4_0/Q8_0/etc, which
+    // need no extra per-element decode state). F8E4M3 KV adds its own
+    // fp8-decode arithmetic on top of the same per-thread Q_i32/Q_ds arrays
+    // (sized D/(4*nthreads_KQ) each, x ncols) -- at nthreads_KQ=2 and
+    // ncols=2, D in {128,256}, that blows well past the register budget.
+    // Static llvm-readobj audit (card 137, fresh measurement) confirmed real
+    // spills at exactly hd128/hd256 ncols=2 (this fork's build:
+    // vgpr_spill 173-181 @ D=128, 281-282 @ D=256; card 124's original scan
+    // reported 116-294 VGPR + 21-44 SGPR on a slightly different tree state
+    // -- same shape family, same root cause).
+    //
+    // SWEPT (2, 4, 8, 16, 32 -- non-monotonic occupancy cliffs are real
+    // here, same T68 lesson as the mmvq rows_per_block sweep, do not assume
+    // a single "wider is better" direction):
+    //   nthreads_KQ_q=4:  D=128 WORSE (195/194), D=256 much better (52/52)
+    //   nthreads_KQ_q=8:  D=128 much better (32/38), D=256 near-zero (1/1)
+    //   nthreads_KQ_q=16: D=128 worse than 8 (55/55), D=256 ZERO (0/0)
+    //   nthreads_KQ_q=32: D=128 near-zero (1/1), D=256 near-zero (1/1) --
+    //     BUT this also touches D=64 and ncols=1, which were NOT spilling
+    //     at baseline and regress badly at 32 (D=64/ncols=2: 0->129;
+    //     D=128/ncols=1: 37->221) -- confirms the register/parallelism
+    //     tradeoff is shape-specific, not a free "more threads always help".
+    // Chosen: nthreads_KQ_q=32 (==WARP_SIZE) ONLY for the exact spilling
+    // shape (F8E4M3, ncols==2, D==128 or D==256) -- reduces both to 1 VGPR /
+    // 0 SGPR spilled (down from 173-282 VGPR / 0-21 SGPR), a >99% cut, while
+    // leaving every non-spilling shape (D=64, ncols=1, every non-F8E4M3
+    // type) byte-for-byte untouched at the original nthreads_KQ_q=2.
+    // vec_dot_fattn_vec_KQ_f8e4m3 (fattn-common.cuh) is already fully
+    // generic in `nthreads` including the nthreads==WARP_SIZE case (no
+    // hardcoded assumption of 2), so this is correctness-safe -- only the
+    // register/parallelism tradeoff changes for the targeted shape.
+    constexpr int nthreads_KQ_q = (type_K == GGML_TYPE_F8E4M3 && ncols == 2 && (D == 128 || D == 256)) ? 32 : 2;
 #else
     constexpr int nthreads_KQ_q = 4;
 #endif // RDNA
@@ -609,3 +641,12 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
+
+// T80: F8E4M3 KV cache -- only the symmetric K==V==F8E4M3 case is wired
+// (matches the honest-value-gate scope: KV-cache experiment, not a general
+// FA-quant sweep), so declared standalone rather than via
+// EXTERN_DECL_FATTN_VEC_CASES (which would pull in F8E4M3 as a type_V for
+// every other type_K too, none of which have an instance file).
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F8E4M3, GGML_TYPE_F8E4M3);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_F8E4M3, GGML_TYPE_F8E4M3);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_F8E4M3, GGML_TYPE_F8E4M3);

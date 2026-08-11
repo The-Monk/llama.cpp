@@ -112,6 +112,23 @@ typedef sycl::half2 ggml_half2;
 #define QI_NVFP4 (QK_NVFP4 / (4 * QR_NVFP4))
 #define QR_NVFP4 2
 
+#define QI_F8E4M3 (QK_F8E4M3 / (4 * QR_F8E4M3))
+#define QR_F8E4M3 1
+
+#define QI_F8E5M2 (QK_F8E5M2 / (4 * QR_F8E5M2))
+#define QR_F8E5M2 1
+
+#define QI_MXFP8 (QK_MXFP8 / (4 * QR_MXFP8))
+#define QR_MXFP8 1
+
+// MXFP6: QI counts "groups of 4 values" (3 packed bytes/group), NOT raw
+// 4-byte words like every byte-per-value quant above -- get_mxfp6_e4m3x4()
+// (common.cuh) addresses qs at 3-byte-group granularity using this same
+// index, mirroring get_int_b2's byte-word addressing 1:1 so the mmvq main
+// loop (kbx/iqs arithmetic) is unchanged.
+#define QI_MXFP6 (QK_MXFP6 / 4)
+#define QR_MXFP6 1
+
 #define QI5_0 (QK5_0 / (4 * QR5_0))
 #define QR5_0 2
 
@@ -184,10 +201,10 @@ typedef struct {
 } block_q1_0;
 static_assert(sizeof(block_q1_0) == sizeof(ggml_half) + QK1_0 / 8, "wrong q1_0 block size/padding");
 
-#define QK2_0 64
+#define QK2_0 128
 typedef struct {
-    ggml_half d;              // delta (scale)
-    uint8_t qs[QK2_0 / 4];   // 2 bits per element
+    ggml_half d;           // delta
+    uint8_t qs[QK2_0 / 4]; // 2 bits per element
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
 
@@ -225,6 +242,163 @@ typedef struct {
     uint8_t qs[QK_NVFP4/2];           // packed 4-bit E2M1 values (32 bytes)
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
+
+// F8E4M3 (Path X): signed e4m3 weights (1 byte/value) + one fp16 scale per block.
+// Mirrors block_q8_0 layout; the scale is per-block here (Path Y will carry a
+// per-tensor Quark scale via a different block/load path, same decode kernel).
+#define QK_F8E4M3 32
+typedef struct {
+    ggml_half d;               // per-block scale (fp16)
+    uint8_t   qs[QK_F8E4M3];   // signed e4m3 (OCP e4m3fn) raw bytes, 1 per value
+} block_f8e4m3;
+static_assert(sizeof(block_f8e4m3) == sizeof(ggml_half) + QK_F8E4M3, "wrong f8e4m3 block size/padding");
+
+// F8E5M2 (T97, OCP bf8): signed e5m2 weights (1 byte/value) + one fp16 scale
+// per block. Same 8.5 bpw block layout as block_f8e4m3/block_q8_0 (mirrors
+// on purpose -- every generic q8_0-shaped code path (get_int_b2 byte packing,
+// MMQ_DP4A_TXS_Q8_0 tile sizing, etc.) is reusable without a new layout).
+// Unlike e4m3fn, OCP e5m2 has real +-Inf and a NaN encoding (5 exponent bits,
+// bias 15); the per-block scale still keeps every stored value well inside
+// the finite range in practice (quantizer maps block amax -> 57344, the
+// largest finite e5m2 magnitude), so Inf is never produced by our own
+// quantizer, only decodable if malformed/foreign data is loaded (validate_row_data
+// simply range-checks the same D_F16 pattern as every other d-scaled type --
+// the qs bytes are unrestricted, mirrors block_q8_0).
+#define QK_F8E5M2 32
+typedef struct {
+    ggml_half d;               // per-block scale (fp16)
+    uint8_t   qs[QK_F8E5M2];   // signed e5m2 (OCP bf8) raw bytes, 1 per value
+} block_f8e5m2;
+static_assert(sizeof(block_f8e5m2) == sizeof(ggml_half) + QK_F8E5M2, "wrong f8e5m2 block size/padding");
+
+// MXFP8 (OCP Microscaling FP8, ROC8): identical leaf value format to
+// block_f8e4m3 -- signed e4m3 (OCP e4m3fn) weight bytes, 1 per value -- the
+// ONLY structural difference is the scale: OCP MX uses a shared per-32-block
+// UE8M0 (unsigned, power-of-2, biased-127) scale instead of a continuous fp16
+// delta. `OsaurusAI/Qwen3.6-27B-MXFP8-MTP` (config.json: bits=8, group_size=32,
+// mode='mxfp8', backend='mx.quantize') is produced this way -- MLX's
+// mx.quantize packs one e8m0 byte per 32-element group, matching QK=32 1:1.
+// scale = 2^(e-127) (ggml_e8m0_to_fp32 / ggml_cuda_e8m0_to_fp32 -- the SAME
+// helper GGML_TYPE_MXFP4 already uses for its own e8m0 scale, NOT the
+// "_HALF" variant: MXFP4's kvalues are pre-doubled so it needs scale/2, but
+// e4m3 leaf values here are NOT doubled, so plain e8m0->fp32 is correct).
+// Every fp8 compute kernel (WMMA prefill fp8xfp8 fragment, dp4a-style decode
+// dot) is value-format-agnostic to e4m3 bytes regardless of scale source --
+// see mmq.cuh load_tiles_mxfp8/vec_dot_mxfp8_mxfp8_mma and vecdotq.cuh
+// vec_dot_mxfp8_q8_1, both mechanical mirrors of the block_f8e4m3 versions
+// that only change how the per-block scale is decoded.
+#define QK_MXFP8 32
+typedef struct {
+    uint8_t e;               // UE8M0 shared scale (biased-127, power-of-2 only)
+    uint8_t qs[QK_MXFP8];     // signed e4m3 (OCP e4m3fn) raw bytes, 1 per value
+} block_mxfp8;
+static_assert(sizeof(block_mxfp8) == sizeof(uint8_t) + QK_MXFP8, "wrong mxfp8 block size/padding");
+
+// MXFP6 (OCP Microscaling FP6, ROC8): 6-bit E3M2 (3 exp bits, bias=3, 2
+// mantissa bits, OCP MX FP6 -- NO Inf/NaN encoding, all 64 bit patterns are
+// finite) weight elements, 4 packed per 3 bytes (24 bytes for QK_MXFP6=32
+// elements) + one shared per-32-block UE8M0 scale byte, same convention as
+// block_mxfp8/block_mxfp4 (scale = 2^(e-127), ggml_e8m0_to_fp32).
+//
+// E3M2 is a strict SUBSET of e4m3fn (OCP e4m3, 4 exp bits bias=7, 3 mantissa
+// bits): e4m3 has 4 more exponent steps of headroom on both ends and one
+// extra mantissa bit, so every finite E3M2 value round-trips EXACTLY through
+// e4m3 -- this is the whole design: the GPU vec_dot upconverts each 6-bit
+// element to its bit-exact e4m3 byte in-register (ggml_cuda_e3m2_to_e4m3,
+// common.cuh) and reuses the EXISTING fp8 dp4a/hardware-dot2 compute path
+// verbatim (see vecdotq.cuh vec_dot_mxfp6_q8_1[_simd]_impl) -- ~6.25 bpw
+// storage/bandwidth at fp8-grade compute, not a new compute kernel.
+//
+//   qs[3*g+0..2] -- 3 packed bytes holding 4 six-bit E3M2 codes v0..v3 of
+//                   group g (g = 0..7): v0 = qs[3g] & 0x3F; v1 = (qs[3g]>>6
+//                   & 0x3) | ((qs[3g+1]&0xF)<<2); v2 = (qs[3g+1]>>4 & 0xF) |
+//                   ((qs[3g+2]&0x3)<<4); v3 = qs[3g+2]>>2 & 0x3F (see
+//                   mxfp6_unpack4 in common.cuh for the single source of
+//                   truth -- CPU (ggml-quants.c) and GPU (common.cuh) both
+//                   implement this same bit layout independently).
+//
+// 25 bytes / 32 logical values = 6.25 bpw (vs block_mxfp8's 8.25 bpw).
+#define QK_MXFP6 32
+typedef struct {
+    uint8_t e;                    // UE8M0 shared scale (biased-127, power-of-2 only)
+    uint8_t qs[QK_MXFP6*6/8];      // 4 packed 6-bit E3M2 codes per 3 bytes (24 bytes)
+} block_mxfp6;
+static_assert(sizeof(block_mxfp6) == sizeof(uint8_t) + QK_MXFP6*6/8, "wrong mxfp6 block size/padding");
+
+// 2OF4_FP8 (RDNA4 2:4-structured-sparse SWMMAC driver-completeness run):
+// per-32-element block, host-side-compressed to the 16 "kept" nonzero
+// e4m3 values (2 per group of 4) + 2-bit-per-index metadata + one fp16
+// scale. This is a GGUF STORAGE layout, distinct from (but designed to
+// trivially re-pack into) the per-lane hardware VGPR layout the
+// V_SWMMAC_F32_16X16X32_FP8_FP8 instruction expects (see swmmac24.cuh);
+// ggml-cuda/mul_mat_2of4_fp8.cu does that re-pack on load.
+//
+//   qs[2*g+0], qs[2*g+1]  -- e4m3 bytes for the two kept values of group g
+//                            (g = 0..7), value order matches ascending
+//                            in-group position (v0 = lower position).
+//   meta[g/2]             -- byte holding 2 groups' worth of 2-bit indices:
+//                            low nibble = group (2*i), high nibble = group
+//                            (2*i+1); each nibble = idx0 | (idx1 << 2),
+//                            idx0 < idx1, both in [0,3] (the kept in-group
+//                            positions, 2 bits each -- exactly the ISA's
+//                            "S=0.5 VGPR/lane" sparsity_idx packing, see
+//                            swmmac24.cuh's GGML_SWMMAC24_IDX_BITS_PER_ENTRY
+//                            block of #defines).
+//
+// 22 bytes / 32 logical values = 5.5 bpw (vs block_f8e4m3's 8.5 bpw dense)
+// -- the whole point of storing only the 50% of weights the 2:4 prune kept.
+#define QK_2OF4_FP8 32
+typedef struct {
+    ggml_half d;                   // per-block scale (fp16), amax of the 16 kept values -> 448.0
+    uint8_t   qs[QK_2OF4_FP8/2];   // 16 kept e4m3 bytes (2 per group of 4, 8 groups)
+    uint8_t   meta[QK_2OF4_FP8/8]; // 4 bytes: packed 2-bit-per-index sparsity metadata
+} block_2of4_fp8;
+static_assert(sizeof(block_2of4_fp8) == sizeof(ggml_half) + QK_2OF4_FP8/2 + QK_2OF4_FP8/8, "wrong 2of4_fp8 block size/padding");
+
+// 2OF4_F16 (card 141: sparse-fp16 2:4 end-to-end, mirrors 2OF4_FP8 exactly
+// except the kept values are stored as NATIVE fp16, not e4m3+scale). fp16
+// already has a 5-bit exponent / 10-bit mantissa -- wide enough dynamic
+// range that, unlike e4m3, it needs NO per-block scale factor at all; the
+// 16 kept values are just raw ggml_fp16_t. Same meta/index packing as
+// block_2of4_fp8 (2-bit-per-index, 2 indices/group of 4, 8 groups -> the
+// SAME 16 meaningful bits of `meta` feed directly into the ISA's
+// `sparsity_idx` lane operand for the K=32 SWMMAC forms -- see swmmac24.cuh).
+//
+//   qs[2*g+0], qs[2*g+1]  -- fp16 values for the two kept values of group g
+//                            (g = 0..7), value order matches ascending
+//                            in-group position (v0 = lower position).
+//   meta[g/2]             -- byte holding 2 groups' worth of 2-bit indices,
+//                            IDENTICAL layout/packing to block_2of4_fp8.meta.
+//
+// 36 bytes / 32 logical values = 9 bpw (vs 16 bpw dense fp16) -- half the
+// weights kept (2:4) plus a small index tax, no fp8 precision loss at all.
+#define QK_2OF4_F16 32
+typedef struct {
+    ggml_half qs[QK_2OF4_F16/2];   // 16 kept fp16 values (2 per group of 4, 8 groups) -- ggml_half == raw fp16 bit pattern, same type block_q4_1.d etc use
+    uint8_t   meta[QK_2OF4_F16/8]; // 4 bytes: packed 2-bit-per-index sparsity metadata (same format as block_2of4_fp8)
+} block_2of4_f16;
+static_assert(sizeof(block_2of4_f16) == (QK_2OF4_F16/2)*sizeof(ggml_half) + QK_2OF4_F16/8, "wrong 2of4_f16 block size/padding");
+
+// IU4 (T89->driver-completeness run): signed int4 weights (2/byte) + one
+// fp16 scale per block. Q4_0-shaped (18 bytes / 32 values), but the nibble
+// packing convention is DIFFERENT from block_q4_0: byte b's low nibble is
+// element 2*b, high nibble is element 2*b+1 (interleaved pairs), matching
+// EXACTLY the convention ggml_cuda_iu4_w4a4.cu's pack_row_i4() uses for the
+// validated `mma_iu4()` WMMA operand packing (see iu4_w4a4.cu top-of-file
+// comment) -- NOT the split-half convention block_q4_0 uses. Values are
+// symmetric-quantized to [-8,7], no zero-point.
+// EXPERIMENTAL / model-blocked: no rotation-free packed-int4 W4A4 model
+// exists yet (needs QuaRot/SpinQuant online rotation or a co-trained
+// BitNet-a4.8, see cards 122/133) -- plain RTN quantization into this block
+// is expected to be low quality. The kernel compiles and runs finite (no
+// crash) but is not production; kept dormant until a real producer model
+// shows up. Does not affect any other type's dispatch path.
+#define QK_IU4 32
+typedef struct {
+    ggml_half d;             // per-block scale (fp16)
+    uint8_t   qs[QK_IU4/2];  // packed signed int4, low nibble=2*b, high nibble=2*b+1
+} block_iu4;
+static_assert(sizeof(block_iu4) == sizeof(ggml_half) + QK_IU4/2, "wrong iu4 block size/padding");
 
 #define QK5_0 32
 typedef struct {

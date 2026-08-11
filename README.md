@@ -1,3 +1,21 @@
+> ### This is a fork
+>
+> Upstream: **[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)** — MIT, © the ggml authors.
+> All credit for llama.cpp belongs there; this branch only adds work on top of it.
+>
+> **Branch `roc8`** carries AMD **gfx1201 / RDNA4** (Radeon AI PRO R9700) inference work:
+> per-format hipBLASLt prefill routes, an int4 `v_dot8_i32_iu4` decode path, native
+> fp8 E4M3 kernels, 2:4-sparse SWMMAC via CK, and assorted correctness fixes
+> (notably `GGML_TYPE_Q2_0` missing from `ggml_validate_row_data`, and weight-cache
+> invalidation on buffer free).
+>
+> Every added route is **opt-in and env-gated**, defaulting to the stock kernel, because
+> the win is shape- and model-dependent — see the crossover measurement in the write-up.
+>
+> These changes are **not upstreamed** and carry no endorsement from the llama.cpp
+> maintainers. Measurements were taken on one machine (2x R9700, gfx1201); treat them
+> as reproducible-here, not as general claims.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)

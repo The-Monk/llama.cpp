@@ -100,6 +100,161 @@ static __global__ void quantize_q8_1(
     y[ib].ds = make_half2(d, sum);
 }
 
+// T79: BS=1 AND BS>1 mmvq-decode activation quantization to signed e4m3,
+// written into a block_q8_1-shaped container -- same struct/size/stride math
+// as quantize_q8_1 above (32-value blocks), only the byte contents differ:
+// `qs` holds raw signed e4m3 bytes (not an int8 code) and `ds.y` (the int8
+// zero-point "sum" term) is unused/zero since a symmetric fp8 quantizer has
+// no zero-point correction to carry -- mirrors the D4-vs-DS4 distinction
+// quantize_mmq_f8e4m3 (Phase 1b, above) makes for the MMQ/WMMA prefill path.
+// This is the decode-side twin of that exact function: same amax->448.0f
+// scale mapping, same ggml_cuda_fp32_to_e4m3 encoder, so it inherits that
+// path's already-production-validated numerics (T79 accuracy-gate re-probed
+// it directly via perplexity: see wiki T79). Reusing block_q8_1 (not a new
+// struct) means the ggml_cuda_mul_mat_vec_q call site needs zero buffer-
+// allocation changes -- only the quantize function pointer swaps for
+// GGML_TYPE_F8E4M3 (mmvq.cu), and vec_dot_f8e4m3_f8e4m3_impl (vecdotq.cuh)
+// reads it back via the exact same block_q8_1* pointer every other quant
+// type's decode dot product uses.
+__launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
+static __global__ void quantize_q8_1_f8e4m3(
+        const float * x_ptr, void * vy_ptr,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
+    ggml_cuda_pdl_lc();
+    const float * GGML_CUDA_RESTRICT x  = x_ptr;
+    void        * GGML_CUDA_RESTRICT vy = vy_ptr;
+    const int64_t i0 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i0 >= ne0) {
+        return;
+    }
+
+    const int64_t i3 = fastdiv(blockIdx.z, ne2);
+    const int64_t i2 = blockIdx.z - i3*ne2.z;
+    const int64_t i1 = blockIdx.y;
+
+    const int64_t & i00 = i0;
+    const int64_t & i01 = i1;
+    const int64_t & i02 = i2;
+    const int64_t & i03 = i3;
+
+    const int64_t i_cont = ((i3*ne2.z + i2) * ne1 + i1) * ne0 + i0;
+
+    block_q8_1 * y = (block_q8_1 *) vy;
+
+    const int64_t ib  = i_cont / QK8_1; // block index
+    const int64_t iqs = i_cont % QK8_1; // quant index
+
+    ggml_cuda_pdl_sync();
+    const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
+    float amax = fabsf(xi);
+
+    amax = warp_reduce_max<QK8_1>(amax);
+
+    const float d_inv = amax > 0.0f ? 448.0f / amax : 0.0f; // e4m3fn max finite magnitude
+    const uint8_t q = ggml_cuda_fp32_to_e4m3(xi * d_inv);
+
+    ((uint8_t *) y[ib].qs)[iqs] = q;
+
+    if (iqs > 0) {
+        return;
+    }
+
+    const float d = d_inv > 0.0f ? 1.0f / d_inv : 0.0f;
+    y[ib].ds = make_half2(d, 0.0f);
+}
+
+void quantize_row_f8e4m3_for_mmvq_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(!ids);
+    GGML_ASSERT(ne0 % QK8_1 == 0);
+
+    const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
+
+    const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+    const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
+    ggml_cuda_kernel_launch(quantize_q8_1_f8e4m3, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    GGML_UNUSED(type_src0);
+}
+
+// Card 137 fix 2: bf8 (E5M2) twin of quantize_q8_1_f8e4m3/quantize_row_
+// f8e4m3_for_mmvq_cuda above -- same block_q8_1-shaped container, same
+// amax-based scale mapping, only the encoder (ggml_cuda_fp32_to_e5m2) and
+// the max-finite-magnitude constant differ: OCP e5m2 max normal magnitude is
+// 57344.0f (exp<=15 unbiased, mantissa max 0b11 -> 1.75 * 2^15), vs e4m3's
+// 448.0f. `ds.y` stays unused/zero, same symmetric-quantizer rationale as
+// the e4m3 twin.
+__launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
+static __global__ void quantize_q8_1_f8e5m2(
+        const float * x_ptr, void * vy_ptr,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
+    ggml_cuda_pdl_lc();
+    const float * GGML_CUDA_RESTRICT x  = x_ptr;
+    void        * GGML_CUDA_RESTRICT vy = vy_ptr;
+    const int64_t i0 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i0 >= ne0) {
+        return;
+    }
+
+    const int64_t i3 = fastdiv(blockIdx.z, ne2);
+    const int64_t i2 = blockIdx.z - i3*ne2.z;
+    const int64_t i1 = blockIdx.y;
+
+    const int64_t & i00 = i0;
+    const int64_t & i01 = i1;
+    const int64_t & i02 = i2;
+    const int64_t & i03 = i3;
+
+    const int64_t i_cont = ((i3*ne2.z + i2) * ne1 + i1) * ne0 + i0;
+
+    block_q8_1 * y = (block_q8_1 *) vy;
+
+    const int64_t ib  = i_cont / QK8_1; // block index
+    const int64_t iqs = i_cont % QK8_1; // quant index
+
+    ggml_cuda_pdl_sync();
+    const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
+    float amax = fabsf(xi);
+
+    amax = warp_reduce_max<QK8_1>(amax);
+
+    const float d_inv = amax > 0.0f ? 57344.0f / amax : 0.0f; // e5m2 (OCP) max finite magnitude
+    const uint8_t q = ggml_cuda_fp32_to_e5m2(xi * d_inv);
+
+    ((uint8_t *) y[ib].qs)[iqs] = q;
+
+    if (iqs > 0) {
+        return;
+    }
+
+    const float d = d_inv > 0.0f ? 1.0f / d_inv : 0.0f;
+    y[ib].ds = make_half2(d, 0.0f);
+}
+
+void quantize_row_f8e5m2_for_mmvq_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(!ids);
+    GGML_ASSERT(ne0 % QK8_1 == 0);
+
+    const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
+
+    const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+    const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
+    ggml_cuda_kernel_launch(quantize_q8_1_f8e5m2, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    GGML_UNUSED(type_src0);
+}
+
 __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
     if (!(amax > 0.0f)) {
         return 0;
@@ -660,6 +815,210 @@ void quantize_scatter_mmq_fp4_cuda(
         quantize_mmq_mxfp4<true><<<num_blocks, block_size, 0, stream>>>(
             x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
     }
+// F8E4M3 (Path X, Phase 1b) online activation quantization. Structurally a
+// copy of quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4> -- same thread/block
+// layout, same output container (block_q8_1_mmq) and stride math -- with two
+// changes: the scale maps amax to the e4m3 max magnitude (448.0f, not 127)
+// and each value is encoded via the signed e4m3 codec instead of an int8
+// round. The container's `qs` field is declared int8_t but is really just a
+// raw-byte payload here (mirrors how block_q8_1_mmq is reused for MXFP4/
+// NVFP4's differently-encoded nibbles); vec_dot_f8e4m3_f8e4m3_mma reads it
+// back as raw bytes for the fp8 WMMA fragment, never as a signed integer.
+static __global__ void quantize_mmq_f8e4m3(
+        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int ne1, const int ne2) {
+
+    constexpr int vals_per_scale = 32;
+
+    const int64_t i0 = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
+
+    if (i0 >= ne0) {
+        return;
+    }
+
+    const int64_t i1 = blockIdx.x;
+    const int64_t i2 = blockIdx.z % ne2;
+    const int64_t i3 = blockIdx.z / ne2;
+
+    const int64_t i00 = i0;
+    ggml_cuda_pdl_sync();
+    const int64_t i01 = ids ? ids[i1] : i1;
+    const int64_t i02 = i2;
+    const int64_t i03 = i3;
+
+    const float4 * x4 = (const float4 *) x;
+
+    block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
+
+    const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1); // first block of channel
+    const int64_t ib  = ib0 + (i0 / (4*QK8_1))*ne1 + blockIdx.x;                    // block index in channel
+    const int64_t iqs = i0 % (4*QK8_1);                                             // quant index in block
+
+    // Load 4 floats per thread and calculate max. abs. value between them:
+    const float4 xi = i0 < ne00 ? x4[(i03*s03 + i02*s02 + i01*s01 + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+
+    // Exchange max. abs. value between vals_per_scale/4 threads.
+#pragma unroll
+    for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    }
+
+    const float d_inv = amax > 0.0f ? 448.0f / amax : 0.0f; // 448.0 = e4m3fn max finite magnitude
+
+    // Encode 4 activations -> 4 raw e4m3 bytes. On RDNA4 use the hardware packed
+    // converter V_CVT_PK_FP8_F32 (2 fp32 -> 2 e4m3 per instruction, 2 instructions
+    // total) instead of 4x the ~15-op software e4m3 codec; hw rounds RNE to e4m3fn,
+    // ppl-neutral. word_sel=false writes bytes 0,1; true writes bytes 2,3 (mirrors
+    // the cvt_pk_f32_fp8 decode-side byte order).
+    uint32_t packed;
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+    packed = __builtin_amdgcn_cvt_pk_fp8_f32(xi.x*d_inv, xi.y*d_inv, 0u,     false);
+    packed = __builtin_amdgcn_cvt_pk_fp8_f32(xi.z*d_inv, xi.w*d_inv, packed, true);
+#else
+    uint8_t q4[4];
+    q4[0] = ggml_cuda_fp32_to_e4m3(xi.x*d_inv);
+    q4[1] = ggml_cuda_fp32_to_e4m3(xi.y*d_inv);
+    q4[2] = ggml_cuda_fp32_to_e4m3(xi.z*d_inv);
+    q4[3] = ggml_cuda_fp32_to_e4m3(xi.w*d_inv);
+    memcpy(&packed, q4, 4);
+#endif
+
+    // Write back 4 raw e4m3 bytes as a single 32 bit value for better memory bandwidth:
+    uint32_t * yqs4 = (uint32_t *) y[ib].qs;
+    yqs4[iqs/4] = packed;
+
+    if (iqs % 32 != 0) {
+        return;
+    }
+
+    const float d = d_inv > 0.0f ? 1.0f / d_inv : 0.0f;
+
+    y[ib].d4[iqs/32] = d;
+}
+
+void quantize_mmq_f8e4m3_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    // ROC8: MXFP8's WMMA fragment is the same fp8xfp8 shape as F8E4M3 (raw
+    // e4m3 weight bytes; only the weight-side SCALE representation differs,
+    // irrelevant here since this quantizer only touches the activation/src1
+    // side) -- broadened to accept both types, see the mmq.cu call-site
+    // comment for the correctness-coupling note.
+    GGML_ASSERT(type_src0 == GGML_TYPE_F8E4M3 || type_src0 == GGML_TYPE_MXFP8);
+    GGML_ASSERT(ne00 % 4 == 0);
+    GGML_ASSERT(ne0 % (4*QK8_1) == 0);
+
+    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    quantize_mmq_f8e4m3<<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+}
+
+// T97: F8E5M2 twin of quantize_mmq_f8e4m3 above -- online activation
+// quantization to signed e5m2 for the native bf8xbf8 WMMA prefill path.
+// Structurally identical, only the scale (57344.0 = e5m2 max finite
+// magnitude, not 448.0) and the codec (ggml_cuda_fp32_to_e5m2, not e4m3)
+// differ.
+static __global__ void quantize_mmq_f8e5m2(
+        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int ne1, const int ne2) {
+
+    constexpr int vals_per_scale = 32;
+
+    const int64_t i0 = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
+
+    if (i0 >= ne0) {
+        return;
+    }
+
+    const int64_t i1 = blockIdx.x;
+    const int64_t i2 = blockIdx.z % ne2;
+    const int64_t i3 = blockIdx.z / ne2;
+
+    const int64_t i00 = i0;
+    ggml_cuda_pdl_sync();
+    const int64_t i01 = ids ? ids[i1] : i1;
+    const int64_t i02 = i2;
+    const int64_t i03 = i3;
+
+    const float4 * x4 = (const float4 *) x;
+
+    block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
+
+    const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1); // first block of channel
+    const int64_t ib  = ib0 + (i0 / (4*QK8_1))*ne1 + blockIdx.x;                    // block index in channel
+    const int64_t iqs = i0 % (4*QK8_1);                                             // quant index in block
+
+    // Load 4 floats per thread and calculate max. abs. value between them:
+    const float4 xi = i0 < ne00 ? x4[(i03*s03 + i02*s02 + i01*s01 + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+
+    // Exchange max. abs. value between vals_per_scale/4 threads.
+#pragma unroll
+    for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    }
+
+    const float d_inv = amax > 0.0f ? 57344.0f / amax : 0.0f; // 57344.0 = e5m2 max finite magnitude
+
+    // Encode 4 activations -> 4 raw e5m2 (OCP bf8) bytes. On RDNA4 use the hardware
+    // packed converter V_CVT_PK_BF8_F32 (2 fp32 -> 2 bf8 per instruction) instead of
+    // 4x the software bf8 codec; mirrors the e4m3 path above and the cvt_pk_f32_bf8
+    // decode-side byte order (word_sel=false -> bytes 0,1; true -> bytes 2,3).
+    uint32_t packed;
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+    packed = __builtin_amdgcn_cvt_pk_bf8_f32(xi.x*d_inv, xi.y*d_inv, 0u,     false);
+    packed = __builtin_amdgcn_cvt_pk_bf8_f32(xi.z*d_inv, xi.w*d_inv, packed, true);
+#else
+    uint8_t q4[4];
+    q4[0] = ggml_cuda_fp32_to_e5m2(xi.x*d_inv);
+    q4[1] = ggml_cuda_fp32_to_e5m2(xi.y*d_inv);
+    q4[2] = ggml_cuda_fp32_to_e5m2(xi.z*d_inv);
+    q4[3] = ggml_cuda_fp32_to_e5m2(xi.w*d_inv);
+    memcpy(&packed, q4, 4);
+#endif
+
+    // Write back 4 raw e5m2 bytes as a single 32 bit value for better memory bandwidth:
+    uint32_t * yqs4 = (uint32_t *) y[ib].qs;
+    yqs4[iqs/4] = packed;
+
+    if (iqs % 32 != 0) {
+        return;
+    }
+
+    const float d = d_inv > 0.0f ? 1.0f / d_inv : 0.0f;
+
+    y[ib].d4[iqs/32] = d;
+}
+
+void quantize_mmq_f8e5m2_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    // Card 120: also accepts GGML_TYPE_F8E4M3 -- the MIXED fp8(e4m3 weight) x
+    // bf8(e5m2 activation) accuracy experiment (runtime-selected via
+    // GGML_HIP_FP8_ACT=bf8, see mmq.cu) reuses this quantizer unchanged to
+    // fill the activation side, exactly the same "activation format is
+    // independent of weight format" argument as quantize_mmq_f8e4m3_cuda's
+    // MXFP8 broadening above.
+    GGML_ASSERT(type_src0 == GGML_TYPE_F8E5M2 || type_src0 == GGML_TYPE_F8E4M3);
+    GGML_ASSERT(ne00 % 4 == 0);
+    GGML_ASSERT(ne0 % (4*QK8_1) == 0);
+
+    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    quantize_mmq_f8e5m2<<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
 }
 
 void quantize_mmq_fp4_cuda(

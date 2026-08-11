@@ -2,6 +2,7 @@
 
 #include "ggml-common.h"
 #include "convert.cuh"
+#include "common.cuh" // ggml_cuda_fp32_to_e4m3 (F8E4M3 KV-cache write path, T80)
 
 static __device__ __forceinline__ int best_index_int8(int n, const int8_t * val, float x) {
     if (x <= val[0]) return 0;
@@ -150,6 +151,29 @@ static __device__ void quantize_f32_q8_0_block(const float * __restrict__ x, blo
     for (int j = 0; j < QK8_0; ++j) {
         const float x0 = x[j]*id;
         y->qs[j] = roundf(x0);
+    }
+}
+
+// F8E4M3 KV-cache write path (T80): mirrors quantize_row_f8e4m3_ref
+// (ggml-quants.c) bit-for-bit -- per-32-block amax->448.0f scale + the
+// shared ggml_cuda_fp32_to_e4m3 codec (common.cuh), same one the Phase-1b
+// WMMA weight quantizer and T79 mmvq activation quantizer already use.
+static __device__ void quantize_f32_f8e4m3_block(const float * __restrict__ x, block_f8e4m3 * __restrict__ y) {
+    float amax = 0.0f; // absolute max
+
+    for (int j = 0; j < QK_F8E4M3; j++) {
+        const float v = x[j];
+        amax = fmaxf(amax, fabsf(v));
+    }
+
+    const float d  = amax / 448.0f;
+    const float id = d ? 1.0f/d : 0.0f;
+
+    y->d = d;
+
+    for (int j = 0; j < QK_F8E4M3; ++j) {
+        const float x0 = x[j]*id;
+        y->qs[j] = ggml_cuda_fp32_to_e4m3(x0);
     }
 }
 

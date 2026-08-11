@@ -314,6 +314,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_eagle3(params);
         case LLM_ARCH_DFLASH:
             return new llama_model_dflash(params);
+        case LLM_ARCH_DSPARK:
+            return new llama_model_dspark(params);
         case LLM_ARCH_MIMO2:
             return new llama_model_mimo2(params);
         case LLM_ARCH_KIMI_LINEAR:
@@ -1338,13 +1340,55 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+
+    // Map each offloaded layer index to a device.
+    //
+    // `splits` holds the cumulative, normalized target fraction per device
+    // (by default proportional to *currently free* VRAM). The original
+    // implementation picked the device for layer `il` via
+    // std::upper_bound(splits, il/act_gpu_layers): the first device whose
+    // cumulative fraction exceeds the layer's position. That is a greedy
+    // threshold-crossing rule, not a nearest-fit one -- for models with a
+    // modest layer count (MoE architectures in particular, ~28-40 layers)
+    // the per-layer granularity (1/n_layers, e.g. 3.6% for a 28-layer model)
+    // is much coarser than typical free-memory noise between two nominally
+    // identical GPUs (e.g. a few hundred MiB held by an unrelated resident
+    // process is <0.5% of 32 GiB). A sub-percent free-memory skew can then
+    // flip an *entire extra layer's* worth of work onto one device (e.g.
+    // 15/13 instead of 14/14 on a 28-layer model split ~50.05/49.95),
+    // silently unbalancing an otherwise-symmetric dual-GPU config on every
+    // load where the skew happens to sit fractionally above vs. below the
+    // midpoint. Round each device's target boundary to the nearest layer
+    // instead of greedily crossing it; this still preserves proportional
+    // splitting for genuinely mismatched-capacity devices (the normal use
+    // case for tensor_split) while eliminating the whole-layer overshoot
+    // for near-equal splits.
+    std::vector<int> layer_gpu_of(act_gpu_layers, 0);
+    if (act_gpu_layers > 0 && n_devices() > 0) {
+        std::vector<int> boundary(n_devices());
+        for (size_t i = 0; i < n_devices(); ++i) {
+            boundary[i] = (int) std::lround((double) splits[i] * act_gpu_layers);
+        }
+        boundary.back() = act_gpu_layers; // guarantee the full range is covered
+        for (size_t i = 1; i < n_devices(); ++i) {
+            boundary[i] = std::max(boundary[i], boundary[i - 1]); // defend against rounding non-monotonicity
+        }
+        int prev = 0;
+        for (size_t i = 0; i < n_devices(); ++i) {
+            for (int k = prev; k < boundary[i]; ++k) {
+                layer_gpu_of[k] = (int) i;
+            }
+            prev = boundary[i];
+        }
+    }
+
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
-        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+        const int layer_gpu = layer_gpu_of[il - i_gpu_start];
         auto * dev = devices.at(layer_gpu).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
@@ -2709,6 +2753,8 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_STEP35:
         case LLM_ARCH_TALKIE:
         case LLM_ARCH_MELLUM:
+        case LLM_ARCH_DFLASH:
+        case LLM_ARCH_DSPARK:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_DFLASH:
@@ -2842,7 +2888,8 @@ bool llama_model_has_encoder(const llama_model * model) {
         case LLM_ARCH_T5:
         case LLM_ARCH_T5ENCODER:
         case LLM_ARCH_EAGLE3:
-        case LLM_ARCH_DFLASH:    return true;
+        case LLM_ARCH_DFLASH:
+        case LLM_ARCH_DSPARK:    return true;
         default:                 return false;
     }
 }

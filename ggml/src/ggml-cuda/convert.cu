@@ -236,6 +236,18 @@ static __global__ void dequantize_block_iq4_xs(const void * __restrict__ vx, dst
     dequantize_iq4_xs(vx, i, yy + i*QK_K, threadIdx.x);
 }
 
+// NOTE (ROC8 fp4-hw-cvt investigation, gfx1201): scalar per-thread LUT
+// dequant (kvalues_mxfp4[]), one element/thread -- not restructured to use
+// AMD's packed hw fp4->f16 decoder (cvt_scalef32_pk(8)_fp4_f16). That
+// instruction does not exist on gfx1201/RDNA4 silicon (confirmed: absent
+// from the RDNA4 ISA manual, gated behind clang target features
+// `fp4-cvt-scale-insts`/`gfx1250-insts` that gfx1201 does not carry, and
+// crashes the LLVM backend if force-enabled for --offload-arch=gfx1201 --
+// gfx1250-exclusive, same class of finding as the wide-K fp8 WMMA dead end).
+// Even setting hardware aside, the pk8 form needs 8 contiguous fp4 lanes
+// gathered into one thread to be worth using -- a kernel-shape change, not
+// a drop-in swap into this one-element-per-thread loop. See the
+// vec_dot_mxfp4_q8_1 comment in vecdotq.cuh for full detail.
 template<typename dst_t>
 static __global__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restrict__ yy) {
     const int64_t i = blockIdx.x;
@@ -374,6 +386,8 @@ static void dequantize_row_mxfp4_cuda(const void * vx, dst_t * y, const int64_t 
     dequantize_block_mxfp4<<<nb, 32, 0, stream>>>(vx, y);
 }
 
+// NOTE (ROC8 fp4-hw-cvt investigation, gfx1201): same finding as
+// dequantize_block_mxfp4 above -- gfx1250-exclusive hardware, not wired.
 template <typename dst_t>
 static __global__ void dequantize_block_nvfp4(
         const void * __restrict__ vx,
@@ -563,6 +577,14 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_F8E4M3:
+            return dequantize_block_cont_cuda<QK_F8E4M3, QR_F8E4M3, dequantize_f8e4m3>;
+        case GGML_TYPE_F8E5M2:
+            return dequantize_block_cont_cuda<QK_F8E5M2, QR_F8E5M2, dequantize_f8e5m2>;
+        case GGML_TYPE_MXFP8:
+            return dequantize_block_cont_cuda<QK_MXFP8, QR_MXFP8, dequantize_mxfp8>;
+        case GGML_TYPE_MXFP6:
+            return dequantize_block_cont_cuda<QK_MXFP6, QR_MXFP6, dequantize_mxfp6>;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -620,6 +642,14 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_F8E4M3:
+            return dequantize_block_cont_cuda<QK_F8E4M3, QR_F8E4M3, dequantize_f8e4m3>;
+        case GGML_TYPE_F8E5M2:
+            return dequantize_block_cont_cuda<QK_F8E5M2, QR_F8E5M2, dequantize_f8e5m2>;
+        case GGML_TYPE_MXFP8:
+            return dequantize_block_cont_cuda<QK_MXFP8, QR_MXFP8, dequantize_mxfp8>;
+        case GGML_TYPE_MXFP6:
+            return dequantize_block_cont_cuda<QK_MXFP6, QR_MXFP6, dequantize_mxfp6>;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:

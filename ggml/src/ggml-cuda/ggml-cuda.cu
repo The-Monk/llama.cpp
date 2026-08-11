@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
+#include "ggml-cuda/hipblaslt_wcache.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -31,6 +32,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
+#include "ggml-cuda/mmvf_qk.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -47,6 +49,7 @@
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
+#include "ggml-cuda/swmmac24.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
 #include "ggml-cuda/top-k.cuh"
@@ -67,6 +70,33 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/iu4_w4a4.cuh"
+#include "ggml-cuda/mxfp8_selftest.cuh"
+#include "ggml-cuda/mul_mat_2of4_fp8.cuh"
+#include "ggml-cuda/mul_mat_2of4_fp8_mmq.cuh"
+#include "ggml-cuda/mul_mat_dense_fp8_v3.cuh"
+#include "ggml-cuda/mul_mat_dense_fp8_mmq.cuh"
+#include "ggml-cuda/int4_24_probe.cuh"
+#include "ggml-cuda/mul_mat_2of4_f16.cuh"
+#include "ggml-cuda/mul_mat_iu4.cuh"
+#include "ggml-cuda/mul_mat_iu4_mmq.cuh"
+#include "ggml-cuda/mmvq_iu4.cuh"
+#include "ggml-cuda/mmvq_dot2f16.cuh"
+#include "ggml-cuda/quantize_fp8_sr.cuh"
+#include "ggml-cuda/mul_mat_iu4_gemv.cuh"
+#include "ggml-cuda/mul_mat_q2_0_gemv.cuh"
+#include "ggml-cuda/mul_mat_iu4_ck_wmma.cuh"
+#include "ggml-cuda/mul_mat_q2_0_fp8route_mmq.cuh"
+#include "ggml-cuda/mul_mat_q2_0_wmma.cuh"
+#include "ggml-cuda/mul_mat_q2_0_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_q1_0_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_q4_K_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_q8_0_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_mxfp8_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_mxfp6_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_f8e4m3_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_iu4_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_f16_hipblaslt.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -738,6 +768,9 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    // Purge any hipBLASLt converted-weight cache entries pointing into this buffer.
+    // The caches key on the raw device address, which a later allocation can reuse.
+    ggml_hipblaslt_wcache_invalidate(ctx->dev_ptr, buffer->size);
     delete ctx;
 }
 
@@ -1666,6 +1699,17 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate_bias = nullptr,
                                           const ggml_tensor * ffn_up_scale = nullptr,
                                           const ggml_tensor * ffn_gate_scale = nullptr) {
+    // RDNA4 2:4-structured-sparse fp8 SWMMAC / T89 IU4 driver-completeness
+    // runs: the gate/up/GLU fusion path below calls straight into the
+    // generic mmq/mmvq machinery, which has no GGML_TYPE_2OF4_FP8 or
+    // GGML_TYPE_IU4 entry -- force these nodes back through the normal
+    // per-op MUL_MAT dispatch (ggml_cuda_mul_mat), which IS hooked for both.
+    if (ffn_up->src[0]->type == GGML_TYPE_2OF4_FP8 || ffn_gate->src[0]->type == GGML_TYPE_2OF4_FP8 ||
+        ffn_up->src[0]->type == GGML_TYPE_2OF4_F16 || ffn_gate->src[0]->type == GGML_TYPE_2OF4_F16 ||
+        ffn_up->src[0]->type == GGML_TYPE_IU4      || ffn_gate->src[0]->type == GGML_TYPE_IU4) {
+        return false;
+    }
+
     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
     const bool has_scale = ffn_up_scale != nullptr || ffn_gate_scale != nullptr;
 
@@ -1785,6 +1829,20 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    // RDNA4 2:4-structured-sparse fp8 SWMMAC / T89 IU4 driver-completeness
+    // runs: this fusion path calls straight into ggml_cuda_mul_mat_vec_q
+    // (mmvq.cu's generic templated dispatch), which has no GGML_TYPE_2OF4_FP8
+    // or GGML_TYPE_IU4 entry -- both have their own dedicated kernel
+    // (mul_mat_2of4_fp8.cu / mul_mat_iu4.cu) hooked only at the top of the
+    // normal, unfused ggml_cuda_mul_mat(). Refuse fusion so those nodes take
+    // that path.
+    if (src0->type == GGML_TYPE_2OF4_FP8 || src0->type == GGML_TYPE_2OF4_F16 || src0->type == GGML_TYPE_IU4) {
+        return false;
+    }
+
+    // F8E4M3 (Path X, Phase 2a): mmvq decode kernel now exists (see
+    // ggml_cuda_should_use_mmvq, mmvq.cu) -- let the general checks below
+    // decide, same as every other quantized type.
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
@@ -1816,23 +1874,566 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
     }
+    // RDNA4 2:4-structured-sparse fp8 SWMMAC driver-completeness run:
+    // GGML_TYPE_2OF4_FP8 is NOT wired into the generic mmq/mmvq dispatch
+    // below -- it gets its own small dedicated kernel (mul_mat_2of4_fp8.cu),
+    // hooked here exactly like the GGML_HINT_SRC0_IS_HADAMARD intercept
+    // further down. Single-GPU only (no split-buffer handling), MUL_MAT
+    // only (no MUL_MAT_ID).
+    // T162 CAPSTONE: library-grade cooperative-tile/double-buffered-LDS
+    // SWMMAC 2:4 GEMM (mul_mat_2of4_fp8_mmq.cu), checked BEFORE the plain
+    // V3/V2/baseline dispatch below so GGML_HIP_2OF4_FP8_MMQ can select it
+    // without disturbing any of the earlier (already-measured) kernels.
+    if (src0->type == GGML_TYPE_2OF4_FP8 && getenv("GGML_HIP_2OF4_FP8_MMQ") != nullptr) {
+        const bool ok = ggml_cuda_op_mul_mat_2of4_fp8_mmq(ctx, src0, src1, dst);
+        GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_2of4_fp8_mmq does not support this tensor shape");
+        return;
+    }
+
+    if (src0->type == GGML_TYPE_2OF4_FP8) {
+        const bool ok = ggml_cuda_op_mul_mat_2of4_fp8(ctx, src0, src1, dst);
+        GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_2of4_fp8 does not support this tensor shape");
+        return;
+    }
+
+    // T162 follow-up (coordinator directive, "the missing measurement"): a
+    // dense-fp8 TWIN of the 2:4-sparse V3 kernel above -- same hand-written
+    // shape, dense WMMA math instead of sparse SWMMAC. Opt-in only
+    // (GGML_HIP_DENSE_FP8_V3), falls through to the normal production
+    // dense-fp8 MMQ path (mmq.cuh) when unset. See mul_mat_dense_fp8_v3.cuh.
+    if (src0->type == GGML_TYPE_F8E4M3 && src1->type == GGML_TYPE_F32 &&
+            src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+            getenv("GGML_HIP_DENSE_FP8_V3") != nullptr) {
+        const bool ok = ggml_cuda_op_mul_mat_dense_fp8_v3(ctx, src0, src1, dst);
+        GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_dense_fp8_v3 does not support this tensor shape");
+        return;
+    }
+
+    // T162 CAPSTONE: MMQ-grade dense-fp8 twin (mul_mat_dense_fp8_mmq.cu),
+    // same cooperative-tile/double-buffered-LDS shape as the sparse
+    // capstone kernel below, checked first so GGML_HIP_DENSE_FP8_MMQ can
+    // select it independently of GGML_HIP_DENSE_FP8_V3.
+    if (src0->type == GGML_TYPE_F8E4M3 && src1->type == GGML_TYPE_F32 &&
+            src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+            getenv("GGML_HIP_DENSE_FP8_MMQ") != nullptr) {
+        const bool ok = ggml_cuda_op_mul_mat_dense_fp8_mmq(ctx, src0, src1, dst);
+        GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_dense_fp8_mmq does not support this tensor shape");
+        return;
+    }
+
+    // card 141: RDNA4 2:4-structured-sparse fp16 SWMMAC, end-to-end -- same
+    // intercept pattern as GGML_TYPE_2OF4_FP8 immediately above, its own
+    // dedicated kernel (mul_mat_2of4_f16.cu). Single-GPU only (no
+    // split-buffer handling), MUL_MAT only (no MUL_MAT_ID).
+    if (src0->type == GGML_TYPE_2OF4_F16) {
+        const bool ok = ggml_cuda_op_mul_mat_2of4_f16(ctx, src0, src1, dst);
+        GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_2of4_f16 does not support this tensor shape");
+        return;
+    }
+
+    // T162: MMQ-grade multi-warp/double-buffered WMMA iu4 GEMM
+    // (mul_mat_iu4_mmq.cu), opt-in via GGML_HIP_IU4_MMQ so it can be A/B
+    // benched against both the dp4a MMQ int8 path (unset) and the older
+    // one-warp-per-tile PoC kernels below (GGML_HIP_Q2_0_WMMA_DECODE).
+    // Checked before the unconditional IU4 intercept and the
+    // GGML_HIP_Q2_0_WMMA_DECODE intercept so either env var can select the
+    // new kernel for its respective type.
+    {
+        static const bool iu4_mmq_enabled = (getenv("GGML_HIP_IU4_MMQ") != nullptr);
+        if (iu4_mmq_enabled && ggml_cuda_iu4_mmq_supports(src0, src1, dst)) {
+            if (src0->type == GGML_TYPE_IU4) {
+                const bool ok = ggml_cuda_op_mul_mat_iu4_mmq(ctx, src0, src1, dst);
+                GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_iu4_mmq does not support this tensor shape");
+                return;
+            }
+            if (src0->type == GGML_TYPE_Q2_0) {
+                const bool ok = ggml_cuda_op_mul_mat_q2_0_iu4_mmq(ctx, src0, src1, dst);
+                GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_q2_0_iu4_mmq does not support this tensor shape");
+                return;
+            }
+            if (src0->type == GGML_TYPE_Q1_0) {
+                const bool ok = ggml_cuda_op_mul_mat_q1_0_iu4_mmq(ctx, src0, src1, dst);
+                GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_q1_0_iu4_mmq does not support this tensor shape");
+                return;
+            }
+        }
+    }
+
+    // T164: PER-CHANNEL weight-scale path (GGML_TYPE_Q2_0 only), its OWN env
+    // var (GGML_HIP_IU4_MMQ_PERCHANNEL) so it can be A/B benched against the
+    // production GGML_HIP_IU4_MMQ path above without disturbing it. See
+    // mul_mat_iu4_mmq.cu / w4a4_gate_bonsai_weight_grid.py (Phase 1 accuracy
+    // grid: per-channel weight + per-32 activation = +12.66% vs floor, PASS).
+    {
+        static const bool iu4_mmq_perchannel_enabled = (getenv("GGML_HIP_IU4_MMQ_PERCHANNEL") != nullptr);
+        if (iu4_mmq_perchannel_enabled && src0->type == GGML_TYPE_Q2_0 && ggml_cuda_iu4_mmq_supports(src0, src1, dst)) {
+            const bool ok = ggml_cuda_op_mul_mat_q2_0_iu4_mmq_perchannel(ctx, src0, src1, dst);
+            GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_q2_0_iu4_mmq_perchannel does not support this tensor shape");
+            return;
+        }
+    }
+
+    // T165: route ternary (Q2_0) weights through the native fp8 e4m3 WMMA
+    // datapath instead of iu4 (RC2 -- the int32->float rescale epilogue --
+    // is structurally absent there, since fp8 WMMA accumulates natively in
+    // fp32). Own env var, own standalone kernel file
+    // (mul_mat_q2_0_fp8route_mmq.cu), zero risk to every other path.
+    {
+        static const bool q2_0_fp8route_enabled = (getenv("GGML_HIP_Q2_0_FP8ROUTE_MMQ") != nullptr);
+        if (q2_0_fp8route_enabled && ggml_cuda_q2_0_fp8route_mmq_supports(src0, src1, dst)) {
+            const bool ok = ggml_cuda_op_mul_mat_q2_0_fp8route_mmq(ctx, src0, src1, dst);
+            GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_q2_0_fp8route_mmq does not support this tensor shape");
+            return;
+        }
+    }
+
+    // T170: dot8 int4-drafter decode path (mmvq_iu4.cu) -- the M=1 (batch=1
+    // decode / spec-decode drafter) GEMV counterpart to the WMMA GEMM kernel
+    // just below. Checked BEFORE the unconditional IU4 intercept so it can
+    // take priority for the shape it targets; ggml_cuda_mmvq_iu4_supports()
+    // itself requires src1->ne[1]==1, so M>1 (prefill) calls always fall
+    // through unchanged to the WMMA path -- this can never regress prefill
+    // even if left enabled. Opt-in via GGML_HIP_IU4_MMVQ_DECODE, same
+    // pattern as every other experimental kernel intercept in this
+    // function (e.g. GGML_HIP_Q2_0_WMMA_DECODE below). See
+    // ~/int4-research/FINDINGS.md Stage 20/23 for the isolated-PoC
+    // validation and in-tree integration results.
+    {
+        static const bool iu4_mmvq_decode_enabled = (getenv("GGML_HIP_IU4_MMVQ_DECODE") != nullptr);
+        if (iu4_mmvq_decode_enabled && ggml_cuda_mmvq_iu4_supports(src0, src1, dst)) {
+            const bool ok = ggml_cuda_op_mul_mat_vec_iu4(ctx, src0, src1, dst);
+            GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_vec_iu4 does not support this tensor shape");
+            return;
+        }
+    }
+
+    // Stage 25 (completeness-inventory mandate, NOT a production win --
+    // see mmvq_dot2f16.cuh header for the full measured verdict): dormant
+    // v_dot2_f32_f16 F16 decode GEMV, tuning-knob only. Off by default (F16
+    // MUL_MAT keeps using the production mmvf.cu mul_mat_vec_f path
+    // unchanged); GGML_HIP_F16_DOT2_DECODE=1 selects single-issue fdot2,
+    // =2 selects the dual-issue VOPD DOT2ACC inline-asm form. Gated to
+    // src1->ne[1]==1 (M=1) same as the IU4 intercept above -- M>1 always
+    // falls through to mmvf.cu unchanged.
+    {
+        static const int f16_dot2_mode = [](){
+            const char * v = getenv("GGML_HIP_F16_DOT2_DECODE");
+            if (!v) return 0;
+            int m = atoi(v);
+            return (m == 1 || m == 2) ? m : 0;
+        }();
+        if (f16_dot2_mode != 0 && ggml_cuda_mmvq_dot2f16_supports(src0, src1, dst)) {
+            const bool ok = ggml_cuda_op_mul_mat_vec_dot2f16(ctx, src0, src1, dst, f16_dot2_mode);
+            GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_vec_dot2f16 does not support this tensor shape");
+            return;
+        }
+    }
+
+    // Phase-3(B): M-gated (batch-size-gated) int4-weight dispatch switch.
+    // GGML_TYPE_IU4 ONLY (see the GGML_HIP_Q2_0_GEMV_EXPERIMENTAL block
+    // right below this one for why Q2_0/Q1_0 are NOT in this switch --
+    // short version: GEMV was tried there too and MEASURED as a real
+    // regression on Bonsai-27B, backed out to its own separate,
+    // never-in-the-production-path env var). FINALIZED 2026-07-20 per the
+    // crossover bench + the int4-dense-WMMA occupancy chase (both on
+    // int4-research-bank, Stage-6/7/8):
+    //   M <= 2  -> mul_mat_iu4_gemv.cu (lean bandwidth-bound GEMV, ~465-676
+    //              GB/s measured on the IU4 synthetic shapes -- caveat:
+    //              re-graded 2026-07-20 on large non-cache-resident shapes,
+    //              see that file's doctrine comment and this commit's
+    //              message for the corrected verdict). Crossover bench
+    //              (real ggml_backend_graph_compute dispatch, sustained
+    //              multi-sweep, GGML_HIP_IU4_MSWITCH_FORCE-isolated) showed
+    //              GEMV beating BOTH iu4_mmq and the unswitched default at
+    //              M=1 AND M=2 on the ORIGINAL (cache-fitting, ~8-40MB)
+    //              test shapes -- hence the cutoff is M<=2, not just M==1.
+    //              NOTE: GGML_TYPE_IU4 has NO real GGUF producer (model-
+    //              blocked, see mul_mat_iu4.cu's own doctrine comment) --
+    //              this route is dormant on every real model today; it
+    //              only fires on synthetic/future IU4 tensors.
+    //   M >= 3  -> falls through to the unconditional W4A4 WMMA intercept
+    //              immediately below (unchanged default dp4a-class path).
+    //              The IU4 batch route (mul_mat_iu4_mmq.cu / T162) that
+    //              used to cover M in [2,16] here has been DROPPED from
+    //              this switch: the crossover bench showed default beating
+    //              iu4_mmq at every M>=3 tested (e.g. N4096K4096 M=4: 206.9
+    //              default vs 191.5 iu4_mmq GB/s; M=8: 202.6 vs 190.8; M=16:
+    //              154.2 vs 145.2), and the separate int4-dense-WMMA
+    //              occupancy chase (Stage-6 small-tile, Stage-8 K=16 --
+    //              both on int4-research-bank) independently confirmed
+    //              dense int4 WMMA cannot approach the ~44% (338 TOPS) dp4a
+    //              parity bar via any tile/stage/K-width configuration
+    //              tried (ceiling holds at ~23% three independent ways).
+    //              So there is no batch-regime int4 WMMA route left worth
+    //              routing to -- dp4a wins the whole M>=3 range outright.
+    //              mul_mat_iu4_mmq.cu is NOT deleted (kept in the tree,
+    //              still reachable via its own GGML_HIP_IU4_MMQ env var,
+    //              unrelated to this switch) -- just unreferenced here.
+    // CK (mul_mat_iu4_ck_wmma.cu) remains DEFERRED (2026-07-20, pk_i4_t
+    // packing blocker) and fully gated off
+    // (ggml_cuda_iu4_ck_wmma_supports() unconditionally false); also not
+    // wired into this switch, kept as a documented future lead.
+    // Opt-in via GGML_HIP_IU4_MSWITCH, GGML_TYPE_IU4 only, so the
+    // unmodified default path for every type (including Q2_0/Q1_0) stays
+    // byte-identical when unset -- same discipline as every other
+    // env-gated intercept in this function. Checked before the
+    // unconditional IU4 intercept below so it can claim IU4 first when
+    // enabled.
+    {
+        static const bool iu4_mswitch_enabled = (getenv("GGML_HIP_IU4_MSWITCH") != nullptr);
+        if (iu4_mswitch_enabled && src0->type == GGML_TYPE_IU4) {
+            const int64_t m = dst->ne[1];
+            if (m <= 2 && ggml_cuda_iu4_gemv_supports(src0, src1, dst)) {
+                const bool ok = ggml_cuda_op_mul_mat_iu4_gemv(ctx, src0, src1, dst);
+                GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_iu4_gemv does not support this tensor shape");
+                return;
+            }
+            // else: M >= 3, or GEMV's _supports() rejected the shape --
+            // fall through to the unconditional IU4 intercept below,
+            // unmodified (dp4a-class default; wins the whole M>=3 range,
+            // see the doctrine comment above).
+        }
+    }
+
+    // GGML_HIP_Q2_0_GEMV_EXPERIMENTAL (coordinator decision 2026-07-20):
+    // Q2_0/Q1_0 GEMV was briefly wired into the GGML_HIP_IU4_MSWITCH path
+    // above and MEASURED as a real ~15% regression on real
+    // Ternary-Bonsai-27B-Q2_0 decode (51.15/50.92 baseline vs 43.32+-0.14
+    // GEMV-active tg128; isolated per-op: default dp4a mmvq 524-526 GB/s
+    // -- 82% of the ~639 GB/s DRAM ceiling -- vs GEMV 227-271 GB/s, ~2x
+    // slower). Root cause: Q2_0's real weight-matmul decode is
+    // VALU-arithmetic-density-bound (packed int8 dp4a = 4 MACs/instr) not
+    // bandwidth-bound, so GEMV's scalar F32 FMA (1 MAC/instr) loses despite
+    // carrying ~53% fewer bytes/element -- the byte savings are real but
+    // wasted, textbook match to this fork's own "seductive but dangerous
+    // half-truth" doctrine (mmvf_qk precedent).
+    // BACKED OUT of the production switch (never reachable via
+    // GGML_HIP_IU4_MSWITCH again) -- kept in the tree as a DOCUMENTED
+    // NEGATIVE, reproducible only via this SEPARATE, clearly-experimental
+    // env var so the measurement stays repeatable without any risk of ever
+    // being live in a shipped route. mul_mat_q2_0_gemv.{cu,cuh} and their
+    // selftests (GGML_HIP_MUL_MAT_Q2_0_GEMV_SELFTEST /
+    // GGML_HIP_MUL_MAT_Q1_0_GEMV_SELFTEST) are unaffected -- selftest
+    // correctness is a fact about the kernel independent of whether it's a
+    // throughput win, and is worth keeping provably true.
+    {
+        static const bool q2_0_gemv_experimental_enabled = (getenv("GGML_HIP_Q2_0_GEMV_EXPERIMENTAL") != nullptr);
+        if (q2_0_gemv_experimental_enabled && src0->type == GGML_TYPE_Q2_0) {
+            const int64_t m = dst->ne[1];
+            if (m <= 2 && ggml_cuda_q2_0_gemv_supports(src0, src1, dst)) {
+                const bool ok = ggml_cuda_op_mul_mat_q2_0_gemv(ctx, src0, src1, dst);
+                GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_q2_0_gemv does not support this tensor shape");
+                return;
+            }
+        }
+        if (q2_0_gemv_experimental_enabled && src0->type == GGML_TYPE_Q1_0) {
+            const int64_t m = dst->ne[1];
+            if (m <= 2 && ggml_cuda_q1_0_gemv_supports(src0, src1, dst)) {
+                const bool ok = ggml_cuda_op_mul_mat_q1_0_gemv(ctx, src0, src1, dst);
+                GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_q1_0_gemv does not support this tensor shape");
+                return;
+            }
+        }
+    }
+
+    // IU4 prefill lever (see mul_mat_iu4_hipblaslt.cuh): int4 MODELS have a slow
+    // mmq/dedicated-kernel prefill (~3x below fp8). Sidestep the 23%-walled int4
+    // WMMA entirely: dequant iu4 -> per-channel fp8/int8 -> Tensile GEMM (int4's
+    // 2x COMPUTE is unreachable, but the model still gets the fast prefill route).
+    // Placed BEFORE the unconditional IU4 intercept below so it can win prefill;
+    // decode (M<=threshold) falls through to the dedicated kernel. Opt-in
+    // GGML_HIP_IU4_HIPBLASLT_PREFILL (+ _FP8); soft-fail -> the intercept below.
+    {
+        static const bool iu4_hipblaslt_prefill_enabled = (getenv("GGML_HIP_IU4_HIPBLASLT_PREFILL") != nullptr);
+        if (iu4_hipblaslt_prefill_enabled && ggml_cuda_iu4_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_iu4_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+        }
+    }
+
+    // T89 driver-completeness run (EXPERIMENTAL, model-blocked -- see
+    // block_iu4 comment in ggml-common.h): GGML_TYPE_IU4 (native int4xint4
+    // W4A4 WMMA) is NOT wired into the generic mmq/mmvq dispatch below -- it
+    // gets its own small dedicated kernel (mul_mat_iu4.cu), hooked here
+    // exactly like the GGML_HINT_SRC0_IS_HADAMARD intercept further down.
+    // Single-GPU only (no split-buffer handling), MUL_MAT only (no
+    // MUL_MAT_ID). GGML_TYPE_IU4 with M=1 reaches here only when the dot8
+    // decode path immediately above is disabled/not applicable.
+    if (src0->type == GGML_TYPE_IU4) {
+        const bool ok = ggml_cuda_op_mul_mat_iu4(ctx, src0, src1, dst);
+        GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_iu4 does not support this tensor shape");
+        return;
+    }
+
+    // Experimental decode-time lever (see mul_mat_q2_0_wmma.cuh): route Q2_0
+    // ternary decode GEMVs (batch=1) through the native RDNA4 iu4 WMMA
+    // instead of the dp4a mmvq.cu path. Opt-in only -- unlike the IU4/2OF4
+    // intercepts above (which are unconditional because those types are
+    // never produced by a real model), Q2_0 IS the production ternary
+    // decode path, so this is gated behind an env var and a strict shape
+    // check; unset/out-of-scope calls fall straight through to the
+    // unmodified mmvq.cu path below.
+    {
+        static const bool q2_0_wmma_decode_enabled = (getenv("GGML_HIP_Q2_0_WMMA_DECODE") != nullptr);
+        if (q2_0_wmma_decode_enabled && ggml_cuda_q2_0_wmma_decode_supports(src0, src1, dst)) {
+            const bool ok = ggml_cuda_op_mul_mat_q2_0_wmma(ctx, src0, src1, dst);
+            GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_q2_0_wmma does not support this tensor shape");
+            return;
+        }
+    }
+
+    // Experimental PREFILL lever (see mul_mat_q2_0_hipblaslt.cuh): route Q2_0
+    // large-M (prefill) matmuls through AMD's tuned hipBLASLt int8 GEMM instead
+    // of the ~5%-efficient dp4a/mmq path. W8A8, per-channel weight scale (v1).
+    // Opt-in; a soft-fail (false) falls through to the unmodified path below.
+    {
+        static const bool q2_0_hipblaslt_prefill_enabled = (getenv("GGML_HIP_Q2_0_HIPBLASLT_PREFILL") != nullptr);
+        if (q2_0_hipblaslt_prefill_enabled && ggml_cuda_q2_0_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_q2_0_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+            // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
+        }
+    }
+
+    // Q1_0 prefill lever (see mul_mat_q1_0_hipblaslt.cuh): route Q1_0 (binary
+    // {-1,+1}) large-M matmuls through hipBLASLt int8 (GGML_HIP_Q1_0_HIPBLASLT_PREFILL)
+    // or fp8/e4m3 (+ GGML_HIP_Q1_0_HIPBLASLT_FP8, selected inside the kernel).
+    // MEASURED winner for Q1_0 prefill: int8 +26% pp1024 (2026-07-31). Opt-in;
+    // soft-fail falls through to the unmodified dp4a/mmq path below.
+    {
+        static const bool q1_0_hipblaslt_prefill_enabled = (getenv("GGML_HIP_Q1_0_HIPBLASLT_PREFILL") != nullptr);
+        if (q1_0_hipblaslt_prefill_enabled && ggml_cuda_q1_0_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_q1_0_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+            // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
+        }
+    }
+
+    // Q4_K prefill lever (see mul_mat_q4_K_hipblaslt.cuh): route Q4_K (4.5bpw
+    // k-quant) large-M matmuls through hipBLASLt int8 (GGML_HIP_Q4_K_HIPBLASLT_PREFILL)
+    // or fp8/e4m3 (+ GGML_HIP_Q4_K_HIPBLASLT_FP8). Fully dequants (min folded in) ->
+    // per-channel int8, then the tuned int8 GEMM. Opt-in; soft-fail -> mmq/dp4a.
+    {
+        static const bool q4_K_hipblaslt_prefill_enabled = (getenv("GGML_HIP_Q4_K_HIPBLASLT_PREFILL") != nullptr);
+        if (q4_K_hipblaslt_prefill_enabled && ggml_cuda_q4_K_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_q4_K_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+            // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
+        }
+    }
+
+    // Q8_0 prefill lever (see mul_mat_q8_0_hipblaslt.cuh): route Q8_0 (8.5bpw,
+    // 32-elem block, symmetric int8 x per-block scale) large-M matmuls through
+    // hipBLASLt int8 (GGML_HIP_Q8_0_HIPBLASLT_PREFILL) or fp8 (+ _FP8). Opt-in;
+    // soft-fail -> mmq/dp4a.
+    {
+        static const bool q8_0_hipblaslt_prefill_enabled = (getenv("GGML_HIP_Q8_0_HIPBLASLT_PREFILL") != nullptr);
+        if (q8_0_hipblaslt_prefill_enabled && ggml_cuda_q8_0_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_q8_0_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+            // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
+        }
+    }
+
+    // MXFP8 prefill lever (see mul_mat_mxfp8_hipblaslt.cuh): route MXFP8 (OCP MX
+    // e4m3 elems + per-32-block UE8M0 scale) large-M matmuls through hipBLASLt
+    // int8/fp8 GEMM. Fully dequants (e4m3*e8m0) -> per-channel operand. Opt-in
+    // GGML_HIP_MXFP8_HIPBLASLT_PREFILL (+ _FP8); soft-fail -> mmq/dp4a.
+    {
+        static const bool mxfp8_hipblaslt_prefill_enabled = (getenv("GGML_HIP_MXFP8_HIPBLASLT_PREFILL") != nullptr);
+        if (mxfp8_hipblaslt_prefill_enabled && ggml_cuda_mxfp8_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_mxfp8_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+            // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
+        }
+    }
+
+    // MXFP6 prefill lever (see mul_mat_mxfp6_hipblaslt.cuh): route MXFP6 (OCP MX
+    // e3m2 6-bit elems + per-32-block UE8M0 scale) large-M matmuls through
+    // hipBLASLt int8/fp8. Lifts MXFP6's weak mmq prefill (it is the decode-role
+    // format). Opt-in GGML_HIP_MXFP6_HIPBLASLT_PREFILL (+ _FP8); soft-fail -> mmq.
+    {
+        static const bool mxfp6_hipblaslt_prefill_enabled = (getenv("GGML_HIP_MXFP6_HIPBLASLT_PREFILL") != nullptr);
+        if (mxfp6_hipblaslt_prefill_enabled && ggml_cuda_mxfp6_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_mxfp6_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+            // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
+        }
+    }
+
+    // F8E4M3 prefill lever (see mul_mat_f8e4m3_hipblaslt.cuh): route F8E4M3
+    // (signed e4m3 elems + per-block fp16 scale) large-M matmuls through hipBLASLt
+    // int8/fp8. fp8 is the natural path (native e4m3). Opt-in
+    // GGML_HIP_F8E4M3_HIPBLASLT_PREFILL (+ _FP8); soft-fail -> mmq/dp4a.
+    {
+        static const bool f8e4m3_hipblaslt_prefill_enabled = (getenv("GGML_HIP_F8E4M3_HIPBLASLT_PREFILL") != nullptr);
+        if (f8e4m3_hipblaslt_prefill_enabled && ggml_cuda_f8e4m3_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_f8e4m3_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+            // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
+        }
+    }
+
+
+    // Route dense F16/BF16/F32 PREFILL matmuls (M > threshold) through
+    // hipBLASLt's tuned HH_SH/BB_SB/SS_SS Tensile GEMM instead of the existing
+    // ggml_cuda_op_mul_mat_cublas() (hipblasGemmEx) path. Opt-in, env-gated.
+    // On ROCm 7.14 (native gfx1201 Tensile logic) this measures ~+6% bf16 /
+    // +1.6% f16 pp1024 vs hipblasGemmEx; earlier stacks were parity. F32 rides
+    // the same route for coverage (SS_SS is VALU-bound on gfx1201, not a win).
+    {
+        static const bool f16_hipblaslt_prefill_enabled = (getenv("GGML_HIP_F16_HIPBLASLT_PREFILL") != nullptr);
+        if (f16_hipblaslt_prefill_enabled && ggml_cuda_f16_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_f16_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+            // else: hipBLASLt unavailable/failed -> fall through to the
+            // existing mmf/cublas path below.
+        }
+    }
+
+    const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+
+    bool use_mul_mat_vec_f = (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16)
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+    bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+        && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+    bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+    // ROC9 GGML_HIP_MMVF_QK (default OFF, see mmvf_qk.cu): K-quant batch=1
+    // decode via direct fp32 dequant-FMA, skipping the int8 q8_1 activation
+    // packing kernel mmvq.cu always pays. Only ever true when the type/cc/
+    // batch gate in ggml_cuda_should_use_mmvf_qk (below) says so; otherwise
+    // this is dead weight and use_mul_mat_vec_q above is unaffected.
+    bool use_mul_mat_vec_qk = ggml_is_quantized(src0->type) && !bad_padding_clear
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+        && src1->ne[1] == 1;
+
+    bool any_gpus_with_slow_fp16 = false;
+
+    if (split) {
+        ggml_backend_cuda_split_buffer_type_context * buft_ctx = (ggml_backend_cuda_split_buffer_type_context *) src0->buffer->buft->context;
+        auto & tensor_split = buft_ctx->tensor_split;
+        for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
+            // skip devices that are not going to do any work:
+            if (tensor_split[id] >= (id + 1 < ggml_backend_cuda_get_device_count() ? tensor_split[id + 1] : 1.0f)) {
+                continue;
+            }
+
+            const int cc            = ggml_cuda_info().devices[id].cc;
+            const int warp_size     = ggml_cuda_info().devices[id].warp_size;
+            use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
+            use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
+            use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
+            use_mul_mat_vec_q       = use_mul_mat_vec_q         && ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]);
+            use_mul_mat_vec_qk      = use_mul_mat_vec_qk        && ggml_cuda_should_use_mmvf_qk(src0->type, cc, src1->ne[1]);
+            any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
+        }
+    } else {
+        const int cc            = ggml_cuda_info().devices[ctx.device].cc;
+        const int warp_size     = ggml_cuda_info().devices[ctx.device].warp_size;
+        use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
+        use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
+        use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
+        use_mul_mat_vec_q       = use_mul_mat_vec_q         && ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]);
+        use_mul_mat_vec_qk      = use_mul_mat_vec_qk        && ggml_cuda_should_use_mmvf_qk(src0->type, cc, src1->ne[1]);
+        any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
+    }
+
+    // Stage-1 (int8-WMMA-for-decode-at-batch research, roc9-int8-wmma-decode,
+    // 2026-07-20): GGML_HIP_FORCE_MMQ_DECODE forces the dp4a-mmvq-vs-mmq
+    // dispatch PRIORITY below to prefer mmq (the tiled, RDNA4-WMMA-
+    // accelerated int8 GEMM -- see amd_wmma_available()'s unconditional
+    // `return true` for RDNA4 in ggml_cuda_should_use_mmq(), mmq.cu) over
+    // mmvq (the dp4a scalar per-value dot) at EVERY M, not just M>
+    // MMVQ_MAX_BATCH_SIZE(8) as the unmodified dispatch order does. This
+    // reuses BOTH kernels completely unchanged (no new device code, no new
+    // correctness surface -- both mmvq and mmq are already-shipped,
+    // already-correct production paths for every quantized type; this
+    // toggle only changes WHICH of the two handles a given (type, M) pair)
+    // -- exactly the "measure the crossover between two already-correct
+    // kernels" question Stage-1 asks. Opt-in, zero effect when unset (the
+    // unmodified `use_mul_mat_vec_q` priority is preserved byte-for-byte).
+    {
+        static const bool force_mmq_decode = (getenv("GGML_HIP_FORCE_MMQ_DECODE") != nullptr);
+        if (force_mmq_decode && use_mul_mat_q) {
+            use_mul_mat_vec_q = false;
+        }
+    }
+
+    // Stage-3 refinement (2026-07-20): the blunt GGML_HIP_FORCE_MMQ_DECODE
+    // above forces mmq at EVERY M, including M==1 (the numerically dominant
+    // case throughout a real decode/spec-decode-draft forward pass) where
+    // Stage-1 itself measured mmq LOSING to mmvq (e.g. ffn_gate_up M=1:
+    // 0.1546ms mmvq vs 0.1676ms mmq) -- a real end-to-end spec-decode test
+    // (Bonsai-27B-Q2_0 + dflash draft, n_max=7 so the verify batch hits
+    // M=8) showed the blunt toggle REGRESSING net decode t/s by ~7-9%
+    // (25.3-25.9 vs 27.6-28.1 t/s), because it also de-optimizes every
+    // M==1 call in the draft model and the verifier's own non-batch ops.
+    // GGML_HIP_MMQ_MTHRESH implements the NARROW, boundary-only fix the
+    // FINDINGS.md "KEY ACTIONABLE" entry actually proposes: mmq only
+    // overrides mmvq's priority when M is AT OR ABOVE this threshold
+    // (default 8, matching the measured crossover) -- M below the
+    // threshold is completely unaffected (unmodified mmvq priority).
+    // Mutually exclusive with GGML_HIP_FORCE_MMQ_DECODE in principle (both
+    // set is harmless -- MTHRESH's narrower condition is a subset of
+    // FORCE's, so FORCE just wins for M>=MTHRESH and stays uninvolved
+    // below it either way).
+    {
+        static const int64_t mmq_mthresh = [] () -> int64_t {
+            const char * v = getenv("GGML_HIP_MMQ_MTHRESH");
+            if (!v) return -1; // disabled
+            return (int64_t) atoll(v);
+        }();
+        if (mmq_mthresh >= 0 && src1->ne[1] >= mmq_mthresh && use_mul_mat_q) {
+            use_mul_mat_vec_q = false;
+        }
+    }
+
+    // debug helpers
+    //printf("src0: %8d %8d %8d %8d\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
+    //printf("      %8d %8d %8d %8d\n", src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
+    //printf("src1: %8d %8d %8d %8d\n", src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
+    //printf("      %8d %8d %8d %8d\n", src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3]);
+    //printf("src0 is contiguous %d, transposed %d, type = %s, name = %s\n", ggml_is_contiguous(src0), ggml_is_transposed(src0), ggml_type_name(src0->type), src0->name);
+    //printf("src1 is contiguous %d, transposed %d, type = %s, name = %s\n", ggml_is_contiguous(src1), ggml_is_transposed(src1), ggml_type_name(src1->type), src1->name);
+
+    //TODO update for generic tensor parallelism
+    const int cc                 = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    bool use_batched_cublas_f16  = src0->type == GGML_TYPE_F16 && (src1->type == GGML_TYPE_F16 || !any_gpus_with_slow_fp16);
+    bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
+    bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
+
+    const int32_t hint = ggml_get_op_params_i32(dst, 1);
+    if (hint == GGML_HINT_SRC0_IS_HADAMARD && !split && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
     }
 
-    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
-    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
-
-    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
-        // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
-        // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
+    if (!split && use_mul_mat_vec_qk) {
+        // ROC9 GGML_HIP_MMVF_QK: direct fp32 dequant-FMA K-quant batch=1
+        // decode, see mmvf_qk.cu. Opt-in; only reachable when the env var is
+        // set AND ggml_cuda_should_use_mmvf_qk gated the type/cc/batch above.
+        ggml_cuda_mul_mat_vec_qk(ctx, src0, src1, dst);
+    } else if (!split && use_mul_mat_vec_f) {
+        // the custom F16 vector kernel can be used over batched cuBLAS GEMM
+        // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -1860,7 +2461,33 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
-        return;
+    } else if (!split && (use_batched_cublas_f16 || use_batched_cublas_bf16 || use_batched_cublas_f32)
+        && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2]*src1->ne[3] > 1) {
+        // general KQ + KQV multi-batch without FlashAttention
+        ggml_cuda_mul_mat_batched_cublas(ctx, src0, src1, dst);
+    } else if (use_mul_mat_vec_f) {
+        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_f, nullptr);
+    } else if (use_mul_mat_vec_q) {
+        // T79: this is the split (multi-GPU tensor-parallel) path -- must
+        // pick the SAME activation-quantize function the non-split
+        // ggml_cuda_mul_mat_vec_q fast path (mmvq.cu) uses for F8E4M3, or
+        // mul_mat_vec_q_switch_type's vec_dot_f8e4m3_f8e4m3_dispatch would
+        // silently reinterpret int8 q8_1 bytes as e4m3 -- a correctness bug,
+        // not just a missed perf win. Not benched (no F8E4M3 split-mode
+        // model validated; our guardrail is single-GPU only) but must not be
+        // left silently wrong.
+        // Card 137 fix 2: F8E5M2 decode dispatch stayed on int8 q8_1
+        // activations (the bf8-activation dot4 path failed its PPL gate,
+        // see get_vec_dot_q_cuda_decode in mmvq.cu) -- so no F8E5M2 branch
+        // is needed here, it already falls through to quantize_row_q8_1_cuda
+        // below, matching mmvq.cu's dispatch table.
+        const quantize_cuda_t quantize_src1 = src0->type == GGML_TYPE_F8E4M3 ?
+            quantize_row_f8e4m3_for_mmvq_cuda : quantize_row_q8_1_cuda;
+        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_q, quantize_src1);
+    } else if (use_mul_mat_q) {
+        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
+    } else {
+        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
@@ -4207,6 +4834,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // T180 diagnostic: reset the mmvq quant-dedup cache every graph build.
+    cuda_ctx->mmvq_quant_cache_tensor = nullptr;
+    cuda_ctx->mmvq_quant_cache_buf.reset();
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -4932,7 +5563,21 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
+                    case GGML_TYPE_F8E4M3:
+                    case GGML_TYPE_F8E5M2:
+                    case GGML_TYPE_MXFP8:
+                    case GGML_TYPE_MXFP6:
                         return true;
+                    // RDNA4 2:4-structured-sparse fp8 SWMMAC / T89 IU4 (EXPERIMENTAL,
+                    // model-blocked) driver-completeness runs: both only have a real
+                    // kernel for plain GGML_OP_MUL_MAT (ggml_cuda_op_mul_mat_2of4_fp8 /
+                    // ggml_cuda_op_mul_mat_iu4, hooked at the top of ggml_cuda_mul_mat).
+                    // MUL_MAT_ID (MoE routing) is NOT wired for either -- fine for
+                    // dense-model testing, not required by the task.
+                    case GGML_TYPE_2OF4_FP8:
+                    case GGML_TYPE_2OF4_F16:
+                    case GGML_TYPE_IU4:
+                        return op->op == GGML_OP_MUL_MAT;
                     default:
                         return false;
                 }
@@ -4966,6 +5611,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ1_S:
                     case GGML_TYPE_IQ1_M:
                     case GGML_TYPE_IQ4_XS:
+                    case GGML_TYPE_F8E4M3:
+                    case GGML_TYPE_F8E5M2:
+                    case GGML_TYPE_MXFP8:
+                    case GGML_TYPE_MXFP6:
                         return true;
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_MXFP4:
@@ -4986,7 +5635,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                            (
                                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
-                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL) &&
+                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
+                               op->type == GGML_TYPE_F8E4M3) // T80: F8E4M3 KV-cache write path &&
                                op->src[0]->type == GGML_TYPE_F32
                            ) || (
                                op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
@@ -5014,6 +5664,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return true;
                 }
                 if (src0_type == GGML_TYPE_Q8_0 && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F8E4M3) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F8E4M3 && src1_type == GGML_TYPE_F32) {
                     return true;
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q4_0) {
@@ -5527,6 +6183,219 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
         /* .context = */ ctx,
     };
+
+    // T89: native iu4 x iu4 (W4A4) RDNA4 WMMA driver-completeness self-test
+    // (iu4_w4a4.cu). Dormant capability, opt-in only, no model/quant path
+    // routes through it -- see iu4_w4a4.cuh / wiki/tech/int4-iu4-notes.md for
+    // the doctrine rationale (accuracy gate on naive W4A4 activation
+    // quantization did not clear the bar for an ACTIVE default path). Runs at
+    // most once per process. Same pattern as GGML_HIP_SWMMAC24_SELFTEST.
+    // T162 follow-up: isolated per-shape occupancy sweep for the 2:4-sparse
+    // fp8 SWMMAC V3 kernel (mul_mat_2of4_fp8.cu). Opt-in only, no
+    // model/quant path routes through it. Runs at most once per process.
+    if (getenv("GGML_HIP_2OF4_FP8_SHAPE_BENCH") != nullptr) {
+        static bool shape_bench_ran = false;
+        if (!shape_bench_ran) {
+            shape_bench_ran = true;
+            const bool ok = ggml_cuda_mul_mat_2of4_fp8_shape_bench();
+            GGML_LOG_INFO("%s: GGML_HIP_2OF4_FP8_SHAPE_BENCH result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // T162 follow-up: dense-fp8 twin of the isolated per-shape sweep above
+    // -- see mul_mat_dense_fp8_v3.cu. Opt-in only, no model/quant path
+    // routes through it. Runs at most once per process.
+    if (getenv("GGML_HIP_DENSE_FP8_V3_SHAPE_BENCH") != nullptr) {
+        static bool dense_v3_shape_bench_ran = false;
+        if (!dense_v3_shape_bench_ran) {
+            dense_v3_shape_bench_ran = true;
+            const bool ok = ggml_cuda_mul_mat_dense_fp8_v3_shape_bench();
+            GGML_LOG_INFO("%s: GGML_HIP_DENSE_FP8_V3_SHAPE_BENCH result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    if (getenv("GGML_HIP_IU4_W4A4_SELFTEST") != nullptr) {
+        static bool iu4_w4a4_selftest_ran = false;
+        if (!iu4_w4a4_selftest_ran) {
+            iu4_w4a4_selftest_ran = true;
+            const bool ok = ggml_cuda_iu4_w4a4_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_IU4_W4A4_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // Card 133 item 3: k_mul_mat_iu4 real-model wrapper correctness self-test
+    // (mul_mat_iu4.cu) -- distinct from GGML_HIP_IU4_W4A4_SELFTEST above,
+    // which only covers the mma_iu4() primitive. Dormant capability, opt-in
+    // only, no model/quant path routes through it. Runs at most once per
+    // process.
+    if (getenv("GGML_HIP_MUL_MAT_IU4_SELFTEST") != nullptr) {
+        static bool mul_mat_iu4_selftest_ran = false;
+        if (!mul_mat_iu4_selftest_ran) {
+            mul_mat_iu4_selftest_ran = true;
+            const bool ok = ggml_cuda_mul_mat_iu4_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_IU4_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // T162: k_mul_mat_iu4_mmq (MMQ-grade multi-warp/double-buffered kernel)
+    // correctness self-test -- covers BOTH the IU4 and Q2_0 loader traits.
+    // Opt-in only, no model/quant path routes through it. Runs at most once
+    // per process.
+    if (getenv("GGML_HIP_MUL_MAT_IU4_MMQ_SELFTEST") != nullptr) {
+        static bool mul_mat_iu4_mmq_selftest_ran = false;
+        if (!mul_mat_iu4_mmq_selftest_ran) {
+            mul_mat_iu4_mmq_selftest_ran = true;
+            const bool ok = ggml_cuda_mul_mat_iu4_mmq_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_IU4_MMQ_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // T170: k_mmvq_dot8_iu4 (dot8 int4-drafter decode GEMV) correctness
+    // self-test (mmvq_iu4.cu) -- distinct from both IU4 selftests above,
+    // which only cover the WMMA GEMM kernels. Opt-in only, no model/quant
+    // path routes through it. Runs at most once per process.
+    if (getenv("GGML_HIP_MUL_MAT_VEC_IU4_SELFTEST") != nullptr) {
+        static bool mul_mat_vec_iu4_selftest_ran = false;
+        if (!mul_mat_vec_iu4_selftest_ran) {
+            mul_mat_vec_iu4_selftest_ran = true;
+            const bool ok = ggml_cuda_mul_mat_vec_iu4_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_VEC_IU4_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // Stage 25: k_mmvq_dot2f16_{single,dual} (dormant fdot2/DOT2ACC F16
+    // decode GEMV, mmvq_dot2f16.cu) correctness self-test -- covers BOTH
+    // modes. Opt-in only, no model/quant path routes through it by
+    // default. Runs at most once per process.
+    if (getenv("GGML_HIP_MUL_MAT_VEC_DOT2F16_SELFTEST") != nullptr) {
+        static bool mul_mat_vec_dot2f16_selftest_ran = false;
+        if (!mul_mat_vec_dot2f16_selftest_ran) {
+            mul_mat_vec_dot2f16_selftest_ran = true;
+            const bool ok = ggml_cuda_mul_mat_vec_dot2f16_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_VEC_DOT2F16_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // Stage 26: stochastic-rounding fp8 weight quantizer (quantize_fp8_sr.cu)
+    // -- the decisive bias-vs-RMS-error measurement (SR vs RTN, both fp8
+    // formats, 20 random draws each) + a correctness gate (all dequantized
+    // values finite and within the format's representable range). An
+    // ACCURACY lever, not a speed lever -- see quantize_fp8_sr.cuh. Opt-in
+    // only, no model/quant path routes through this by default. Runs at
+    // most once per process.
+    if (getenv("GGML_HIP_FP8_SR_QUANT_SELFTEST") != nullptr) {
+        static bool fp8_sr_quant_test_ran = false;
+        if (!fp8_sr_quant_test_ran) {
+            fp8_sr_quant_test_ran = true;
+            const bool ok = ggml_cuda_fp8_sr_quant_bias_test();
+            GGML_LOG_INFO("%s: GGML_HIP_FP8_SR_QUANT_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // Phase-3(B) M-gated dispatch, M<=2 route (mul_mat_iu4_gemv.cu)
+    // correctness self-test. Opt-in only, no model/quant path routes
+    // through it unless GGML_HIP_IU4_MSWITCH is also set. Runs at most
+    // once per process.
+    if (getenv("GGML_HIP_MUL_MAT_IU4_GEMV_SELFTEST") != nullptr) {
+        static bool mul_mat_iu4_gemv_selftest_ran = false;
+        if (!mul_mat_iu4_gemv_selftest_ran) {
+            mul_mat_iu4_gemv_selftest_ran = true;
+            const bool ok = ggml_cuda_mul_mat_iu4_gemv_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_IU4_GEMV_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // Phase-3(B) M-gated dispatch, M<=2 route for the REAL production
+    // ternary/binary types (mul_mat_q2_0_gemv.cu). Opt-in only, no
+    // model/quant path routes through it unless GGML_HIP_IU4_MSWITCH is
+    // also set. Runs at most once per process.
+    if (getenv("GGML_HIP_MUL_MAT_Q2_0_GEMV_SELFTEST") != nullptr) {
+        static bool mul_mat_q2_0_gemv_selftest_ran = false;
+        if (!mul_mat_q2_0_gemv_selftest_ran) {
+            mul_mat_q2_0_gemv_selftest_ran = true;
+            const bool ok = ggml_cuda_mul_mat_q2_0_gemv_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_Q2_0_GEMV_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    if (getenv("GGML_HIP_MUL_MAT_Q1_0_GEMV_SELFTEST") != nullptr) {
+        static bool mul_mat_q1_0_gemv_selftest_ran = false;
+        if (!mul_mat_q1_0_gemv_selftest_ran) {
+            mul_mat_q1_0_gemv_selftest_ran = true;
+            const bool ok = ggml_cuda_mul_mat_q1_0_gemv_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_Q1_0_GEMV_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // mul_mat_iu4_ck_wmma.cu correctness self-test -- DEFERRED/not wired
+    // into the Phase-3(B) M-switch (see that file's doctrine comment:
+    // pk_i4_t packing not reconciled, EXPECTED FAIL), kept as a real,
+    // honest, opt-in-only check rather than removed.
+    if (getenv("GGML_HIP_MUL_MAT_IU4_CK_WMMA_SELFTEST") != nullptr) {
+        static bool mul_mat_iu4_ck_wmma_selftest_ran = false;
+        if (!mul_mat_iu4_ck_wmma_selftest_ran) {
+            mul_mat_iu4_ck_wmma_selftest_ran = true;
+            const bool ok = ggml_cuda_mul_mat_iu4_ck_wmma_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_MUL_MAT_IU4_CK_WMMA_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // RDNA4 2:4-structured-sparse SWMMAC driver-completeness self-test (swmmac24.cu).
+    // Dormant capability, opt-in only, no model/quant path routes through it -- see
+    // swmmac24.cuh for the doctrine rationale. Runs at most once per process.
+    if (getenv("GGML_HIP_SWMMAC24_SELFTEST") != nullptr) {
+        static bool swmmac24_selftest_ran = false;
+        if (!swmmac24_selftest_ran) {
+            swmmac24_selftest_ran = true;
+            const bool ok = ggml_cuda_swmmac24_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_SWMMAC24_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // T162 int4-2:4 pivot: idx-encoding-fixed iu4 sparse SWMMAC self-test
+    // (swmmac24_iu4_fixed.cu). Opt-in, does not touch the selftest above.
+    if (getenv("GGML_HIP_SWMMAC24_IU4_FIXED_SELFTEST") != nullptr) {
+        static bool swmmac24_iu4_fixed_selftest_ran = false;
+        if (!swmmac24_iu4_fixed_selftest_ran) {
+            swmmac24_iu4_fixed_selftest_ran = true;
+            const bool ok = ggml_cuda_swmmac24_iu4_fixed_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_SWMMAC24_IU4_FIXED_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // T162 int4-2:4 pivot: isolated MMQ-grade sparse int4 correctness +
+    // throughput probe (int4_24_probe.cu). Opt-in, standalone (no ggml
+    // dispatch path routes through it -- see file header for why).
+    if (getenv("GGML_HIP_INT4_24_PROBE") != nullptr) {
+        static bool int4_24_probe_ran = false;
+        if (!int4_24_probe_ran) {
+            int4_24_probe_ran = true;
+            const bool ok = ggml_cuda_int4_24_probe();
+            GGML_LOG_INFO("%s: GGML_HIP_INT4_24_PROBE result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // ROC8: MXFP8 type-plumbing + kernel correctness self-test (mxfp8_selftest.cu).
+    // Synthetic (no model/GGUF needed), opt-in only, no default model/quant
+    // path routes through it -- see mxfp8_selftest.cuh for the doctrine/gating
+    // rationale. Runs at most once per process, same pattern as the two
+    // selftests directly above.
+    if (getenv("GGML_HIP_MXFP8_SELFTEST") != nullptr) {
+        static bool mxfp8_selftest_ran = false;
+        if (!mxfp8_selftest_ran) {
+            mxfp8_selftest_ran = true;
+            const bool ok = ggml_cuda_mxfp8_selftest();
+            GGML_LOG_INFO("%s: GGML_HIP_MXFP8_SELFTEST result: %s\n", __func__, ok ? "PASS" : "FAIL");
+        }
+    }
+    // Concurrency PoC (see mul_mat_q2_0_wmma.cuh): spawns a detached
+    // background thread that hammers the WMMA path on its own stream, IN
+    // THIS SAME PROCESS/CONTEXT, for the life of the process -- used to
+    // measure whether a real decode workload (mmvq, VALU-bound) on the main
+    // stream holds its throughput while a WMMA-bound companion runs
+    // concurrently on a second stream of the SAME context (the mechanism the
+    // T112 async draft/verify pipeline actually uses). Opt-in only, no
+    // effect unless GGML_HIP_WMMA_CONCURRENCY_POC is set; duration/intensity
+    // tunable via GGML_HIP_WMMA_CONCURRENCY_POC_SECONDS /
+    // _ITERS (defaults: 120s, 500000 iters/launch).
+    if (getenv("GGML_HIP_WMMA_CONCURRENCY_POC") != nullptr) {
+        static bool wmma_concurrency_poc_started = false;
+        if (!wmma_concurrency_poc_started) {
+            wmma_concurrency_poc_started = true;
+            const char * secs_env  = getenv("GGML_HIP_WMMA_CONCURRENCY_POC_SECONDS");
+            const char * iters_env = getenv("GGML_HIP_WMMA_CONCURRENCY_POC_ITERS");
+            const double secs  = secs_env  ? atof(secs_env)  : 120.0;
+            const long   iters = iters_env ? atol(iters_env) : 500000L;
+            GGML_LOG_INFO("%s: starting GGML_HIP_WMMA_CONCURRENCY_POC companion (%.1fs, %ld iters/launch)\n",
+                           __func__, secs, iters);
+            ggml_cuda_start_wmma_concurrency_poc_companion(secs, iters);
+        }
+    }
 
     return cuda_backend;
 }

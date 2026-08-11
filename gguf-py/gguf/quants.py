@@ -48,6 +48,247 @@ def np_roundf(n: np.ndarray) -> np.ndarray:
     return np.sign(n) * b
 
 
+def pack_f8e4m3_preserve(qweight_e4m3_bytes: np.ndarray, scale: np.ndarray,
+                         block_dims: tuple[int, int] | None = None) -> np.ndarray:
+    """Re-block a vendor fp8 tensor (Quark / compressed-tensors / modelopt /
+    DeepSeek block-scale) into ggml block_f8e4m3 WITHOUT dequantizing.
+
+    Vendor decode:  w = (float)e4m3fn(qs) * scale
+    block_f8e4m3:   struct { ggml_half d; uint8_t qs[32]; }, decode w = e4m3fn(qs) * d
+    => copy the e4m3fn bytes verbatim and put the covering vendor scale into each
+    32-element block's fp16 d. Loss is limited to fp16 rounding of the scale.
+
+    Fully vectorized over arbitrary leading (e.g. MoE expert) dims.
+
+    qweight_e4m3_bytes: uint8 raw e4m3fn bytes, [cols], [rows, cols] or [*lead, rows, cols].
+    scale, block_dims:
+      - per-tensor:  scale scalar/size-1,           block_dims=None
+      - per-channel: scale [rows] or [*lead, rows], block_dims=None
+      - block-scale: scale [rows//bs0, cols//bs1] (or [*lead, ...]), block_dims=(bs0, bs1);
+                     bs1 must be a multiple of 32 so each 32-block sits in one column tile
+                     (DeepSeek uses 128x128). Each 32-block b of row r takes the scale of
+                     tile (r//bs0, (b*32)//bs1).
+    Returns a uint8 array shaped [*lead, rows, nblk*(2+32)] (row-padded to 32).
+    """
+    QK = 32
+    q = np.ascontiguousarray(qweight_e4m3_bytes).astype(np.uint8, copy=False)
+    s = np.asarray(scale, dtype=np.float32)
+
+    if q.ndim == 1:
+        q = q[None, :]
+    if q.ndim < 2:
+        raise ValueError(f"pack_f8e4m3_preserve: unsupported ndim {q.ndim}")
+
+    lead = q.shape[:-2]
+    rows, cols = q.shape[-2:]
+    rem = cols % QK
+    if rem:  # row-pad to a block boundary; e4m3 0x00 == +0.0
+        q = np.pad(q, [(0, 0)] * (q.ndim - 1) + [(0, QK - rem)], constant_values=0)
+        cols = q.shape[-1]
+    nblk = cols // QK
+
+    # Compute a per-block scale grid s_blk with shape [*lead, rows, nblk].
+    if block_dims is not None:
+        bs0, bs1 = block_dims
+        if bs1 % QK != 0:
+            raise ValueError(f"block col size {bs1} must be a multiple of {QK}")
+        sg = s.reshape(*lead, s.shape[-2], s.shape[-1])                    # [*lead, RT, CT]
+        RT, CT = sg.shape[-2], sg.shape[-1]
+        row_tile = np.minimum(np.arange(rows) // bs0, RT - 1)             # [rows]
+        col_tile = np.minimum((np.arange(nblk) * QK) // bs1, CT - 1)      # [nblk]
+        s_blk = sg[..., row_tile[:, None], col_tile[None, :]]            # [*lead, rows, nblk]
+    elif s.ndim == 0 or s.size == 1:
+        s_blk = np.broadcast_to(np.float32(s.reshape(-1)[0]), (*lead, rows, nblk))
+    else:
+        s_rows = s.reshape(*lead, rows).astype(np.float32)               # per-channel
+        s_blk = np.broadcast_to(s_rows[..., None], (*lead, rows, nblk))
+
+    s16 = np.ascontiguousarray(s_blk.astype(np.float16)).view(np.uint16)  # [*lead, rows, nblk]
+    d_bytes = s16.astype("<u2").view(np.uint8).reshape(*lead, rows, nblk, 2)
+    qs_blocks = q.reshape(*lead, rows, nblk, QK)
+    blocks = np.concatenate([d_bytes, qs_blocks], axis=-1)                # [*lead, rows, nblk, 34]
+    return np.ascontiguousarray(blocks.reshape(*lead, rows, nblk * (2 + QK)))
+
+
+def pack_mxfp8_preserve(qweight_e4m3_bytes: np.ndarray, e8m0_scale: np.ndarray) -> np.ndarray:
+    """Re-block an OCP MXFP8 tensor (MLX `mx.quantize(mode="mxfp8")`, group_size=32)
+    into ggml block_mxfp8 WITHOUT dequantizing (ROC8).
+
+    Source decode: w = e4m3fn(qs) * 2^(e8m0 - 127)   (e8m0 already the raw biased
+    exponent byte, one per 32-element group -- MLX's .scales tensor is already
+    shaped [rows, cols//32], a 1:1 match with the qs block grid, unlike
+    pack_f8e4m3_preserve's vendor formats which need per-channel/block-tile
+    broadcasting.)
+    block_mxfp8: struct { uint8_t e; uint8_t qs[32]; }, decode w = e4m3fn(qs) * 2^(e-127)
+    => copy the e4m3fn bytes verbatim and the e8m0 byte verbatim -- both are
+    ALREADY the exact on-disk ggml representation, no rounding/reinterpretation
+    at all (unlike F8E4M3's vendor path, which must round a continuous fp32/fp16
+    vendor scale down into ggml_half). This is a pure re-layout: interleave
+    [e, qs[0..31]] per block, no float math.
+
+    Fully vectorized over arbitrary leading (e.g. MoE expert) dims, mirroring
+    pack_f8e4m3_preserve's shape conventions.
+
+    qweight_e4m3_bytes: uint8 raw e4m3fn bytes, [rows, cols] or [*lead, rows, cols]
+                         (already unpacked from MLX's U32-packed-4-per-word layout
+                         by the caller -- see conversion/base.py _generate_mxfp8_preserve_tensors).
+    e8m0_scale: uint8 raw e8m0 bytes, [rows, cols//32] or [*lead, rows, cols//32].
+    Returns a uint8 array shaped [*lead, rows, nblk*(1+32)] (row-padded to 32).
+    """
+    QK = 32
+    q = np.ascontiguousarray(qweight_e4m3_bytes).astype(np.uint8, copy=False)
+    e = np.ascontiguousarray(e8m0_scale).astype(np.uint8, copy=False)
+
+    if q.ndim == 1:
+        q = q[None, :]
+    if q.ndim < 2:
+        raise ValueError(f"pack_mxfp8_preserve: unsupported ndim {q.ndim}")
+
+    lead = q.shape[:-2]
+    rows, cols = q.shape[-2:]
+    rem = cols % QK
+    if rem:  # row-pad to a block boundary; e4m3 0x00 == +0.0
+        q = np.pad(q, [(0, 0)] * (q.ndim - 1) + [(0, QK - rem)], constant_values=0)
+        cols = q.shape[-1]
+    nblk = cols // QK
+
+    if e.shape[-2:] != (rows, nblk):
+        raise ValueError(
+            f"pack_mxfp8_preserve: e8m0_scale shape {e.shape} does not match "
+            f"[*, {rows}, {nblk}] (rows x cols/{QK}) derived from the weight shape")
+
+    e_bytes = e.reshape(*lead, rows, nblk, 1)
+    qs_blocks = q.reshape(*lead, rows, nblk, QK)
+    blocks = np.concatenate([e_bytes, qs_blocks], axis=-1)                # [*lead, rows, nblk, 33]
+    return np.ascontiguousarray(blocks.reshape(*lead, rows, nblk * (1 + QK)))
+
+
+def pack_mxfp6_preserve(qweight_e3m2_packed_bytes: np.ndarray, e8m0_scale: np.ndarray) -> np.ndarray:
+    """Re-block an OCP MXFP6 tensor (Quark `fp6_e3m2`, per_group/group_size=32,
+    scale_format=e8m0) into ggml block_mxfp6 WITHOUT dequantizing (T184).
+
+    Quark's Pack_fp6 (quark/torch/utils/pack.py, selected via
+    create_pack_method(dtype="fp6_e3m2") -- NOT the dtype="mx" branch, which
+    would pick Pack_mxfp6 and use a different in-tensor-embedded-scale byte
+    order) packs 4 six-bit E3M2 codes per 3 bytes as:
+        combined = v0 | (v1<<6) | (v2<<12) | (v3<<18)   (24-bit, LSB-first)
+        byte0 = combined>>16, byte1 = combined>>8, byte2 = combined
+        output order per group of 4: [byte2, byte1, byte0]
+    which is BIT-IDENTICAL to ggml block_mxfp6's qs[3g+0..2] layout (see
+    ggml-common.h block_mxfp6 comment / mxfp6_unpack4) -- verified empirically
+    2026-07-24 by unpacking a real checkpoint block through both Quark's own
+    Pack_fp6.unpack() and the ggml bit formula and comparing all 32 decoded
+    E3M2 floats bit-for-bit (exact match). So this is a PURE re-layout: the
+    packed qs bytes are copied verbatim, only the separate weight/weight_scale
+    tensors get interleaved into ggml's [e, qs[0..23]] per-block struct --
+    mirrors pack_mxfp8_preserve's shape conventions exactly.
+
+    qweight_e3m2_packed_bytes: uint8 raw Quark-packed 6-bit-per-4-in-3-bytes
+                                data, [rows, cols_packed] or [*lead, rows, cols_packed]
+                                where cols_packed = (cols // 32) * 24.
+    e8m0_scale: uint8 raw e8m0 bytes, [rows, cols//32] or [*lead, rows, cols//32].
+    Returns a uint8 array shaped [*lead, rows, nblk*(1+24)].
+    """
+    QK = 32
+    BLK_BYTES = QK * 6 // 8  # 24
+    q = np.ascontiguousarray(qweight_e3m2_packed_bytes).astype(np.uint8, copy=False)
+    e = np.ascontiguousarray(e8m0_scale).astype(np.uint8, copy=False)
+
+    if q.ndim == 1:
+        q = q[None, :]
+    if q.ndim < 2:
+        raise ValueError(f"pack_mxfp6_preserve: unsupported ndim {q.ndim}")
+
+    lead = q.shape[:-2]
+    rows, cols_packed = q.shape[-2:]
+    rem = cols_packed % BLK_BYTES
+    if rem:
+        raise ValueError(
+            f"pack_mxfp6_preserve: packed cols {cols_packed} is not a multiple of "
+            f"{BLK_BYTES} bytes/block (24 bytes = 32 elements at 6 bits each)")
+    nblk = cols_packed // BLK_BYTES
+
+    if e.shape[-2:] != (rows, nblk):
+        raise ValueError(
+            f"pack_mxfp6_preserve: e8m0_scale shape {e.shape} does not match "
+            f"[*, {rows}, {nblk}] (rows x cols/{QK}) derived from the weight shape")
+
+    e_bytes = e.reshape(*lead, rows, nblk, 1)
+    qs_blocks = q.reshape(*lead, rows, nblk, BLK_BYTES)
+    blocks = np.concatenate([e_bytes, qs_blocks], axis=-1)                # [*lead, rows, nblk, 25]
+    return np.ascontiguousarray(blocks.reshape(*lead, rows, nblk * (1 + BLK_BYTES)))
+
+
+def pack_mxfp4_preserve(qweight_fp4_packed_bytes: np.ndarray, e8m0_scale: np.ndarray) -> np.ndarray:
+    """Re-block a Quark OCP MXFP4 tensor (`dtype="fp4"`, per_group/group_size=32,
+    scale_format=e8m0 -- produced by e.g. quark.torch.quantization.config.config.
+    OCP_MXFP4Spec) into ggml block_mxfp4 WITHOUT dequantizing (T185).
+
+    Codebook check (empirical, 2026-07-24): Quark's Pack_fp4 4-bit code i
+    (i=0..15) decodes to +/-{0, 0.5, 1, 1.5, 2, 3, 4, 6} (sign = bit 3,
+    magnitude index = bits 2:0), VERIFIED bit-for-bit identical to ggml's
+    `kvalues_mxfp4[i] / 2` (ggml-common.h; the /2 is `GGML_E8M0_TO_FP32_HALF`,
+    which exists purely because ggml's table stores doubled magnitudes
+    {0,1,2,3,4,6,8,12} -- the actual decoded float is the same standard OCP
+    E2M1 grid either way). So NO value/table remapping is needed -- this is a
+    PURE NIBBLE-INTERLEAVE reshuffle, not a requant:
+
+      Quark Pack_fp4 (quark/torch/utils/pack.py):
+        byte[i]      = code[2*i] | (code[2*i+1] << 4)     for i in 0..15
+        (sequential pairs -- same convention as quantize_row_q4_1)
+
+      ggml block_mxfp4 (ggml-quants.c quantize_row_mxfp4_ref / dequantize_row_mxfp4):
+        qs[j]        = code[j] | (code[j+16] << 4)        for j in 0..15
+        (SPLIT-HALF: low nibble = element j, high nibble = element j+16)
+
+    qweight_fp4_packed_bytes: uint8 Quark-packed nibbles (2 codes/byte,
+                                sequential), [rows, cols//2] or [*lead, rows, cols//2].
+    e8m0_scale: uint8 raw e8m0 bytes, [rows, cols//32] or [*lead, rows, cols//32]
+                (byte-identical semantics to ggml's block_mxfp4.e -- both are
+                the biased power-of-2 GGML_E8M0_TO_FP32/_HALF exponent, and
+                Quark's own `to_e8m0_uint8` uses the same bias-127 convention).
+    Returns a uint8 array shaped [*lead, rows, nblk*(1+16)].
+    """
+    QK = 32
+    BLK_BYTES = QK // 2  # 16
+    q = np.ascontiguousarray(qweight_fp4_packed_bytes).astype(np.uint8, copy=False)
+    e = np.ascontiguousarray(e8m0_scale).astype(np.uint8, copy=False)
+
+    if q.ndim == 1:
+        q = q[None, :]
+    if q.ndim < 2:
+        raise ValueError(f"pack_mxfp4_preserve: unsupported ndim {q.ndim}")
+
+    lead = q.shape[:-2]
+    rows, cols_packed = q.shape[-2:]
+    rem = cols_packed % BLK_BYTES
+    if rem:
+        raise ValueError(
+            f"pack_mxfp4_preserve: packed cols {cols_packed} is not a multiple of "
+            f"{BLK_BYTES} bytes/block (16 bytes = 32 elements at 2/byte)")
+    nblk = cols_packed // BLK_BYTES
+
+    if e.shape[-2:] != (rows, nblk):
+        raise ValueError(
+            f"pack_mxfp4_preserve: e8m0_scale shape {e.shape} does not match "
+            f"[*, {rows}, {nblk}] (rows x cols/{QK}) derived from the weight shape")
+
+    # Unpack Quark's sequential-pair nibbles -> 32 codes/block in element order.
+    qb = q.reshape(*lead, rows, nblk, BLK_BYTES)                      # [*lead, rows, nblk, 16]
+    lo = qb & 0x0F                                                    # code[2i]
+    hi = (qb >> 4) & 0x0F                                             # code[2i+1]
+    codes = np.empty((*lead, rows, nblk, QK), dtype=np.uint8)
+    codes[..., 0::2] = lo
+    codes[..., 1::2] = hi
+
+    # Re-pack ggml split-half: qs[j] = code[j] | (code[j+16] << 4), j in 0..15.
+    qs_ggml = (codes[..., :16] | (codes[..., 16:] << 4)).astype(np.uint8)   # [*lead, rows, nblk, 16]
+
+    e_bytes = e.reshape(*lead, rows, nblk, 1)
+    blocks = np.concatenate([e_bytes, qs_ggml], axis=-1)               # [*lead, rows, nblk, 17]
+    return np.ascontiguousarray(blocks.reshape(*lead, rows, nblk * (1 + BLK_BYTES)))
+
+
 class QuantError(Exception): ...
 
 

@@ -402,6 +402,20 @@ static void ggml_cuda_get_rows_switch_src0_type(
             break;
         case GGML_TYPE_MXFP4:
             get_rows_cuda_kq<32, dst_t, dequantize_mxfp4<dst_t>>(src0_d, src1_d, dst_d,
+        case GGML_TYPE_F8E4M3:
+            get_rows_cuda_q<QK_F8E4M3, QR_F8E4M3, dequantize_f8e4m3>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_F8E5M2:
+            get_rows_cuda_q<QK_F8E5M2, QR_F8E5M2, dequantize_f8e5m2>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_MXFP8:
+            get_rows_cuda_q<QK_MXFP8, QR_MXFP8, dequantize_mxfp8>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_MXFP6:
+            get_rows_cuda_q<QK_MXFP6, QR_MXFP6, dequantize_mxfp6>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         default:

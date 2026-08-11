@@ -1336,6 +1336,101 @@ namespace ggml_cuda_mma {
 #endif // AMD_MFMA_AVAILABLE
     }
 
+    // Native fp8_e4m3 x fp8_e4m3 -> f32 WMMA (RDNA4/gfx12 only). Used by the
+    // F8E4M3 (Path X) MMQ vec_dot (Phase 1b). Unlike the iu8 int8 overload
+    // above, the hardware interprets the raw bytes as e4m3 floats and
+    // accumulates the true dot product directly in fp32 -- no post-hoc
+    // integer->float rescale, just the usual per-block (dA, dB) scale
+    // multiply applied by the caller after accumulation. Tile shapes mirror
+    // the iu8 (16,8,int) overload exactly (same 1-byte-per-value packing),
+    // two accumulating builtin calls per mma() to cover K=32.
+    template <data_layout dl_d, data_layout dl_ab>
+    static __device__ __forceinline__ void mma(
+            tile<16, 16, float, dl_d> & D, const tile<16, 8, int, dl_ab> & A, const tile<16, 8, int, dl_ab> & B) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+        using float8_t  = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+        using int32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+        float8_t          * acc   = (float8_t *) D.x;
+        const int32x2_t   * a_vec = (const int32x2_t *) A.x;
+        const int32x2_t   * b_vec = (const int32x2_t *) B.x;
+        acc[0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_vec[0], b_vec[0], acc[0]);
+        acc[0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_vec[1], b_vec[1], acc[0]);
+#else
+        GGML_UNUSED_VARS(D, A, B);
+        NO_DEVICE_CODE;
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+    }
+
+    // T97: Native bf8_e5m2 x bf8_e5m2 -> f32 WMMA (RDNA4/gfx12 only). Used by
+    // the F8E5M2 MMQ vec_dot (native prefill, completing the E5M2 format --
+    // decode already had the T77-style hardware bf8 convert-instruction
+    // path). Compile+disasm ISA-verified (llvm-objdump --mcpu=gfx1201 on a
+    // standalone HIP test kernel, T97 WMMA session): the RDNA4 WMMA cross
+    // matrix genuinely has 4 independent instructions --
+    // v_wmma_f32_16x16x16_{fp8,bf8}_{fp8,bf8} -- confirmed
+    // __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12 compiles to
+    // exactly v_wmma_f32_16x16x16_bf8_bf8 (distinct opcode from the fp8_fp8
+    // one above). NOTE: this is named `mma_bf8`, NOT an overload of `mma()`,
+    // because the fp8_e4m3 overload directly above already claims the exact
+    // same C++ signature (tile<16,16,float,dl_d>, tile<16,8,int,dl_ab> x2) --
+    // two mma() overloads with identical parameter types but different
+    // builtin bodies would be an ODR/redefinition conflict, not legal
+    // overload resolution (overload picking here is by TILE SHAPE/element
+    // type, not by ggml_type, and F8E4M3 already occupies this shape). Callers
+    // (vec_dot_f8e5m2_f8e5m2_mma, mmq.cuh) invoke mma_bf8() directly instead
+    // of going through the generic mma() dispatcher.
+    template <data_layout dl_d, data_layout dl_ab>
+    static __device__ __forceinline__ void mma_bf8(
+            tile<16, 16, float, dl_d> & D, const tile<16, 8, int, dl_ab> & A, const tile<16, 8, int, dl_ab> & B) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+        using float8_t  = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+        using int32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+        float8_t          * acc   = (float8_t *) D.x;
+        const int32x2_t   * a_vec = (const int32x2_t *) A.x;
+        const int32x2_t   * b_vec = (const int32x2_t *) B.x;
+        acc[0] = __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12(a_vec[0], b_vec[0], acc[0]);
+        acc[0] = __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12(a_vec[1], b_vec[1], acc[0]);
+#else
+        GGML_UNUSED_VARS(D, A, B);
+        NO_DEVICE_CODE;
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+    }
+
+    // Card 120: MIXED fp8_e4m3 (A, weight) x bf8_e5m2 (B, activation) -> f32
+    // WMMA (RDNA4/gfx12 only). Accuracy-lever experiment, not a speed lever --
+    // weights stay F8E4M3 (well-behaved, wants the extra mantissa bit),
+    // activations get quantized to bf8/e5m2 instead of e4m3 (wants the extra
+    // exponent bit for outlier range). ISA-verified real silicon (standalone
+    // HIP kernel + llvm-objdump --mcpu=gfx1201, card 120 session): encodes to
+    // `v_wmma_f32_16x16x16_fp8_bf8` (opcode 0xCC47), a DISTINCT opcode from
+    // both `v_wmma_f32_16x16x16_fp8_fp8` (0xCC46, the production fp8_fp8
+    // above) and the reverse `v_wmma_f32_16x16x16_bf8_fp8` (0xCC48) -- the
+    // RDNA4 WMMA cross matrix genuinely has all 4 fp8/bf8 combinations as
+    // independent instructions, operand order matters (A=fp8, B=bf8 for this
+    // one). Named separately (not a `mma()` overload) for the same ODR
+    // reason as `mma_bf8` above -- this C++ signature is already claimed by
+    // the fp8_fp8 overload. Both this function AND the production fp8_fp8
+    // path (`mma()` above) are ALWAYS compiled in -- selection between them
+    // is a RUNTIME choice (GGML_HIP_FP8_ACT env var, mmq.cu/mmq.cuh), not a
+    // build-time one, so no compile guard lives here beyond the hardware
+    // gate (AMD_WMMA_AVAILABLE && RDNA4) that already covers `mma()` too.
+    template <data_layout dl_d, data_layout dl_ab>
+    static __device__ __forceinline__ void mma_mixed_fp8_bf8(
+            tile<16, 16, float, dl_d> & D, const tile<16, 8, int, dl_ab> & A, const tile<16, 8, int, dl_ab> & B) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+        using float8_t  = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+        using int32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+        float8_t          * acc   = (float8_t *) D.x;
+        const int32x2_t   * a_vec = (const int32x2_t *) A.x;
+        const int32x2_t   * b_vec = (const int32x2_t *) B.x;
+        acc[0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_bf8_w32_gfx12(a_vec[0], b_vec[0], acc[0]);
+        acc[0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_bf8_w32_gfx12(a_vec[1], b_vec[1], acc[0]);
+#else
+        GGML_UNUSED_VARS(D, A, B);
+        NO_DEVICE_CODE;
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+    }
+
     static __device__ __forceinline__ void mma(
             tile<32, 32, int> & D, const tile<32, 4, int> & A, const tile<32, 4, int> & B) {
 #if defined(AMD_MFMA_AVAILABLE)
@@ -1452,5 +1547,61 @@ namespace ggml_cuda_mma {
         GGML_UNUSED(B);
         NO_DEVICE_CODE;
 #endif // AMD_WMMA_AVAILABLE
+    }
+
+    // --- T89: native iu4 (int4 x int4 -> int32) W4A4 WMMA, RDNA4-only ---------
+    // Mirrors the iu8 K=16 dense overload directly above: SAME tile<16,4,int>
+    // operand shape (ne=2, i.e. one int32x2 register/lane = 8 bytes/lane), but
+    // calls the native `V_WMMA_I32_16X16X32_IU4` builtin (2 int4 nibbles packed
+    // per byte) instead of iu8's K=16 form. At IDENTICAL register footprint
+    // this gets DOUBLE the reduction depth (K=32 instead of K=16) in a SINGLE
+    // instruction -- matches a Q4_0-style 32-element quant block exactly, and
+    // matches the measured ~2.23x raw-throughput finding
+    // (`wiki/tech/phase2-lever-validation.md`: iu4_dense_k32/iu8_dense_k16 =
+    // 2.228 +/- 0.070, confirmed via `__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12`
+    // disasm to `v_wmma_i32_16x16x32_iu4`).
+    //
+    // Named `mma_iu4` (NOT an `mma()` overload) on purpose: iu4 and iu8 both
+    // accumulate to `int` with the textually IDENTICAL tile<16,4,int> operand
+    // shape, so there is no type-safe way to overload purely on "byte packing
+    // convention" here without threading a new tile element-type tag through
+    // this header (which is included by every translation unit in the CUDA/HIP
+    // backend). Since this is a correctness-only, self-test-gated capability
+    // (T89 disposition: DORMANT -- see ggml/src/ggml-cuda/iu4_w4a4.cu and
+    // wiki/tech/int4-iu4-notes.md) and NOT wired into the production mmq
+    // dispatch, a distinctly-named function keeps the change minimal and
+    // zero-risk to every existing kernel that includes this file.
+    //
+    // A/B pack 32 signed int4 values (range [-8,7]) as 16 bytes = 4 int32
+    // words per THREAD's tile (ne=2 per the tile<16,4,int> shape only covers
+    // half of that -- the remaining reduction depth comes from the wave-wide
+    // WMMA fabric exactly as it does for the existing iu8/fp8 overloads in
+    // this file; see the ISA doc, doc 70651, Table 41 / SS7.12).
+    template <data_layout dl_d, data_layout dl_ab>
+    static __device__ __forceinline__ void mma_iu4(
+            tile<16, 16, int, dl_d> & D, const tile<16, 4, int, dl_ab> & A, const tile<16, 4, int, dl_ab> & B) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+        using int32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
+        using int32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+        int32x8_t * acc = (int32x8_t *) D.x;
+        const int32x2_t * a_vec = (const int32x2_t *) A.x;
+        const int32x2_t * b_vec = (const int32x2_t *) B.x;
+        // Lane A signed-i4 probe (2026-07-20): tested false,false ("signed")
+        // against the k_mul_mat_iu4_mmq selftest -- FAILS correctness
+        // (max_abs_err ~18000+ on a two's-complement-packed [-8,7] operand
+        // range) while true,true ("unsigned") below is the ONLY flag
+        // combination that reproduces the true signed dot product for this
+        // packing convention (verified: disasm shows the flags select
+        // neg_lo:[1,1,0] vs no modifier -- a real HW difference, not a
+        // no-op -- but the "unsigned" name does not mean what the API
+        // parameter name suggests for this w32 K=32 iu4 builtin on gfx1201).
+        // Do NOT flip this without re-running that selftest.
+        acc[0] = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true, a_vec[0], true, b_vec[0], acc[0], true);
+#else
+        GGML_UNUSED(D);
+        GGML_UNUSED(A);
+        GGML_UNUSED(B);
+        NO_DEVICE_CODE;
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
     }
 }
