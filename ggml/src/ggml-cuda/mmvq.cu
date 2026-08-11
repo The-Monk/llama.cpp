@@ -918,6 +918,16 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             if (type == GGML_TYPE_F8E4M3 || type == GGML_TYPE_F8E5M2 || type == GGML_TYPE_Q2_0) {
                 return 3;
             }
+            // Q1_0 re-swept 2026-08-11 after the 2c-1 identity rewrite of its vec_dot
+            // (the leaner kernel moved the optimum): Bonsai-27B tg128 -r3, GPU0:
+            //   rpb=2 56.28  rpb=3 58.84  rpb=4 58.88  rpb=6 60.01  rpb=8 58.99  rpb=10 54.96
+            // Monotonic rise to 6 then falloff; nwarps 1/2/4/8 all within noise at
+            // rpb=6 (60.0-60.4), so only rpb changes. VDR=2 was also tried and lost
+            // (~56 across geometries -- fewer lanes/block costs more than the extra
+            // in-flight loads gain). Swept on the 27B only.
+            if (type == GGML_TYPE_Q1_0) {
+                return 6;
+            }
             // Swept 2026-07-20 (Vulkan-decode-gap investigation) on GPU0, llama-bench
             // tg128 -r5, median-of-3+ reps per point:
             //   Devstral-13B (Q4_K_M): rpb=2 35.90/35.93/36.01 -> rpb=3 36.86/36.86/37.22
