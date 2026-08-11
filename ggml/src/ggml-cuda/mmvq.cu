@@ -555,7 +555,9 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
                 return 3;
             }
             if (type == GGML_TYPE_Q1_0) {
-                return 6;
+                // Re-swept on the 2c-1 dp4a kernel (the old rpb=6 was tuned on
+                // the pre-rewrite kernel): 4 > 6 > 8 > 10 > 12 on gfx1201.
+                return 4;
             }
             if (type == GGML_TYPE_Q4_K) {
                 return 3;
