@@ -715,35 +715,27 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     // Process only the chunk specified by iqs
     const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
 
-    // Load 32 bits (4 bytes) for this chunk from Q1_0
+    // Binary {-1,+1} via the same identity Q2_0 uses: with raw code bits
+    // c in {0,1}, s = 2c - 1, so dot(s,u) = 2*dot(c,u) - sum(u). Bit-spread
+    // each qs byte straight into two dp4a operands of {0,1} bytes (4 fused
+    // shift-or ops each) and apply the -sum(u) offset once at the end via the
+    // q8_1 stored sum (ds.y = d8*sum(u)). Replaces the previous per-bit
+    // select chain that materialized +-1 bytes (~2.5x the VALU ops on a
+    // VALU-bound kernel; measured 43.96 -> see VALIDATION log, Bonsai-27B).
     const int offset = iqs * 4;
-    const int v = bq1_0->qs[offset + 0] | (bq1_0->qs[offset + 1] << 8) |
-                  (bq1_0->qs[offset + 2] << 16) | (bq1_0->qs[offset + 3] << 24);
-
-    // Unpack 32 bits into 32 signed values (-1 or +1)
-    int vi_bytes[8];
+    int sumi = 0;   // = dot(c, u), c in {0,1}
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int shift = j * 4;
-        const int bits4 = (v >> shift) & 0x0F;
-        const int b0 = (bits4 & 0x01) ? 1 : -1;
-        const int b1 = (bits4 & 0x02) ? 1 : -1;
-        const int b2 = (bits4 & 0x04) ? 1 : -1;
-        const int b3 = (bits4 & 0x08) ? 1 : -1;
-        vi_bytes[j] = (b0 & 0xFF) | ((b1 & 0xFF) << 8) | ((b2 & 0xFF) << 16) | ((b3 & 0xFF) << 24);
+    for (int j2 = 0; j2 < 4; ++j2) {
+        const int b  = bq1_0->qs[offset + j2];
+        const int lo = ( b       | (b << 7) | (b << 14) | (b << 21)) & 0x01010101; // bits 0..3 -> bytes
+        const int hi = ((b >> 4) | (b << 3) | (b << 10) | (b << 17)) & 0x01010101; // bits 4..7 -> bytes
+        sumi = ggml_cuda_dp4a(lo, get_int_b4(bq8_1_chunk->qs, 2*j2 + 0), sumi);
+        sumi = ggml_cuda_dp4a(hi, get_int_b4(bq8_1_chunk->qs, 2*j2 + 1), sumi);
     }
 
-    // Compute dot product for this 32-element chunk
-    int sumi = 0;
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int u = get_int_b4(bq8_1_chunk->qs, j);
-        sumi = ggml_cuda_dp4a(vi_bytes[j], u, sumi);
-    }
-
-    // Apply Q1_0's single scale and this chunk's Q8_1 scale
     const float d8 = __low2float(bq8_1_chunk->ds);
-    return d1 * d8 * sumi;
+    const float s8 = __high2float(bq8_1_chunk->ds); // = d8 * sum(u)
+    return d1 * (2.0f * d8 * (float) sumi - s8);
 }
 
 static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
