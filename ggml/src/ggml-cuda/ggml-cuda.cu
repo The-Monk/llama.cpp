@@ -4343,6 +4343,33 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // MUL_MAT -> ADD residual epilogue (decode). The ADD after o-proj /
+    // ffn_down / out-proj is a full same-shape elementwise add, which the
+    // mmvq fusion's x_bias lane already implements at ncols_dst==1 (bias is
+    // loaded per (row, col) with dst strides, and `result += x_biases[j]` is
+    // unconditional under has_fusion). Folding it removes one launch and one
+    // graph-node boundary per matmul -- at bs=1 the boundary is the cost
+    // (launch-gap anatomy, 2026-08-11).
+    if (node->op == GGML_OP_MUL_MAT) {
+        const ggml_op resid_ops[2] = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+        if (ggml_can_fuse(cgraph, i, resid_ops, 2)) {
+            ggml_tensor * add = cgraph->nodes[i + 1];
+            const ggml_tensor * residual = get_bias_tensor(add, node, GGML_OP_ADD);
+            const int resid_out_nodes[] = { i + 1 };
+            if (residual != nullptr &&
+                ggml_are_same_shape(add->src[0], add->src[1]) &&   // full add, no broadcast
+                node->type == GGML_TYPE_F32 && residual->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(residual) &&
+                ggml_cuda_should_fuse_mul_mat_vec_q(node) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, resid_out_nodes, 1)) {
+                ggml_cuda_mm_fusion_args_host fusion_data{};
+                fusion_data.x_bias = residual;
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], node->src[2], add, &fusion_data);
+                return 1;   // skip the ADD
+            }
+        }
+    }
+
     fused_mul_mat_vec = false;
     fused_node_count  = 0;
 
