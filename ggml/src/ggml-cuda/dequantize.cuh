@@ -447,6 +447,8 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
         y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] & 0xf]*0.5f);
         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
     }
+}
+
 static __device__ __forceinline__ void dequantize_f8e4m3(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_f8e4m3 * x = (const block_f8e4m3 *) vx;
 

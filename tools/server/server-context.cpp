@@ -199,6 +199,8 @@ struct server_slot {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    common_memory mem;
+
     // ROC8 cross-request prefix sharing (null = feature disabled)
     server_prefix_cache * pcache = nullptr;
 
@@ -298,10 +300,7 @@ struct server_slot {
             pcache->release(id, prompt.tokens.get_text_tokens());
         }
 
-        common_context_seq_rm(ctx_tgt, id, -1, -1);
-        if (ctx_dft) {
-            common_context_seq_rm(ctx_dft, id, -1, -1);
-        }
+        mem.seq_rm(id, -1, -1);
 
         prompt.clear();
     }
@@ -3335,12 +3334,8 @@ private:
                                     if (m.owner >= 0 && m.len > (int) n_past && m.len <= (int) in_vec.size()) {
                                         // drop this slot's divergent tail past n_past, then splice
                                         // in the shared cells [n_past, m.len) from the owner seq.
-                                        common_context_seq_rm(ctx_tgt, slot.id, n_past, -1);
-                                        common_context_seq_cp(ctx_tgt, m.owner, slot.id, n_past, m.len);
-                                        if (ctx_dft) {
-                                            common_context_seq_rm(ctx_dft.get(), slot.id, n_past, -1);
-                                            common_context_seq_cp(ctx_dft.get(), m.owner, slot.id, n_past, m.len);
-                                        }
+                                        slot.mem.seq_rm(slot.id, n_past, -1);
+                                        slot.mem.seq_cp(m.owner, slot.id, n_past, m.len);
                                         // keep slot.prompt.tokens consistent: == input[0, m.len)
                                         slot.prompt.tokens.keep_first(n_past);
                                         slot.prompt.tokens.insert(llama_tokens(in_vec.begin() + n_past,
