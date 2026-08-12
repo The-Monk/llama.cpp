@@ -571,6 +571,12 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             }
             return 2;
         }
+        // Batched (ncols_dst 2..8) rows-per-block for the binary/ternary types,
+        // swept 1/2/3/4 on gfx1201 (Bonsai-27B, npp128/ntg128): 4 >= 3 > 2 > 1,
+        // Q1_0 B=4 aggregate 132.5 -> 168.5 t/s. Other types keep upstream rpb=1.
+        if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q2_0) {
+            return 4;
+        }
         return 1;
     }
     return 1;
@@ -915,7 +921,9 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-    if constexpr (c_ncols_dst == 1) {
+    // Fused gate+up (and bias/glu) kernels are instantiated for ncols_dst <= 4:
+    // the kernel body is ncols-generic; 5..8 stay unfused to bound instantiations.
+    if constexpr (c_ncols_dst <= 4) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k>, launch_params,
@@ -1325,7 +1333,14 @@ void ggml_cuda_mul_mat_vec_q(
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        // Dense fused ncols_dst 2..4: the kernel indexes bias lanes as
+        // x_bias[j*stride_col_dst], which is only correct when the bias tensor is
+        // per-column (same shape as dst -- the residual-ADD case). Column-broadcast
+        // biases must stay at ne1 == 1; every ADD matcher enforces same-shape.
+        GGML_ASSERT(  ids || dst->ne[1] == 1 ||
+                     (dst->ne[1] <= 4 &&
+                      (!fusion->x_bias    || fusion->x_bias->ne[1]    == dst->ne[1]) &&
+                      (!fusion->gate_bias || fusion->gate_bias->ne[1] == dst->ne[1])));
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);

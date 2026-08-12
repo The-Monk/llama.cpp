@@ -1720,6 +1720,10 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
+    // Bias-carrying fused patterns stay ncols_dst==1 (see mmvq.cu bias indexing note).
+    if ((ffn_up_bias || ffn_gate_bias) && glu->ne[1] != 1) {
+        return false;
+    }
     const bool is_mul_mat     = ffn_up->op == GGML_OP_MUL_MAT     && ffn_gate->op == GGML_OP_MUL_MAT     && glu->op == GGML_OP_GLU;
     const bool is_mul_mat_id  = ffn_up->op == GGML_OP_MUL_MAT_ID  && ffn_gate->op == GGML_OP_MUL_MAT_ID  && glu->op == GGML_OP_GLU;
 
@@ -1855,8 +1859,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    // mmvq fused kernels are instantiated for ncols_dst <= 4 (see mmvq.cu);
+    // ncols_dst > 1 is bias-less-only, enforced by the caller pattern checks.
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] > 4) {
         return false;
     }
 
