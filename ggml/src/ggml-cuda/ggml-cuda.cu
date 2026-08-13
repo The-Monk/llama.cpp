@@ -2004,7 +2004,21 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // ~/int4-research/FINDINGS.md Stage 20/23 for the isolated-PoC
     // validation and in-tree integration results.
     {
-        static const bool iu4_mmvq_decode_enabled = (getenv("GGML_HIP_IU4_MMVQ_DECODE") != nullptr);
+        // Default ON since 2026-08-13: measured +48% decode on gfx1201
+        // (Bonsai-1.7B-IU4, tg128: 117.33 +/- 3.05 -> 173.38 +/- 4.20).
+        // Opt OUT with GGML_HIP_IU4_MMVQ_DECODE=0.
+        // NOTE: this is NOT bit-identical to the WMMA path -- greedy output
+        // diverges (different dot/accumulation order), e.g. same prompt at
+        // temp 0 continues "...primes that are greater than 1" (WMMA) vs
+        // "...smallest numbers that are divisible only by 1" (dot8). That is
+        // acceptable here ONLY because IU4 is model-blocked (no production
+        // model uses the type) and its target role is a spec-decode drafter,
+        // where the verifier corrects any divergence. Revisit before any
+        // real W4A4 model ships standalone on this path.
+        static const bool iu4_mmvq_decode_enabled = [](){
+            const char * v = getenv("GGML_HIP_IU4_MMVQ_DECODE");
+            return !(v && v[0] == '0');
+        }();
         if (iu4_mmvq_decode_enabled && ggml_cuda_mmvq_iu4_supports(src0, src1, dst)) {
             const bool ok = ggml_cuda_op_mul_mat_vec_iu4(ctx, src0, src1, dst);
             GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_vec_iu4 does not support this tensor shape");
