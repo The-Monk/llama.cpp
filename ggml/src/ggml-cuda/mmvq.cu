@@ -487,6 +487,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 // cheaper vec_dot doesn't pay for the cross-warp LDS
                 // reduction + barrier that nwarps>1 introduces.
                 case GGML_TYPE_Q2_0:
+                // F8E5M2: nwarps=8 19.87 +/- 0.08 vs nwarps=1 19.63 +/- 0.06
+                // (Qwen3.6-27B, tg128, r=5) = +1.2%. Small but outside noise.
+                case GGML_TYPE_F8E5M2:
                     return 8;
                 default:
                     return 1;
