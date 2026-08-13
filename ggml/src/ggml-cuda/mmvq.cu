@@ -478,6 +478,15 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_Q6_K:
                 case GGML_TYPE_IQ4_NL:
                 case GGML_TYPE_IQ4_XS:
+                // Q2_0 was in this list on roc8/roc9 and was dropped by the
+                // roc10 mmvq slim-to-upstream. Re-measured on gfx1201
+                // (Bonsai-27B Q2_0, tg128, r=5): nwarps=8 52.28 +/- 0.32 vs
+                // nwarps=1 50.84 +/- 0.30, so the drop cost 2.8%.
+                // NOTE: Q1_0 is deliberately NOT here -- same test says it
+                // REGRESSES 8.2% at nwarps=8 (67.6 -> 62.1), because its
+                // cheaper vec_dot doesn't pay for the cross-warp LDS
+                // reduction + barrier that nwarps>1 introduces.
+                case GGML_TYPE_Q2_0:
                     return 8;
                 default:
                     return 1;
