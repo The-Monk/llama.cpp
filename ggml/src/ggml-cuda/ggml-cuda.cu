@@ -2185,6 +2185,22 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    // T213: W2A4 dot8 decode -- Q2_0 ternary weights (unpacked losslessly to
+    // signed int4) x int4 activations through v_dot8_i32_iu4, instead of the
+    // dp4a mmvq path's 4x expansion to int8 lanes. Checked BEFORE the WMMA
+    // intercept below because it targets the same shape and wins it (a 16x16
+    // WMMA tile wastes 15/16 of its rows at M=1). Opt-in and M=1 gated, so
+    // prefill can never route here. Weights stay exactly ternary; only the
+    // ACTIVATIONS drop q8_1 -> int4, which is the premise under test.
+    {
+        static const bool q2_0_dot8_decode_enabled = (getenv("GGML_HIP_Q2_0_DOT8_DECODE") != nullptr);
+        if (q2_0_dot8_decode_enabled && ggml_cuda_q2_0_dot8_decode_supports(src0, src1, dst)) {
+            const bool ok = ggml_cuda_op_mul_mat_q2_0_dot8(ctx, src0, src1, dst);
+            GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_q2_0_dot8 does not support this tensor shape");
+            return;
+        }
+    }
+
     // Experimental decode-time lever (see mul_mat_q2_0_wmma.cuh): route Q2_0
     // ternary decode GEMVs (batch=1) through the native RDNA4 iu4 WMMA
     // instead of the dp4a mmvq.cu path. Opt-in only -- unlike the IU4/2OF4

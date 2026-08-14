@@ -225,6 +225,63 @@ bool ggml_cuda_q2_0_wmma_decode_supports(const ggml_tensor * src0, const ggml_te
     return GGML_CUDA_CC_IS_RDNA4(cc);
 }
 
+using namespace ggml_cuda_mul_mat_q2_0_wmma_detail;
+
+// --- W2A4 dot8 decode GEMV (T213) ------------------------------------------
+// Identical OPERAND path to k_mul_mat_q2_0_wmma above -- same
+// k_quantize_act_iu4_q2 int4 activations, same lossless
+// unpack_q2_0_chunk_to_iu4_words 2-bit -> signed int4 weights -- but the
+// compute is v_dot8_i32_iu4 instead of a 16x16 WMMA tile. At M=1 a WMMA tile
+// discards 15/16 of its rows, which is why the WMMA decode intercept measures
+// -55% vs dp4a; that was a verdict on the instruction, never on W2A4 operands.
+//
+// Why this should be faster than the shipped dp4a mmvq path: dp4a consumes
+// int8 lanes, so 2-bit weights must expand 4x into registers and each thread
+// drags a full 36B q8_1 activation chunk per 8B of weight (act:wt = 4.5).
+// int4 lanes halve both -- 2x expansion, ~18B activations (act:wt = 2.3, the
+// same ratio IU4 runs at). Measured act:wt vs efficiency across four formats
+// (Q8_0 1.1 -> 100%, IU4 2.3 -> 87%, Q2_0 4.5 -> 68%, Q1_0 9.0 -> 46%)
+// predicts this lands near IU4's ~87% of Q8_0-class, i.e. ~+34% decode.
+// ACCURACY NOTE: weights stay EXACTLY ternary (the unpack is lossless); only
+// the ACTIVATIONS drop q8_1 -> int4. That is the premise under test.
+#define Q2_0_DOT8_BLOCK 256
+
+static __global__ void k_mmvq_dot8_q2_0(
+        const char * __restrict__ vweight, const block_iu4 * __restrict__ act,
+        float * __restrict__ dst, int64_t n_blocks_k, int64_t nb01) {
+    const int64_t row = blockIdx.x;
+    const int     tid = threadIdx.x;
+
+    const char * wrow = vweight + row * nb01;
+    float partial = 0.0f;
+    for (int64_t c = tid; c < n_blocks_k; c += blockDim.x) {
+        const block_q2_0 * bq2 = (const block_q2_0 *) wrow + (c >> 2);
+        int w[4];
+        unpack_q2_0_chunk_to_iu4_words(bq2->qs + (int) (c & 3) * 8, w);
+        uint32_t xw[4];
+        memcpy(xw, act[c].qs, 16);
+        int sumi = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            sumi = __builtin_amdgcn_sudot8(true, w[i], true, (int) xw[i], sumi, false);
+        }
+        partial += (float) sumi * __half2float(bq2->d) * __half2float(act[c].d);
+    }
+
+    __shared__ float sdata[Q2_0_DOT8_BLOCK];
+    sdata[tid] = partial;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        dst[row] = sdata[0];
+    }
+}
+
 bool ggml_cuda_op_mul_mat_q2_0_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using namespace ggml_cuda_mul_mat_q2_0_wmma_detail;
 
@@ -262,6 +319,50 @@ bool ggml_cuda_op_mul_mat_q2_0_wmma(ggml_backend_cuda_context & ctx, const ggml_
                 M, N, nb01, n_blocks_k, dst_row_stride_floats);
     }
 
+    return true;
+}
+
+
+// --- W2A4 dot8 decode entry points (T213) ----------------------------------
+bool ggml_cuda_q2_0_dot8_decode_supports(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (src0->type != GGML_TYPE_Q2_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    if (src0->ne[0] != src1->ne[0] || src0->ne[0] % QK2_0 != 0) {
+        return false;
+    }
+    if (src1->ne[1] != 1) {
+        return false; // M=1 decode only -- prefill keeps the existing path
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return GGML_CUDA_CC_IS_RDNA4(cc);
+}
+
+bool ggml_cuda_op_mul_mat_q2_0_dot8(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    using namespace ggml_cuda_mul_mat_q2_0_wmma_detail;
+
+    const int64_t K = src0->ne[0];
+    const int64_t N = src0->ne[1];
+    const int64_t n_blocks_k = K / QK_IU4;
+
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool_alloc<block_iu4> act_q(ctx.pool(), (size_t) n_blocks_k);
+
+    {
+        const int64_t row_stride_floats = src1->nb[1] / (int64_t) sizeof(float);
+        const dim3 grid(n_blocks_k, 1, 1);
+        const dim3 block(32, 1, 1);
+        k_quantize_act_iu4_q2<<<grid, block, 0, stream>>>((const float *) src1->data, act_q.get(), n_blocks_k, row_stride_floats);
+    }
+    {
+        const dim3 grid((unsigned) N, 1, 1);
+        const dim3 block(Q2_0_DOT8_BLOCK, 1, 1);
+        k_mmvq_dot8_q2_0<<<grid, block, 0, stream>>>(
+                (const char *) src0->data, act_q.get(), (float *) dst->data, n_blocks_k, src0->nb[1]);
+    }
     return true;
 }
 

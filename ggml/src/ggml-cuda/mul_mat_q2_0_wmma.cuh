@@ -33,6 +33,11 @@ bool ggml_cuda_op_mul_mat_q2_0_wmma(ggml_backend_cuda_context & ctx, const ggml_
 // the ggml_cuda_mul_mat() intercept before calling the op above).
 bool ggml_cuda_q2_0_wmma_decode_supports(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 
+// T213: W2A4 dot8 decode -- same operands as the WMMA path, v_dot8_i32_iu4
+// compute. M=1 only. Opt-in via GGML_HIP_Q2_0_DOT8_DECODE.
+bool ggml_cuda_op_mul_mat_q2_0_dot8(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+bool ggml_cuda_q2_0_dot8_decode_supports(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+
 // Concurrency PoC companion (see mul_mat_q2_0_wmma.cu for the full
 // rationale): spawns a detached background thread that repeatedly launches
 // a small WMMA-heavy kernel on its OWN hipStream_t, in the SAME process/HIP
