@@ -88,6 +88,7 @@
 #include "ggml-cuda/mul_mat_iu4_ck_wmma.cuh"
 #include "ggml-cuda/mul_mat_q2_0_fp8route_mmq.cuh"
 #include "ggml-cuda/mul_mat_q2_0_wmma.cuh"
+#include "ggml-cuda/mmvq_coop_q2_0.cuh"
 #include "ggml-cuda/mul_mat_q2_0_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_q1_0_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_q4_K_hipblaslt.cuh"
@@ -2183,6 +2184,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const bool ok = ggml_cuda_op_mul_mat_iu4(ctx, src0, src1, dst);
         GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_iu4 does not support this tensor shape");
         return;
+    }
+
+    // T180 phase-pair 1: cooperative persistent quantize+GEMV for Q2_0 decode.
+    // Replaces TWO dispatches (quantize_q8_1 + mul_mat_vec_q) with ONE
+    // cooperative launch + one grid.sync. Measured on gfx1201: a grid barrier
+    // is ~0.81 us vs a ~2.17 us kernel-boundary gap (21x cheaper), and the
+    // dispatch gap is 23% of wall on a real decode. Numerics are bit-identical
+    // to the shipped path -- same vec_dot_q2_0_q8_1, same q8_1 quantization.
+    // Opt-in, M=1 gated. NOTE: bypasses mmvq fusion, so it is only a win where
+    // the matmul does NOT participate in a fused gate+up pair.
+    {
+        static const bool q2_0_coop_enabled = (getenv("GGML_HIP_Q2_0_COOP_DECODE") != nullptr);
+        if (q2_0_coop_enabled && ggml_cuda_q2_0_coop_decode_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_q2_0_coop(ctx, src0, src1, dst)) {
+                return;
+            }
+        }
     }
 
     // T213: W2A4 dot8 decode -- Q2_0 ternary weights (unpacked losslessly to
