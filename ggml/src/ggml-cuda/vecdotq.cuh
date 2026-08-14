@@ -108,11 +108,14 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 
 #define VDR_Q1_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
 #define VDR_Q1_0_Q8_1_MMQ  4  // Q1_0 has 128 bits (4 ints) per block
-#define VDR_Q2_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time
-#define VDR_Q2_0_Q8_1_MMQ  4  // Q2_0 has 256 bits (8 ints) per block, 4 32-element chunks
-
+// NOTE: these were previously defined TWICE, with VDR_Q2_0_Q8_1_MMQ given as
+// both 4 and 2. The second definition silently won, so 2 is what every build
+// has actually used; the dead first pair only produced a -Wmacro-redefined
+// warning on every TU that includes this header. Keeping the values that were
+// live (and are verified: test-backend-ops -o MUL_MAT passes for q2_0, all
+// shapes, 2/2 backends), so this is a no-op for codegen.
 #define VDR_Q2_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
-#define VDR_Q2_0_Q8_1_MMQ  2  // Q2_0 group 64: 128 bits (4 ints) per block, 2 32-element chunks
+#define VDR_Q2_0_Q8_1_MMQ  2  // 2 32-element chunks per MMQ tile step
 
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
@@ -714,8 +717,6 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     // iqs selects which of the 4 chunks of 32 elements to process (0-3)
 
     const float     d1 = bq1_0->d;
-    const int16_t * qs = (const int16_t *) bq1_0->qs + iqs * 2;
-
     // Process only the chunk specified by iqs
     const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
 
