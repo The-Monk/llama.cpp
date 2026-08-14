@@ -247,6 +247,26 @@ using namespace ggml_cuda_mul_mat_q2_0_wmma_detail;
 #define Q2_0_DOT8_BLOCK 64
 #define Q2_0_DOT8_ROWS  3   // activation reuse, matching the dp4a template's rpb=3
 
+
+// Bit-parallel 2-bit -> 4-bit spread: 2 Q2_0 bytes (8 ternary codes) become one
+// int of 8 UNSIGNED int4 lanes, in 3 mask/shift/or steps (~9 instrs). Replaces
+// unpack_q2_0_chunk_to_iu4_words' 32-element scalar loop (~176 ops per 8 bytes)
+// in the GEMV inner loop -- that helper is fine amortised over a WMMA tile load
+// but here it runs per chunk PER ROW, costing ~6x the ALU of the dp4a bit-spread
+// this path is trying to beat.
+//
+// Codes stay UNSIGNED {0,1,2}; the ternary symbol s = c-1 is recovered with the
+// same identity the dp4a path uses, dot(s,u) = dot(c,u) - sum(u), so no packed
+// subtract (which would borrow across nibbles) is needed. sum(u) is per-CHUNK,
+// so it is computed once and reused across all rows in the block.
+static __device__ __forceinline__ uint32_t q2_spread8(uint32_t v16) {
+    uint32_t v = v16 & 0xFFFFu;
+    v = (v | (v <<  8)) & 0x00FF00FFu;   // 4 codes per 16-bit half
+    v = (v | (v <<  4)) & 0x0F0F0F0Fu;   // 2 codes per byte
+    v = (v | (v <<  2)) & 0x33333333u;   // 1 code per nibble
+    return v;
+}
+
 static __global__ void k_mmvq_dot8_q2_0(
         const char * __restrict__ vweight, const block_iu4 * __restrict__ act,
         float * __restrict__ dst, int64_t n_blocks_k, int64_t nb01, int64_t N) {
@@ -271,6 +291,14 @@ static __global__ void k_mmvq_dot8_q2_0(
         const float da   = __half2float(act[c].d);
         const int64_t q2b = c >> 2;
         const int     sub = (int) (c & 3);
+
+        // sum(u) for this chunk: one unsigned-weight dot against all-ones
+        // nibbles. Per CHUNK, not per row, so it amortises over the block.
+        int sum_u = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            sum_u = __builtin_amdgcn_sudot8(false, (int) 0x11111111, true, (int) xw[i], sum_u, false);
+        }
 #pragma unroll
         for (int r = 0; r < Q2_0_DOT8_ROWS; ++r) {
             const int64_t row = row0 + r;
@@ -278,14 +306,18 @@ static __global__ void k_mmvq_dot8_q2_0(
                 continue;
             }
             const block_q2_0 * bq2 = (const block_q2_0 *) (vweight + row * nb01) + q2b;
-            int w[4];
-            unpack_q2_0_chunk_to_iu4_words(bq2->qs + sub * 8, w);
+            uint32_t q[2];
+            memcpy(q, bq2->qs + sub * 8, 8);
+            const uint32_t w0 = q2_spread8(q[0]);
+            const uint32_t w1 = q2_spread8(q[0] >> 16);
+            const uint32_t w2 = q2_spread8(q[1]);
+            const uint32_t w3 = q2_spread8(q[1] >> 16);
             int sumi = 0;
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                sumi = __builtin_amdgcn_sudot8(true, w[i], true, (int) xw[i], sumi, false);
-            }
-            partial[r] += (float) sumi * __half2float(bq2->d) * da;
+            sumi = __builtin_amdgcn_sudot8(false, (int) w0, true, (int) xw[0], sumi, false);
+            sumi = __builtin_amdgcn_sudot8(false, (int) w1, true, (int) xw[1], sumi, false);
+            sumi = __builtin_amdgcn_sudot8(false, (int) w2, true, (int) xw[2], sumi, false);
+            sumi = __builtin_amdgcn_sudot8(false, (int) w3, true, (int) xw[3], sumi, false);
+            partial[r] += (float) (sumi - sum_u) * __half2float(bq2->d) * da;
         }
     }
 
