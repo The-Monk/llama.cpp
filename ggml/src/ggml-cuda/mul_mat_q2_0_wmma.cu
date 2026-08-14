@@ -244,41 +244,68 @@ using namespace ggml_cuda_mul_mat_q2_0_wmma_detail;
 // predicts this lands near IU4's ~87% of Q8_0-class, i.e. ~+34% decode.
 // ACCURACY NOTE: weights stay EXACTLY ternary (the unpack is lossless); only
 // the ACTIVATIONS drop q8_1 -> int4. That is the premise under test.
-#define Q2_0_DOT8_BLOCK 256
+#define Q2_0_DOT8_BLOCK 64
+#define Q2_0_DOT8_ROWS  3   // activation reuse, matching the dp4a template's rpb=3
 
 static __global__ void k_mmvq_dot8_q2_0(
         const char * __restrict__ vweight, const block_iu4 * __restrict__ act,
-        float * __restrict__ dst, int64_t n_blocks_k, int64_t nb01) {
-    const int64_t row = blockIdx.x;
-    const int     tid = threadIdx.x;
+        float * __restrict__ dst, int64_t n_blocks_k, int64_t nb01, int64_t N) {
+    const int64_t row0 = (int64_t) blockIdx.x * Q2_0_DOT8_ROWS;
+    const int     tid  = threadIdx.x;
 
-    const char * wrow = vweight + row * nb01;
-    float partial = 0.0f;
-    for (int64_t c = tid; c < n_blocks_k; c += blockDim.x) {
-        const block_q2_0 * bq2 = (const block_q2_0 *) wrow + (c >> 2);
-        int w[4];
-        unpack_q2_0_chunk_to_iu4_words(bq2->qs + (int) (c & 3) * 8, w);
-        uint32_t xw[4];
-        memcpy(xw, act[c].qs, 16);
-        int sumi = 0;
+    float partial[Q2_0_DOT8_ROWS];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            sumi = __builtin_amdgcn_sudot8(true, w[i], true, (int) xw[i], sumi, false);
-        }
-        partial += (float) sumi * __half2float(bq2->d) * __half2float(act[c].d);
+    for (int r = 0; r < Q2_0_DOT8_ROWS; ++r) {
+        partial[r] = 0.0f;
     }
 
-    __shared__ float sdata[Q2_0_DOT8_BLOCK];
-    sdata[tid] = partial;
+    // ROW REUSE: load each int4 activation chunk ONCE and apply it to
+    // Q2_0_DOT8_ROWS weight rows. This is the same lever rows_per_cuda_block
+    // gives the dp4a mmvq template, and the rpb sweep (T212) showed it is what
+    // actually drives effective bandwidth here: dp4a measured 55.5% at rpb=1
+    // vs 62.8% at rpb=3. A one-row-per-block GEMV is an rpb=1 kernel and must
+    // not be compared against the rpb=3 baseline.
+    for (int64_t c = tid; c < n_blocks_k; c += blockDim.x) {
+        uint32_t xw[4];
+        memcpy(xw, act[c].qs, 16);
+        const float da   = __half2float(act[c].d);
+        const int64_t q2b = c >> 2;
+        const int     sub = (int) (c & 3);
+#pragma unroll
+        for (int r = 0; r < Q2_0_DOT8_ROWS; ++r) {
+            const int64_t row = row0 + r;
+            if (row >= N) {
+                continue;
+            }
+            const block_q2_0 * bq2 = (const block_q2_0 *) (vweight + row * nb01) + q2b;
+            int w[4];
+            unpack_q2_0_chunk_to_iu4_words(bq2->qs + sub * 8, w);
+            int sumi = 0;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                sumi = __builtin_amdgcn_sudot8(true, w[i], true, (int) xw[i], sumi, false);
+            }
+            partial[r] += (float) sumi * __half2float(bq2->d) * da;
+        }
+    }
+
+    __shared__ float sdata[Q2_0_DOT8_ROWS][Q2_0_DOT8_BLOCK];
+#pragma unroll
+    for (int r = 0; r < Q2_0_DOT8_ROWS; ++r) {
+        sdata[r][tid] = partial[r];
+    }
     __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            sdata[tid] += sdata[tid + s];
+#pragma unroll
+            for (int r = 0; r < Q2_0_DOT8_ROWS; ++r) {
+                sdata[r][tid] += sdata[r][tid + s];
+            }
         }
         __syncthreads();
     }
-    if (tid == 0) {
-        dst[row] = sdata[0];
+    if (tid < Q2_0_DOT8_ROWS && row0 + tid < N) {
+        dst[row0 + tid] = sdata[tid][0];
     }
 }
 
@@ -358,10 +385,10 @@ bool ggml_cuda_op_mul_mat_q2_0_dot8(ggml_backend_cuda_context & ctx, const ggml_
         k_quantize_act_iu4_q2<<<grid, block, 0, stream>>>((const float *) src1->data, act_q.get(), n_blocks_k, row_stride_floats);
     }
     {
-        const dim3 grid((unsigned) N, 1, 1);
+        const dim3 grid((unsigned) ((N + Q2_0_DOT8_ROWS - 1) / Q2_0_DOT8_ROWS), 1, 1);
         const dim3 block(Q2_0_DOT8_BLOCK, 1, 1);
         k_mmvq_dot8_q2_0<<<grid, block, 0, stream>>>(
-                (const char *) src0->data, act_q.get(), (float *) dst->data, n_blocks_k, src0->nb[1]);
+                (const char *) src0->data, act_q.get(), (float *) dst->data, n_blocks_k, src0->nb[1], N);
     }
     return true;
 }
