@@ -1,5 +1,29 @@
 # TheRock ROCm 7.13 Pin — Ship Sign-Off (Section B, blocker #2)
 
+> **SUPERSEDED 2026-08-15 — this sign-off is historical.**
+>
+> The pin it certifies (TheRock ROCm 7.13) is **retired**; the "keep inference on
+> 7.13" directive of 2026-07-16 is rescinded and **ROCm 7.14 is the going-forward
+> toolchain** (`use-rocm714.env`). There is no 7.15 — TheRock's gfx120X nightly
+> index has published nothing newer than `7.14.0a20260612`.
+>
+> This document remains valid for exactly one purpose: it describes the toolchain
+> bundled in the **frozen submission image** `ghcr.io/the-monk/the-rock8:rdna4-tr713`
+> (built from `roc8` `70629174b1`). That image is frozen and is not being rebuilt
+> or retagged, so its 7.13 contents stay accurate and reproducible. Nothing here
+> should be read as a recommendation for new builds.
+>
+> **The successor recipe is `container/Containerfile.dev714`** (7.14 devel SDK).
+> It is **not yet validated**: as of 2026-08-15 it has never been built — every
+> image on the build host is a `tr713` tag — and it builds branch `roc8`, which
+> carries the `MUL_MAT_ID` out-of-bounds defect. Before it can replace this
+> sign-off it must be built from a fixed branch and pass `validate_image.sh`,
+> and a new sign-off written against the resulting digest.
+>
+> Also note: the "Image" line below cites digest tag `f36df0f3c`, which is a
+> **4-week-old** build, not the submitted `70629174b1`. Treat the digest here as
+> referring to the 13 July validation run only.
+
 **Date:** 2026-07-13
 **Image:** `localhost/roc8-lemonade:tr713` (= `ghcr.io/the-monk/the-rock8:rdna4-tr713`, digest tag `f36df0f3c`)
 **Target:** RDNA4 / gfx1201 (Radeon AI PRO R9700, RX 9070 XT/9070)

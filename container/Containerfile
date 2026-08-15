@@ -1,4 +1,14 @@
 # ROC8 + Lemonade portability appliance — PURE TheRock ROCm 7.13, zero /opt/rocm-7.2.4
+#
+# STATUS 2026-08-15: LEGACY / FROZEN-ARTIFACT RECIPE. Do not use for new images.
+# This is the recipe that produced the frozen submission image
+# ghcr.io/the-monk/the-rock8:rdna4-tr713 (from roc8 70629174b1). It is kept so
+# that image stays reproducible. The ROCm 7.13 pin it carries is RETIRED --
+# 7.14 is the going-forward toolchain (use-rocm714.env), and there is no 7.15.
+# Successor: container/Containerfile.dev714 (7.14 devel SDK) -- which as of this
+# date has NEVER BEEN BUILT and still builds branch roc8 (the branch carrying the
+# MUL_MAT_ID OOB defect), so it is not yet a validated replacement.
+# See container/THEROCK-PIN-SIGNOFF.md for the superseded sign-off.
 # Card 124 ship/portability gate. Base: ubuntu:24.04.
 #
 # Build context must contain:
