@@ -41,6 +41,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_MXFP8:
             mul_mat_q_case<GGML_TYPE_MXFP8>(ctx, args, stream);
             break;
+        case GGML_TYPE_MXFP6:
+            mul_mat_q_case<GGML_TYPE_MXFP6>(ctx, args, stream);
+            break;
         case GGML_TYPE_Q2_K:
             mul_mat_q_case<GGML_TYPE_Q2_K>(ctx, args, stream);
             break;
@@ -168,7 +171,7 @@ void ggml_cuda_mul_mat_q(
         return env != nullptr && std::string(env) == "bf8";
     }();
     const bool use_mixed_bf8_act = g_fp8_use_mixed_bf8_act && src0->type == GGML_TYPE_F8E4M3;
-    const bool use_native_f8e4m3 = (src0->type == GGML_TYPE_F8E4M3 || src0->type == GGML_TYPE_MXFP8) && !use_mixed_bf8_act;
+    const bool use_native_f8e4m3 = (src0->type == GGML_TYPE_F8E4M3 || src0->type == GGML_TYPE_MXFP8 || src0->type == GGML_TYPE_MXFP6) && !use_mixed_bf8_act;
     // T97: same rationale as F8E4M3 above -- the bf8xbf8 WMMA fragment needs
     // src1 quantized to native e5m2, not int8 Q8_1.
     const bool use_native_f8e5m2 = src0->type == GGML_TYPE_F8E5M2 || use_mixed_bf8_act;
@@ -358,6 +361,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_F8E4M3:
         case GGML_TYPE_F8E5M2:
         case GGML_TYPE_MXFP8:
+        case GGML_TYPE_MXFP6:
             mmq_supported = true;
             break;
         default:
@@ -406,6 +410,14 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     if (type == GGML_TYPE_MXFP8) {
         return GGML_CUDA_CC_IS_RDNA4(cc);
     }
+
+    // MXFP6 native prefill: unpack-to-e4m3 tile load + MXFP8's fp8 WMMA
+    // compute -- same RDNA4-only gate and decode/prefill split as MXFP8
+    // (should_use_mmvq(MXFP6) routes ne11<=8 to the mmvq decode kernel).
+    if (type == GGML_TYPE_MXFP6) {
+        return GGML_CUDA_CC_IS_RDNA4(cc);
+    }
+
 
     if (turing_mma_available(cc)) {
         return true;

@@ -231,6 +231,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         // (RDNA4-only type, see should_use_mmq gate), this entry only feeds
         // host-side shared-mem sizing.
         case GGML_TYPE_MXFP8:   return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_MXFP6:   return MMQ_DP4A_TXS_Q8_0;
         default:                return tile_x_sizes{0, 0, 0};
     }
 }
@@ -285,6 +286,7 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_F8E4M3:  return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_F8E5M2:  return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_MXFP8:   return MMQ_MMA_TILE_X_K_Q8_0;
+        case GGML_TYPE_MXFP6:   return MMQ_MMA_TILE_X_K_Q8_0;
         default:                return 0;
     }
 }
@@ -1148,6 +1150,99 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         x_df[i*MMQ_MMA_TILE_X_K_Q8_0                  + kbxd] = d;
 #else
         x_df[i*(2*MMQ_TILE_NE_K/QI_MXFP8) + i/(QI_MXFP8/2) + kbxd] = d;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
+
+// v2 unpack for the MMQ tile (PC-sample-driven): a thread's 4 codes are
+// EXACTLY 3 contiguous bytes (4 x 6 bits, starting at byte 3*kqsx), so read
+// those 3 bytes and extract branch-free from one 24-bit pack -- vs v1's
+// whole-block mxfp6_load_block per thread (24 global_load_u8 + ORs + the
+// cross-word branch), which PC sampling showed as 19.6% s_wait_loadcnt +
+// 7.4% saveexec divergence in mul_mat_q. 8x fewer loads, no divergence.
+static __device__ __forceinline__ int mxfp6_e4m3x4_from_bytes3(const uint8_t * p) {
+    const uint32_t pack = (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16);
+    uint32_t out = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        out |= ((uint32_t) mxfp6_e3m2_to_e4m3_lut[(pack >> (6*j)) & 0x3F]) << (8*j);
+    }
+    return (int) out;
+}
+
+// MXFP6 MMQ tile load: twin of load_tiles_mxfp8 above. The packed 6-bit
+// e3m2 payload is unpacked to e4m3 bytes AT TILE-LOAD TIME
+// (mxfp6_load_block + mxfp6_e4m3x4_from_block, common.cuh -- the same
+// whole-block register unpack the decode path uses), so the tile buffer
+// holds exactly what load_tiles_mxfp8 produces (e4m3 payload ints + the
+// e8m0-decoded float scale) and the ENTIRE downstream compute
+// (vec_dot_mxfp8_mxfp8_mma / _dp4a) is reused unchanged. Every e3m2 value
+// embeds exactly into e4m3 (mantissa <<1, exponent re-bias, ranges fit),
+// so this path is numerically identical to the mxfp6 decode path.
+template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_mxfp6(
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_tile + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_MXFP6, mmq_y);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+    constexpr int qi_mxfp6 = QK_MXFP6/4; // 8 output int32s (of e4m3 x4) per block
+    constexpr int threads_per_row = 32;
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx  = txi / qi_mxfp6;
+    const int kqsx = txi % qi_mxfp6;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_mxfp6 * bxi = (const block_mxfp6 *) x + kbx0 + i*stride + kbx;
+
+        const uint8_t * q0 = bxi[0].qs + 3*kqsx;
+        const uint8_t * q1 = bxi[MMQ_TILE_NE_K/qi_mxfp6].qs + 3*kqsx;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + 0             + txi] = mxfp6_e4m3x4_from_bytes3(q0);
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + MMQ_TILE_NE_K + txi] = mxfp6_e4m3x4_from_bytes3(q1);
+#else
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = mxfp6_e4m3x4_from_bytes3(q0);
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = mxfp6_e4m3x4_from_bytes3(q1);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+
+    constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / qi_mxfp6;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_mxfp6 * bxi = (const block_mxfp6 *) x + kbx0 + i*stride + kbxd;
+
+        const float d = ggml_cuda_e8m0_to_fp32(bxi->e); // same UE8M0 scale field as block_mxfp8
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*MMQ_MMA_TILE_X_K_Q8_0                  + kbxd] = d;
+#else
+        x_df[i*(2*MMQ_TILE_NE_K/qi_mxfp6) + i/(qi_mxfp6/2) + kbxd] = d;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }
@@ -4047,6 +4142,17 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_MXFP8> {
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_mxfp8_mxfp8_dp4a<mmq_x, mmq_y>;
 };
 
+// MXFP6 native prefill: the tile load unpacks e3m2->e4m3 (exact embedding),
+// after which the tile is indistinguishable from MXFP8's -- so both vec_dots
+// are MXFP8's, reused unchanged.
+template <int mmq_x, int mmq_y, bool need_check>
+struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_MXFP6> {
+    static constexpr int              vdr          = VDR_Q8_0_Q8_1_MMQ; // same 8-per-step granularity as Q8_0
+    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_mxfp6<mmq_y, need_check>;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_mxfp8_mxfp8_mma<mmq_x, mmq_y>;
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_mxfp8_mxfp8_dp4a<mmq_x, mmq_y>;
+};
+
 template <int mmq_x, int mmq_y, bool need_check>
 struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_MXFP4> {
     static constexpr int              vdr          = VDR_MXFP4_Q8_1_MMQ;
@@ -4932,6 +5038,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_F8E4M3);
 extern DECL_MMQ_CASE(GGML_TYPE_F8E5M2);
 extern DECL_MMQ_CASE(GGML_TYPE_MXFP8);
+extern DECL_MMQ_CASE(GGML_TYPE_MXFP6);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_K);
 extern DECL_MMQ_CASE(GGML_TYPE_Q3_K);
 extern DECL_MMQ_CASE(GGML_TYPE_Q4_K);

@@ -596,7 +596,7 @@ void quantize_mmq_f8e4m3_cuda(
     // irrelevant here since this quantizer only touches the activation/src1
     // side) -- broadened to accept both types, see the mmq.cu call-site
     // comment for the correctness-coupling note.
-    GGML_ASSERT(type_src0 == GGML_TYPE_F8E4M3 || type_src0 == GGML_TYPE_MXFP8);
+    GGML_ASSERT(type_src0 == GGML_TYPE_F8E4M3 || type_src0 == GGML_TYPE_MXFP8 || type_src0 == GGML_TYPE_MXFP6);
     GGML_ASSERT(ne00 % 4 == 0);
     GGML_ASSERT(ne0 % (4*QK8_1) == 0);
 
