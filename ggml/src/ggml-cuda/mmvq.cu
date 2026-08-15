@@ -2089,8 +2089,18 @@ void ggml_cuda_mul_mat_vec_q(
         ne11 == 1 || (ne11 > 1 && ggml_cuda_dedup_mmvq_quant_batch_enabled());
     const bool dedup_quant =
         ggml_cuda_dedup_mmvq_quant_enabled() && !fuse_quant && !ids && dedup_quant_batch_ok && dedup_quant_eligible_type;
-    const bool dedup_hit = dedup_quant &&
-        ctx.mmvq_quant_cache_tensor == src1 && ctx.mmvq_quant_cache_buf;
+    // Key on what determines the quantized bytes, not on the tensor address --
+    // see the mmvq_quant_cache_key comment in common.cuh. mul_mat_id's fallback
+    // reuses ONE stack-local ggml_tensor for every expert, so an address key
+    // aliases all experts onto expert 0's activations.
+    ggml_backend_cuda_context::mmvq_quant_cache_key dedup_key;
+    dedup_key.data      = src1->data;
+    dedup_key.src1_type = src1->type;
+    dedup_key.src0_type = src0->type;
+    for (int i = 0; i < 4; ++i) { dedup_key.ne[i] = src1->ne[i]; dedup_key.nb[i] = src1->nb[i]; }
+
+    const bool dedup_hit = dedup_quant && ctx.mmvq_quant_cache_valid &&
+        ctx.mmvq_quant_cache_buf && ctx.mmvq_quant_cache_key_cur == dedup_key;
 
     // dedup_quant (hit OR miss-that-populates) ALWAYS routes data through
     // ctx.mmvq_quant_cache_buf, never through the local src1_q8_1 -- so the
@@ -2126,7 +2136,8 @@ void ggml_cuda_mul_mat_vec_q(
         if (src0->type == GGML_TYPE_F8E4M3) {
             if (dedup_quant) {
                 ctx.mmvq_quant_cache_buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-                ctx.mmvq_quant_cache_tensor = src1;
+                ctx.mmvq_quant_cache_key_cur = dedup_key;
+                ctx.mmvq_quant_cache_valid   = true;
                 quantize_row_f8e4m3_for_mmvq_cuda(src1_d, nullptr, ctx.mmvq_quant_cache_buf->get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
             } else {
                 quantize_row_f8e4m3_for_mmvq_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
@@ -2135,7 +2146,8 @@ void ggml_cuda_mul_mat_vec_q(
             quantize_row_f8e5m2_for_mmvq_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         } else if (dedup_quant) {
             ctx.mmvq_quant_cache_buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-            ctx.mmvq_quant_cache_tensor = src1;
+            ctx.mmvq_quant_cache_key_cur = dedup_key;
+            ctx.mmvq_quant_cache_valid   = true;
             quantize_row_q8_1_cuda(src1_d, nullptr, ctx.mmvq_quant_cache_buf->get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         } else {
             quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);

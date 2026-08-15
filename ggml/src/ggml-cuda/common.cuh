@@ -1872,7 +1872,36 @@ struct ggml_backend_cuda_context {
     // T180 diagnostic (see mmvq.cu): keyed cache buffer for the quant-dedup
     // experiment. Declared AFTER pools[] (destroyed before it -- reverse
     // declaration order).
-    const ggml_tensor * mmvq_quant_cache_tensor = nullptr;
+    //
+    // The key is the set of inputs that DETERMINE the quantized bytes, NOT the
+    // ggml_tensor address. ggml_cuda_mul_mat_id's fallback path declares a
+    // stack-local `ggml_tensor src1_slice` INSIDE its per-expert loop and calls
+    // ggml_cuda_mul_mat(&src0_slice, &src1_slice, ...) with ids == nullptr, so
+    // dedup is live there. That stack slot has the SAME address on every
+    // iteration while .data advances per expert (src1_data_cur += nb[2]) --
+    // so an address-keyed cache reports a hit for expert 1..N and silently
+    // reuses expert 0's quantized activations. Deterministic, not racy;
+    // measured as MUL_MAT_ID(type_a=iq1_m,...) ERR 0.9967 with dedup enabled.
+    //
+    // src0_type is part of the key because it selects the quantizer
+    // (quantize_row_f8e4m3_for_mmvq_cuda vs quantize_row_q8_1_cuda) AND is
+    // passed as an argument INTO quantize_row_q8_1_cuda, so the same src1 can
+    // legitimately produce different bytes for different src0 types.
+    struct mmvq_quant_cache_key {
+        const void * data      = nullptr;
+        ggml_type    src1_type = GGML_TYPE_COUNT;
+        ggml_type    src0_type = GGML_TYPE_COUNT;
+        int64_t      ne[4]     = {0, 0, 0, 0};
+        size_t       nb[4]     = {0, 0, 0, 0};
+
+        bool operator==(const mmvq_quant_cache_key & o) const {
+            return data == o.data && src1_type == o.src1_type && src0_type == o.src0_type
+                && ne[0] == o.ne[0] && ne[1] == o.ne[1] && ne[2] == o.ne[2] && ne[3] == o.ne[3]
+                && nb[0] == o.nb[0] && nb[1] == o.nb[1] && nb[2] == o.nb[2] && nb[3] == o.nb[3];
+        }
+    };
+    mmvq_quant_cache_key mmvq_quant_cache_key_cur;
+    bool mmvq_quant_cache_valid = false;
     std::unique_ptr<ggml_cuda_pool_alloc<char>> mmvq_quant_cache_buf;
 
     static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(int device, int stream_no);

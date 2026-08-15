@@ -5035,7 +5035,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_set_device(cuda_ctx->device);
 
     // T180 diagnostic: reset the mmvq quant-dedup cache every graph build.
-    cuda_ctx->mmvq_quant_cache_tensor = nullptr;
+    cuda_ctx->mmvq_quant_cache_valid = false;
+    cuda_ctx->mmvq_quant_cache_key_cur = {};
     cuda_ctx->mmvq_quant_cache_buf.reset();
 
     bool use_cuda_graph             = false;
