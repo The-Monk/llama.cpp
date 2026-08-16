@@ -379,13 +379,14 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         int unpacked_bytes[8];
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            const int shift = j * 4;
-            const int bits4 = (qs0 >> shift) & 0x0F;
-            const int b0 = (bits4 & 0x01) ? 1 : -1;
-            const int b1 = (bits4 & 0x02) ? 1 : -1;
-            const int b2 = (bits4 & 0x04) ? 1 : -1;
-            const int b3 = (bits4 & 0x08) ? 1 : -1;
-            unpacked_bytes[j] = (b0 & 0xFF) | ((b1 & 0xFF) << 8) | ((b2 & 0xFF) << 16) | ((b3 & 0xFF) << 24);
+            // bit-spread to {0,1} bytes, then map 1->0x01 / 0->0xFF in-word:
+            // ((2b + 0x7F) ^ 0x80) per byte, carry-free. Replaces the per-bit
+            // ternary chains (4x v_cmp_eq + v_cndmask serializing on VCC --
+            // PC-sampled 9.5% of the kernel -- plus the long live ranges
+            // feeding the mmq_x=128 scratch spills).
+            const int bits4  = (qs0 >> (j*4)) & 0x0F;
+            const int spread = (bits4 | (bits4 << 7) | (bits4 << 14) | (bits4 << 21)) & 0x01010101;
+            unpacked_bytes[j] = ((spread << 1) + 0x7F7F7F7F) ^ 0x80808080;
         }
 
         const int dst_offset = kbx*(scale_entries_per_block*QI8_0) + kqsx*QI8_0;
@@ -462,21 +463,19 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         int unpacked_bytes[8];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const int codes = (qs0 >> (j*8)) & 0xFF;
-            const int c0 = ((codes >> 0) & 0x3) - 1;
-            const int c1 = ((codes >> 2) & 0x3) - 1;
-            const int c2 = ((codes >> 4) & 0x3) - 1;
-            const int c3 = ((codes >> 6) & 0x3) - 1;
-            unpacked_bytes[j] = (c0 & 0xFF) | ((c1 & 0xFF) << 8) | ((c2 & 0xFF) << 16) | ((c3 & 0xFF) << 24);
+            // 2-bit spread to {0,1,2} bytes, then c-1 per byte carry-free:
+            // (c + 0x7F) ^ 0x80 (see the q1_0 unpack above)
+            const int codes  = (qs0 >> (j*8)) & 0xFF;
+            const int spread = (codes | (codes << 6) | (codes << 12) | (codes << 18)) & 0x03030303;
+            unpacked_bytes[j] = (spread + 0x7F7F7F7F) ^ 0x80808080;
         }
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const int codes = (qs1 >> (j*8)) & 0xFF;
-            const int c0 = ((codes >> 0) & 0x3) - 1;
-            const int c1 = ((codes >> 2) & 0x3) - 1;
-            const int c2 = ((codes >> 4) & 0x3) - 1;
-            const int c3 = ((codes >> 6) & 0x3) - 1;
-            unpacked_bytes[4 + j] = (c0 & 0xFF) | ((c1 & 0xFF) << 8) | ((c2 & 0xFF) << 16) | ((c3 & 0xFF) << 24);
+            // 2-bit spread to {0,1,2} bytes, then c-1 per byte carry-free:
+            // (c + 0x7F) ^ 0x80 (see the q1_0 unpack above)
+            const int codes  = (qs1 >> (j*8)) & 0xFF;
+            const int spread = (codes | (codes << 6) | (codes << 12) | (codes << 18)) & 0x03030303;
+            unpacked_bytes[4 + j] = (spread + 0x7F7F7F7F) ^ 0x80808080;
         }
 
         const int dst_offset = kbx*(scale_entries_per_block*QI8_0) + kqsx*QI8_0;
