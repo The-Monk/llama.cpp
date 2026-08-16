@@ -44,3 +44,24 @@ and the dp4a decode paths to transfer; RDNA4-only rows above will report
 `compiled out`/fallback and that is correct behavior. Please capture
 `llama-bench` tg128/pp2048 plus junction temps — bench-card tooling in
 `tools/bench-card/` automates full provenance capture if you want it.
+
+## Strix Halo (Ryzen AI Max, gfx1151) testers
+
+Covered by the default build line as-is (`gfx1151` is in the target list;
+RDNA 3.5 resolves to the RDNA3-tier guards). APU-specific notes:
+
+- **Memory**: unified LPDDR5X (~256 GB/s class). Ternary decode is
+  memory-bound, so expect proportionally lower tg than dGPUs — the
+  interesting Halo result is that a 27B 1-bit model (3.5 GB) fits and
+  decodes usefully at all, and the SWAR VALU savings are worth *more*
+  per byte here than on discrete cards. Rough ceiling math: Q1_0 27B
+  ≈ 256/3.4 → ~75 t/s theoretical; report whatever fraction you achieve
+  together with the model of your unit.
+- **Stack**: needs a ROCm build with gfx1151 enabled (ROCm 7.x /
+  TheRock wheels both carry it). Use `-ngl 99`; unified memory means no
+  VRAM-size gymnastics, but check the BIOS carveout if allocation fails.
+- **Gates are identical**: the bit-exact PPL values above are
+  architecture-independent — same numbers or it is a bug.
+- If you capture results, junction/skin temps and the power profile
+  (balanced vs performance) matter on APUs — note them alongside
+  tg128/pp2048.
