@@ -11,12 +11,17 @@ typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_
 // ROC8 fp8/MX vec_dot wrappers: bind the templated impls (vecdotq.cuh) to
 // their MMVQ VDR widths so they fit the vec_dot_q_cuda_t table above.
 #define VDR_F8E4M3_F8E4M3_MMVQ_DOT4 2
+#define VDR_F8E4M3_Q8_1_MMVQ_SIMD 8
 #define VDR_F8E5M2_Q8_1_MMVQ_SIMD 8
 #define VDR_MXFP8_Q8_1_MMVQ_SIMD 8
 #define VDR_MXFP6_Q8_1_MMVQ_SIMD 8
 static __device__ __forceinline__ float vec_dot_f8e4m3_f8e4m3_dispatch(
         const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
     return vec_dot_f8e4m3_f8e4m3_impl<VDR_F8E4M3_F8E4M3_MMVQ_DOT4>(vbq, bq8_1, kbx, iqs);
+}
+static __device__ __forceinline__ float vec_dot_f8e4m3_q8_1_simd_dispatch(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_f8e4m3_q8_1_simd_impl<VDR_F8E4M3_Q8_1_MMVQ_SIMD>(vbq, bq8_1, kbx, iqs);
 }
 static __device__ __forceinline__ float vec_dot_f8e5m2_q8_1_simd_dispatch(
         const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
@@ -88,7 +93,12 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         // (GGML_HIP_F8E5M2_DOT4) was dropped in the roc10 slimming: it was
         // accuracy-gated OFF by default and its template dimension doubled
         // kernel instantiations for every type.
-        case GGML_TYPE_F8E4M3:  return vec_dot_f8e4m3_f8e4m3_dispatch;
+        // Switched from T79 dot4 (e4m3-quantized activations, disclosed
+        // ~1.2-1.5% accuracy hit) to the T77 hardware-dot2 path with
+        // LOSSLESS q8_1 activations -- the same tier F8E5M2/MXFP8 use,
+        // both of which out-decoded F8E4M3 in the 2026-08-15 format
+        // sweep. T79 (vec_dot_f8e4m3_f8e4m3_dispatch) kept for reference.
+        case GGML_TYPE_F8E4M3:  return vec_dot_f8e4m3_q8_1_simd_dispatch;
         case GGML_TYPE_F8E5M2:  return vec_dot_f8e5m2_q8_1_simd_dispatch;
         case GGML_TYPE_MXFP8:   return vec_dot_mxfp8_q8_1_simd_dispatch;
         case GGML_TYPE_MXFP6:   return vec_dot_mxfp6_q8_1_simd_dispatch;
@@ -119,7 +129,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_IQ3_S:   return VDR_IQ3_S_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_NL:  return VDR_IQ4_NL_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ;
-        case GGML_TYPE_F8E4M3:  return VDR_F8E4M3_F8E4M3_MMVQ_DOT4;
+        case GGML_TYPE_F8E4M3:  return VDR_F8E4M3_Q8_1_MMVQ_SIMD;
         case GGML_TYPE_F8E5M2:  return VDR_F8E5M2_Q8_1_MMVQ_SIMD;
         case GGML_TYPE_MXFP8:   return VDR_MXFP8_Q8_1_MMVQ_SIMD;
         case GGML_TYPE_MXFP6:   return VDR_MXFP6_Q8_1_MMVQ_SIMD;
@@ -473,6 +483,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_Q5_1:
                 case GGML_TYPE_Q8_0:
                 case GGML_TYPE_Q2_K:
+                // Q4_K re-verified in the 8-warp bucket 2026-08-15 (Qwen3.6-27B
+                // Q4_K_M tg128 r=5: nwarps=8 28.27 vs nwarps=1 27.98, +1.0%)
+                // DESPITE PC sampling showing 22.8% s_barrier_wait -- the
+                // cross-warp parallelism pays for its barriers here. The
+                // remaining Q4_K gap vs the fp8 tier is the scale-load
+                // pattern (27.4% of samples on global_load_d16_hi_b16).
                 case GGML_TYPE_Q4_K:
                 case GGML_TYPE_Q5_K:
                 case GGML_TYPE_Q6_K:
@@ -1405,8 +1421,9 @@ void ggml_cuda_mul_mat_vec_q(
     // F8E4M3 uses a different quantizer (native e4m3); its dedup is a separate
     // opt-in because the cache-buffer size invariant is shared but the
     // producer function is not.
-    const bool dedup_quant_fp8_ok  = src0->type != GGML_TYPE_F8E4M3 ||
-        getenv("GGML_HIP_DEDUP_MMVQ_QUANT_FP8") != nullptr;
+    // F8E4M3 uses the standard q8_1 quantizer since the T77 decode switch,
+    // so the separate fp8-dedup opt-in is moot (var accepted, ignored).
+    const bool dedup_quant_fp8_ok  = true;
     const bool dedup_quant_batch_ok = ne11 == 1 || (ne11 > 1 && ggml_cuda_dedup_mmvq_quant_batch_enabled());
     const bool dedup_quant = ggml_cuda_dedup_mmvq_quant_enabled() && !ids && dedup_quant_batch_ok && dedup_quant_fp8_ok;
     const bool dedup_hit   = dedup_quant &&
@@ -1421,12 +1438,10 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        // F8E4M3 decode activations are quantized to native e4m3 (not int8
-        // q8_1) so vec_dot_f8e4m3_f8e4m3_dispatch can feed both operands to
-        // v_dot4_f32_fp8_fp8 -- correctness-coupled with get_vec_dot_q_cuda's
-        // F8E4M3 entry above. Applies with or without `ids` (MoE experts).
-        const quantize_cuda_t quantize_src1 = src0->type == GGML_TYPE_F8E4M3 ?
-            quantize_row_f8e4m3_for_mmvq_cuda : quantize_row_q8_1_cuda;
+        // F8E4M3 now uses standard q8_1 activations (T77 dot2 decode) like
+        // every other mmvq type; the former native-e4m3 activation quantizer
+        // (T79, quantize_row_f8e4m3_for_mmvq_cuda) is retained but unused.
+        const quantize_cuda_t quantize_src1 = quantize_row_q8_1_cuda;
         if (dedup_quant) {
             ctx.mmvq_quant_cache_buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
             ctx.mmvq_quant_cache_tensor = src1;
