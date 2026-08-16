@@ -46,6 +46,24 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         for (int j = 0; j < 2; ++j) {
             const int q  = qxi[j];
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+            // HIP: __byte_perm emulates PRMT's nibble-selector convention at
+            // runtime (and lacks its mode bits), so the 10-perm unpack below
+            // is both slow and semantics-fragile here. Borrow-free SWAR
+            // instead: bit-spread each nibble to {0,1} bytes, then map
+            // 1 -> 0x01 / 0 -> 0xFF per byte, carry-free. Identical values.
+            int v[4];
+#pragma unroll
+            for (int b4 = 0; b4 < 4; ++b4) {
+                const int bits4  = (q >> (4*b4)) & 0x0F;
+                const int spread = (bits4 | (bits4 << 7) | (bits4 << 14) | (bits4 << 21)) & 0x01010101;
+                v[b4] = ((spread << 1) + 0x7F7F7F7F) ^ 0x80808080;
+            }
+            const int v0 = v[0];
+            const int v1 = v[1];
+            const int v2 = v[2];
+            const int v3 = v[3];
+#else
             // unpack crumbs into nibble indices
             const int n0 = __byte_perm(0x11100100, 0x11100100, q >> 0); // [0, 1, 4, 5] [ 8,  9, 12, 13]
             const int n1 = __byte_perm(0x11100100, 0x11100100, q >> 2); // [2, 3, 6, 7] [10, 11, 14, 15]
@@ -59,6 +77,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             const int v1 = __byte_perm(s0, s1, 0x7632);
             const int v2 = __byte_perm(s2, s3, 0x5410);
             const int v3 = __byte_perm(s2, s3, 0x7632);
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             x_qs[i*sram_stride           + dst_offset + j*4+0] = v0;
@@ -138,12 +157,23 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         for (int j = 0; j < 4; ++j) {
             const int q  = qxi[j];
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+            // HIP: see the Q1_0 note -- SWAR instead of emulated perms.
+            // 2-bit spread to {0,1,2} bytes, then c-1 per byte carry-free.
+            const int b0 = (q >> 0) & 0xFF;
+            const int b1 = (q >> 8) & 0xFF;
+            const int s0 = (b0 | (b0 << 6) | (b0 << 12) | (b0 << 18)) & 0x03030303;
+            const int s1 = (b1 | (b1 << 6) | (b1 << 12) | (b1 << 18)) & 0x03030303;
+            const int qx = (s0 + 0x7F7F7F7F) ^ 0x80808080;
+            const int qy = (s1 + 0x7F7F7F7F) ^ 0x80808080;
+#else
             // unpack even and odd crumbs into byte values
             const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
             const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
             // unshuffle values
             const int qx = __byte_perm(qe, qo, 0x5140);
             const int qy = __byte_perm(qe, qo, 0x7362);
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             x_qs[i*sram_stride           + dst_offset + j*2+0] = qx;
