@@ -1,6 +1,44 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
+
+// Wave32 f32 add-reduce on the VALU pipe (RDNA4): the generic warp_reduce_sum
+// butterfly lowers each __shfl_xor to ds_bpermute (LDS pipe + s_wait_dscnt);
+// PC sampling showed those at 41% of this kernel's samples. Every step below
+// is an involution, so each lane accumulates the full sum -- the broadcast
+// the consumers need (delta_col/attn_col are used by all lanes) comes free.
+// Compiler-verified lowering: 4x v_add_f32_dpp + 1x v_permlanex16_b32.
+// Not bit-identical to the butterfly (different add order); validated by
+// decode-PPL parity + oracle.
+#if defined(GGML_USE_HIP) && (defined(__gfx1200__) || defined(__gfx1201__))
+#define GDN_DPP_REDUCE 1
+
+template <int CTRL>
+static __device__ __forceinline__ float gdn_dpp_add(float x) {
+    union { float f; int i; } a, r;
+    a.f = x;
+    r.i = __builtin_amdgcn_update_dpp(0, a.i, CTRL, 0xF, 0xF, true);
+    return x + r.f;
+}
+#endif // GDN_DPP_REDUCE
+
+template <int width>
+static __device__ __forceinline__ float gdn_reduce_sum(float x) {
+#ifdef GDN_DPP_REDUCE
+    if constexpr (width == 32) {
+        x = gdn_dpp_add<0xB1>(x);   // quad_perm [1,0,3,2]
+        x = gdn_dpp_add<0x4E>(x);   // quad_perm [2,3,0,1]
+        x = gdn_dpp_add<0x141>(x);  // row_half_mirror
+        x = gdn_dpp_add<0x140>(x);  // row_mirror
+        union { float f; int i; } a, r;
+        a.f = x;
+        r.i = __builtin_amdgcn_permlanex16(a.i, a.i, 0x76543210u, 0xFEDCBA98u, true, false);
+        return x + r.f;
+    }
+#endif // GDN_DPP_REDUCE
+    return warp_reduce_sum<width>(x);
+}
+
 template <int S_v, bool KDA, bool keep_rs_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
@@ -90,7 +128,7 @@ gated_delta_net_cuda(const float * q,
             for (int r = 0; r < rows_per_lane; r++) {
                 kv_shard += s_shard[r] * k_reg[r];
             }
-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+            float kv_col = gdn_reduce_sum<warp_size>(kv_shard);
 
             // delta[col] = (v[col] - g * kv[col]) * beta
             float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
@@ -104,7 +142,7 @@ gated_delta_net_cuda(const float * q,
                 attn_partial += s_shard[r] * q_reg[r];
             }
 
-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+            float attn_col = gdn_reduce_sum<warp_size>(attn_partial);
 
             if (lane == 0) {
                 attn_data[col] = attn_col * scale;
@@ -118,7 +156,7 @@ gated_delta_net_cuda(const float * q,
                 kv_shard += expf(g_t[i]) * s_shard[r] * k_reg[r];
             }
 
-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+            float kv_col = gdn_reduce_sum<warp_size>(kv_shard);
 
             // delta[col] = (v[col] - kv[col]) * beta
             float delta_col = (v_t[col] - kv_col) * beta_val;
@@ -133,7 +171,7 @@ gated_delta_net_cuda(const float * q,
                 attn_partial += s_shard[r] * q_reg[r];
             }
 
-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+            float attn_col = gdn_reduce_sum<warp_size>(attn_partial);
 
             if (lane == 0) {
                 attn_data[col] = attn_col * scale;
