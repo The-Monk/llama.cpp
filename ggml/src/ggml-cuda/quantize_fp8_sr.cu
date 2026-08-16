@@ -33,6 +33,7 @@ __device__ __forceinline__ uint32_t sr_seed_hash(uint32_t x) {
 }
 
 __global__ void k_quantize_weight_f8e4m3_sr(const float * __restrict__ x, block_f8e4m3 * __restrict__ y) {
+#if defined(RDNA4) // arch-guard: k_quantize_weight_f8e4m3_sr
     const int64_t c   = blockIdx.x;
     const int     tid = threadIdx.x;
 
@@ -61,9 +62,13 @@ __global__ void k_quantize_weight_f8e4m3_sr(const float * __restrict__ x, block_
     const uint32_t rng = sr_seed_hash((uint32_t)(__builtin_readcyclecounter() * (gid + 1)));
     const int packed = __builtin_amdgcn_cvt_sr_fp8_f32(scaled, rng, 0, 0);
     y[c].qs[tid] = (uint8_t)(packed & 0xFF);
+#else
+    NO_DEVICE_CODE;
+#endif // arch-guard
 }
 
 __global__ void k_quantize_weight_f8e5m2_sr(const float * __restrict__ x, block_f8e5m2 * __restrict__ y) {
+#if defined(RDNA4) // arch-guard: k_quantize_weight_f8e5m2_sr
     const int64_t c   = blockIdx.x;
     const int     tid = threadIdx.x;
 
@@ -92,6 +97,9 @@ __global__ void k_quantize_weight_f8e5m2_sr(const float * __restrict__ x, block_
     const uint32_t rng = sr_seed_hash((uint32_t)(__builtin_readcyclecounter() * (gid + 1)));
     const int packed = __builtin_amdgcn_cvt_sr_bf8_f32(scaled, rng, 0, 0);
     y[c].qs[tid] = (uint8_t)(packed & 0xFF);
+#else
+    NO_DEVICE_CODE;
+#endif // arch-guard
 }
 
 void ggml_cuda_quantize_weight_f8e4m3_sr(ggml_backend_cuda_context & ctx, const float * d_src, void * d_dst, int64_t n) {
@@ -221,14 +229,22 @@ static bool run_format(const char * name, float max_mag, SrKernel sr_kernel, Rtn
 // scalar ggml_fp32_to_e4m3/e5m2 CPU refs, id==1 semantics on the SR
 // kernel side) so the mechanism itself is demonstrated cleanly.
 __global__ void k_sr_fp8_repeated(float val, int * __restrict__ out_byte, uint64_t salt) {
+#if defined(RDNA4) // arch-guard: k_sr_fp8_repeated
     const uint32_t rng = sr_seed_hash((uint32_t)(__builtin_readcyclecounter() * (salt + 1)));
     const int packed = __builtin_amdgcn_cvt_sr_fp8_f32(val, rng, 0, 0);
     *out_byte = packed & 0xFF;
+#else
+    NO_DEVICE_CODE;
+#endif // arch-guard
 }
 __global__ void k_sr_bf8_repeated(float val, int * __restrict__ out_byte, uint64_t salt) {
+#if defined(RDNA4) // arch-guard: k_sr_bf8_repeated
     const uint32_t rng = sr_seed_hash((uint32_t)(__builtin_readcyclecounter() * (salt + 1)));
     const int packed = __builtin_amdgcn_cvt_sr_bf8_f32(val, rng, 0, 0);
     *out_byte = packed & 0xFF;
+#else
+    NO_DEVICE_CODE;
+#endif // arch-guard
 }
 
 static bool run_repeated_constant_test(

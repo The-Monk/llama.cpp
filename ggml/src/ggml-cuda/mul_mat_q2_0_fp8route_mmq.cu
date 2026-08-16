@@ -101,6 +101,7 @@ __device__ __forceinline__ void unpack_q2_0_chunk_to_fp8_words(const uint8_t * _
 static __global__ void k_quantize_act_fp8route_mmq(
         const float * __restrict__ x, block_fp8_32 * __restrict__ y,
         const int64_t n_blocks_k, const int64_t row_stride_floats) {
+#if defined(RDNA4) // arch-guard: k_quantize_act_fp8route_mmq
     const int64_t c   = blockIdx.x; // which 32-elem block along K
     const int64_t m   = blockIdx.y; // which token/row
     const int     tid = threadIdx.x; // 0..31
@@ -140,6 +141,9 @@ static __global__ void k_quantize_act_fp8route_mmq(
         const uint32_t packed = __builtin_amdgcn_cvt_pk_fp8_f32(qf, qf_pair, 0u, false);
         std::memcpy(y[m * n_blocks_k + c].qs + tid, &packed, 2);
     }
+#else
+    NO_DEVICE_CODE;
+#endif // arch-guard
 }
 
 // --- the MMQ-grade fp8-route kernel -----------------------------------------
@@ -160,6 +164,7 @@ static __global__ void k_mul_mat_q2_0_fp8route_mmq(
         const char * __restrict__ vweight, const block_fp8_32 * __restrict__ act, float * __restrict__ dst,
         const int64_t M, const int64_t N, const int64_t nb01, const int64_t n_blocks_k,
         const int64_t dst_row_stride_floats) {
+#if defined(RDNA4) // arch-guard: k_mul_mat_q2_0_fp8route_mmq
     constexpr int NTILES_N = BN / 16;
     constexpr int NTX      = (BM / 16) * (BN / 16) / NWARPS;
 
@@ -278,6 +283,9 @@ static __global__ void k_mul_mat_q2_0_fp8route_mmq(
             }
         }
     }
+#else
+    NO_DEVICE_CODE;
+#endif // arch-guard
 }
 
 } // namespace ggml_cuda_mul_mat_q2_0_fp8route_mmq_detail

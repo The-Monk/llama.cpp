@@ -84,6 +84,7 @@ static __global__ void k_quantize_act_iu4_mmvq(
 static __global__ void k_mmvq_dot8_iu4(
         const char * __restrict__ vweight, const block_iu4 * __restrict__ act,
         float * __restrict__ dst, int64_t Kblocks, int64_t row_stride_bytes) {
+#if defined(RDNA3) || defined(RDNA4) // arch-guard: k_mmvq_dot8_iu4
     const int64_t row = blockIdx.x;
     const int     tid = threadIdx.x;
 
@@ -117,6 +118,9 @@ static __global__ void k_mmvq_dot8_iu4(
     if (tid == 0) {
         dst[row] = sdata[0];
     }
+#else
+    NO_DEVICE_CODE;
+#endif // arch-guard
 }
 
 // Pick the launch block size. Empirically swept 32/64/128/256/512/1024

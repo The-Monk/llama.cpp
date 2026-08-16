@@ -270,6 +270,7 @@ static __device__ __forceinline__ uint32_t q2_spread8(uint32_t v16) {
 static __global__ void k_mmvq_dot8_q2_0(
         const char * __restrict__ vweight, const block_iu4 * __restrict__ act,
         float * __restrict__ dst, int64_t n_blocks_k, int64_t nb01, int64_t N) {
+#if defined(RDNA3) || defined(RDNA4) // arch-guard: k_mmvq_dot8_q2_0
     const int64_t row0 = (int64_t) blockIdx.x * Q2_0_DOT8_ROWS;
     const int     tid  = threadIdx.x;
 
@@ -339,6 +340,9 @@ static __global__ void k_mmvq_dot8_q2_0(
     if (tid < Q2_0_DOT8_ROWS && row0 + tid < N) {
         dst[row0 + tid] = sdata[tid][0];
     }
+#else
+    NO_DEVICE_CODE;
+#endif // arch-guard
 }
 
 bool ggml_cuda_op_mul_mat_q2_0_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {

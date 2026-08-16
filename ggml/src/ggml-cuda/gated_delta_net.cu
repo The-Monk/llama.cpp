@@ -10,8 +10,11 @@
 // Compiler-verified lowering: 4x v_add_f32_dpp + 1x v_permlanex16_b32.
 // Not bit-identical to the butterfly (different add order); validated by
 // decode-PPL parity + oracle.
-#if defined(GGML_USE_HIP) && (defined(__gfx1200__) || defined(__gfx1201__))
+#if defined(GGML_USE_HIP) && (defined(RDNA1) || defined(RDNA2) || defined(RDNA3) || defined(RDNA4))
 #define GDN_DPP_REDUCE 1
+// DPP16 quad_perm/row_mirror + v_permlanex16_b32 exist on all RDNA
+// generations (gfx1010+, verified via the ISA grid in tools/bench-card);
+// CDNA lacks permlane and keeps the generic butterfly fallback below.
 
 template <int CTRL>
 static __device__ __forceinline__ float gdn_dpp_add(float x) {

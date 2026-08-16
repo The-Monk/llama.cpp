@@ -33,6 +33,7 @@ __device__ __forceinline__ _Float16 f16_from_bits(uint16_t bits) {
 __global__ void k_mmvq_dot2f16_single(
         const char * __restrict__ vweight, const float * __restrict__ x,
         float * __restrict__ dst, int64_t K, int64_t row_stride_bytes) {
+#if defined(RDNA3) || defined(RDNA4) // arch-guard: k_mmvq_dot2f16_single
     const int64_t row = blockIdx.x;
     const int     tid = threadIdx.x;
     const uint16_t * wrow = (const uint16_t *) (vweight + row * row_stride_bytes);
@@ -55,6 +56,9 @@ __global__ void k_mmvq_dot2f16_single(
         __syncthreads();
     }
     if (tid == 0) dst[row] = sdata_s[0];
+#else
+    NO_DEVICE_CODE;
+#endif // arch-guard
 }
 
 // ---------------------------------------------------------------------
@@ -92,6 +96,7 @@ __device__ __forceinline__ uint32_t pack_half2_bits(_Float16 lo, _Float16 hi) {
 __global__ void k_mmvq_dot2f16_dual(
         const char * __restrict__ vweight, const float * __restrict__ x,
         float * __restrict__ dst, int64_t K, int64_t row_stride_bytes) {
+#if defined(RDNA3) || defined(RDNA4) // arch-guard: k_mmvq_dot2f16_dual
     const int64_t row = blockIdx.x;
     const int     tid = threadIdx.x;
     const uint16_t * wrow = (const uint16_t *) (vweight + row * row_stride_bytes);
@@ -133,6 +138,9 @@ __global__ void k_mmvq_dot2f16_dual(
         __syncthreads();
     }
     if (tid == 0) dst[row] = sdata_d[0];
+#else
+    NO_DEVICE_CODE;
+#endif // arch-guard
 }
 
 bool ggml_cuda_mmvq_dot2f16_supports(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
