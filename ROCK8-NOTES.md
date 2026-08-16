@@ -65,3 +65,25 @@ RDNA 3.5 resolves to the RDNA3-tier guards). APU-specific notes:
 - If you capture results, junction/skin temps and the power profile
   (balanced vs performance) matter on APUs — note them alongside
   tg128/pp2048.
+
+## Speculative decoding (MTP) on ternary targets
+
+Bonsai-27B is a Qwen3.6-27B ternary train (identical 248,320-token vocab).
+Any Qwen3.6-27B gguf that carries the MTP/nextn layer can donate its head
+to a Bonsai target via `tools/graft_mtp.py <bonsai.gguf> <out.gguf>` (15
+`blk.64.*` tensors + `block_count` 65 + `nextn_predict_layers=1`). Then:
+
+    llama-speculative-simple -m out.gguf --spec-type draft-mtp \
+        --spec-draft-n-max 2 -n 512 --temp 0 -p "..."
+
+Measured on gfx1201 (temp 0 — exact-match verify, output bit-identical
+to plain greedy):
+
+| target | accept | effective tg | vs plain |
+|--------|--------|--------------|----------|
+| Q2_0 g128 | 49.2% | 62.9 | +20.9% |
+| Q1_0      | 32.7% | 61.4 | -8.5% (skip) |
+
+n-max=2 is optimal; deeper drafts lower accept and throughput. Q1_0 needs
+a Bonsai-distilled head (tracked with PrismML). The script only grafts
+tensors you already have — no weights are distributed with this repo.
