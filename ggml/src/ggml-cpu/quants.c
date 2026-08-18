@@ -1511,8 +1511,8 @@ void ggml_vec_dot_2of4_t1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const 
                 const int i0 = nib & 3, i1 = (nib >> 2) & 3;
                 const int s0 = (x[ib].signs[(2*g+0) >> 3] >> ((2*g+0) & 7)) & 1;
                 const int s1 = (x[ib].signs[(2*g+1) >> 3] >> ((2*g+1) & 7)) & 1;
-                sumi += (s0 ? 1 : -1) * yb->qs[4*gl + i0];
-                sumi += (s1 ? 1 : -1) * yb->qs[4*gl + i1];
+                if (i0 <= i1) sumi += (s0 ? 1 : -1) * yb->qs[4*gl + i0];
+                if (i0 <  i1) sumi += (s1 ? 1 : -1) * yb->qs[4*gl + i1];
             }
             sumf += d * d8 * sumi;
         }

@@ -6257,8 +6257,13 @@ void quantize_row_2of4_t1_ref(const float * GGML_RESTRICT x, block_2of4_t1 * GGM
                 if (i1 < 0 || fabsf(xb[4*g+j]) > fabsf(xb[4*g+i1])) i1 = j;
             }
             if (i0 > i1) { const int t = i0; i0 = i1; i1 = t; }
-            idx0[g] = (uint8_t) i0; idx1[g] = (uint8_t) i1;
             const float a0 = fabsf(xb[4*g+i0]), a1 = fabsf(xb[4*g+i1]);
+            // v1.1 states: i0<i1 two survivors; i0==i1 one survivor; i0>i1 empty
+            if (a0 > 0 && a1 > 0)      { /* two */ }
+            else if (a0 > 0)           { i1 = i0; }            // single at i0
+            else if (a1 > 0)           { i0 = i1; }            // single at i1
+            else                       { i0 = 1; i1 = 0; }     // empty group
+            idx0[g] = (uint8_t) i0; idx1[g] = (uint8_t) i1;
             if (a0 > 0) { amean += a0; cnt++; }
             if (a1 > 0) { amean += a1; cnt++; }
         }
@@ -6271,8 +6276,8 @@ void quantize_row_2of4_t1_ref(const float * GGML_RESTRICT x, block_2of4_t1 * GGM
             else       y[ib].meta[g >> 1]  = nib;
             // zero-valued survivors encode as +d (representable error; QAT-trained
             // exactly-2-nonzero weights never hit this)
-            if (xb[4*g+idx0[g]] >= 0.0f) y[ib].signs[(2*g+0) >> 3] |= (uint8_t)(1u << ((2*g+0) & 7));
-            if (xb[4*g+idx1[g]] >= 0.0f) y[ib].signs[(2*g+1) >> 3] |= (uint8_t)(1u << ((2*g+1) & 7));
+            if (idx0[g] <= idx1[g] && xb[4*g+idx0[g]] >= 0.0f) y[ib].signs[(2*g+0) >> 3] |= (uint8_t)(1u << ((2*g+0) & 7));
+            if (idx0[g] <  idx1[g] && xb[4*g+idx1[g]] >= 0.0f) y[ib].signs[(2*g+1) >> 3] |= (uint8_t)(1u << ((2*g+1) & 7));
         }
     }
 }
@@ -6289,8 +6294,8 @@ void dequantize_row_2of4_t1(const block_2of4_t1 * GGML_RESTRICT x, float * GGML_
             const int i0 = nib & 3, i1 = (nib >> 2) & 3;
             const int s0 = (x[ib].signs[(2*g+0) >> 3] >> ((2*g+0) & 7)) & 1;
             const int s1 = (x[ib].signs[(2*g+1) >> 3] >> ((2*g+1) & 7)) & 1;
-            yb[4*g+i0] = s0 ? d : -d;
-            yb[4*g+i1] = s1 ? d : -d;
+            if (i0 <= i1) yb[4*g+i0] = s0 ? d : -d;   // two or single
+            if (i0 <  i1) yb[4*g+i1] = s1 ? d : -d;   // two only
         }
     }
 }
