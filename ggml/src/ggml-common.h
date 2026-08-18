@@ -355,6 +355,22 @@ typedef struct {
 } block_2of4_fp8;
 static_assert(sizeof(block_2of4_fp8) == sizeof(ggml_half) + QK_2OF4_FP8/2 + QK_2OF4_FP8/8, "wrong 2of4_fp8 block size/padding");
 
+// 2OF4_T1: 2:4-structured-sparse TERNARY (q2.4). 128 weights per block, ONE
+// positive fp16 scale. Each group of 4 consecutive weights keeps exactly 2
+// survivors at +/-d (non-survivors are exact zeros). meta nibble per group:
+// i0 | i1<<2 with i0<i1 (same 2-bit-per-index scheme as block_2of4_fp8.meta).
+// signs bit s=2g+k: 1 -> +d for survivor k of group g. 26 bytes / 128
+// weights = 1.625 bpw (vs dense Q2_0 g128 at 2.125).
+#define QK_2OF4_T1 128
+#define QR_2OF4_T1 1
+#define QI_2OF4_T1 (QK_2OF4_T1 / 32)
+typedef struct {
+    ggml_half d;                        // group scale (always > 0)
+    uint8_t   signs[QK_2OF4_T1/16];    // 8B: 64 survivor sign bits
+    uint8_t   meta[QK_2OF4_T1/8];      // 16B: 32 nibbles of 2-bit index pairs
+} block_2of4_t1;
+static_assert(sizeof(block_2of4_t1) == sizeof(ggml_half) + QK_2OF4_T1/16 + QK_2OF4_T1/8, "wrong 2of4_t1 block size/padding");
+
 // 2OF4_F16 (card 141: sparse-fp16 2:4 end-to-end, mirrors 2OF4_FP8 exactly
 // except the kept values are stored as NATIVE fp16, not e4m3+scale). fp16
 // already has a 5-bit exponent / 10-bit mantissa -- wide enough dynamic

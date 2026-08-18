@@ -437,7 +437,8 @@ extern "C" {
         GGML_TYPE_IU4     = 47, // signed int4 x int4 W4A4, native RDNA4 WMMA -- EXPERIMENTAL, model-blocked (see comment at IU4 kernel registration)
         GGML_TYPE_2OF4_F16 = 48, // RDNA4 2:4-structured-sparse fp16 (card 141, native SWMMAC f16 A/B, fp32 accumulate)
         GGML_TYPE_MXFP6   = 49, // MXFP6 (OCP MX): e3m2 weights (6-bit packed) + per-32-block e8m0 shared scale, rides the e4m3 fp8 compute path (mx.quantize)
-        GGML_TYPE_COUNT   = 50,
+        GGML_TYPE_2OF4_T1 = 50, // 2:4-structured-sparse ternary: g128 fp16 scale, sign-bit survivors + nibble metadata (1.625 bpw)
+        GGML_TYPE_COUNT   = 51,
     };
 
     // precision

@@ -41,6 +41,26 @@ static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const in
     v.y = (c1 - 1) * d;
 }
 
+static __device__ __forceinline__ void dequantize_2of4_t1(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_2of4_t1 * x = (const block_2of4_t1 *) vx;
+    const float d = x[ib].d;
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+        const int j   = iqs + e;
+        const int g   = j >> 2;
+        const int pos = j & 3;
+        const uint8_t nib = (x[ib].meta[g >> 1] >> (4*(g & 1))) & 0xF;
+        const int i0 = nib & 3, i1 = (nib >> 2) & 3;
+        float val = 0.0f;
+        if (pos == i0) {
+            val = ((x[ib].signs[(2*g+0) >> 3] >> ((2*g+0) & 7)) & 1) ? d : -d;
+        } else if (pos == i1) {
+            val = ((x[ib].signs[(2*g+1) >> 3] >> ((2*g+1) & 7)) & 1) ? d : -d;
+        }
+        if (e == 0) v.x = val; else v.y = val;
+    }
+}
+
 static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q4_0 * x = (const block_q4_0 *) vx;
 

@@ -8029,6 +8029,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q1_0,
     GGML_TYPE_Q2_0,
+    GGML_TYPE_2OF4_T1,
     GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
     // NOT ADDABLE YET: GGML_TYPE_Q2_0 and GGML_TYPE_MXFP8 have type_traits
     // entries but NO CPU vec_dot/quantize implementation, so the suite cannot
@@ -8049,6 +8050,7 @@ static const ggml_type base_types[] = {
     GGML_TYPE_Q8_0, // for I8MM tests
     GGML_TYPE_Q1_0,
     GGML_TYPE_Q2_0,
+    GGML_TYPE_2OF4_T1,
     GGML_TYPE_Q4_0,
     GGML_TYPE_Q4_1, // for I8MM tests
     GGML_TYPE_Q4_K,

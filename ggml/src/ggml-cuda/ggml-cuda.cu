@@ -5571,6 +5571,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_F16:
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
+                    case GGML_TYPE_2OF4_T1:
+                        // 2of4_t1 v1: mmvq + dequant MUL_MAT proven (43/43);
+                        // MUL_MAT_ID ids-path n>8 geometry unvalidated -> scoped out
+                        if (a->type == GGML_TYPE_2OF4_T1) {
+                            return op->op == GGML_OP_MUL_MAT;
+                        }
+                        GGML_ASSERT(a->type != GGML_TYPE_2OF4_T1);
+                        // fallthrough
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
@@ -5624,6 +5632,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_I32:
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
+                    case GGML_TYPE_2OF4_T1:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:

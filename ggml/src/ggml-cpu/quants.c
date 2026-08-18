@@ -1488,3 +1488,38 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
     assert(k % QK_K == 0);
     quantize_iq4_xs(x, y, 1, k, NULL);
 }
+
+
+// 2OF4_T1 (2:4-sparse ternary): scalar reference. Survivor gather via the
+// nibble metadata; signs give +/-d. Only ~half the MACs of dense q2_0.
+void ggml_vec_dot_2of4_t1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    (void) bs; (void) bx; (void) by; (void) nrc;
+    assert(n % QK_2OF4_T1 == 0);
+    const block_2of4_t1 * GGML_RESTRICT x = vx;
+    const block_q8_0    * GGML_RESTRICT y = vy;
+    const int nb = n / QK_2OF4_T1;
+    float sumf = 0.0f;
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        for (int c = 0; c < 4; ++c) {              // 4 q8_0 blocks per t1 block
+            const block_q8_0 * yb = &y[4*ib + c];
+            const float d8 = GGML_CPU_FP16_TO_FP32(yb->d);
+            int sumi = 0;
+            for (int gl = 0; gl < 8; ++gl) {       // groups within this 32-chunk
+                const int g = 8*c + gl;
+                const uint8_t nib = (x[ib].meta[g >> 1] >> (4*(g & 1))) & 0xF;
+                const int i0 = nib & 3, i1 = (nib >> 2) & 3;
+                const int s0 = (x[ib].signs[(2*g+0) >> 3] >> ((2*g+0) & 7)) & 1;
+                const int s1 = (x[ib].signs[(2*g+1) >> 3] >> ((2*g+1) & 7)) & 1;
+                sumi += (s0 ? 1 : -1) * yb->qs[4*gl + i0];
+                sumi += (s1 ? 1 : -1) * yb->qs[4*gl + i1];
+            }
+            sumf += d * d8 * sumi;
+        }
+    }
+    *s = sumf;
+}
+
+void quantize_row_2of4_t1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_2of4_t1_ref(x, (block_2of4_t1 *) y, k);
+}

@@ -6237,3 +6237,69 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
 
     return true;
 }
+
+
+// ===================== 2OF4_T1: 2:4-structured sparse ternary (q2.4) ====================
+
+void quantize_row_2of4_t1_ref(const float * GGML_RESTRICT x, block_2of4_t1 * GGML_RESTRICT y, int64_t k) {
+    const int qk = QK_2OF4_T1;
+    assert(k % qk == 0);
+    for (int64_t ib = 0; ib < k/qk; ++ib) {
+        const float * xb = x + ib*qk;
+        uint8_t idx0[32], idx1[32];
+        float amean = 0.0f; int cnt = 0;
+        for (int g = 0; g < 32; ++g) {
+            int i0 = 0;
+            for (int j = 1; j < 4; ++j) if (fabsf(xb[4*g+j]) > fabsf(xb[4*g+i0])) i0 = j;
+            int i1 = -1;
+            for (int j = 0; j < 4; ++j) {
+                if (j == i0) continue;
+                if (i1 < 0 || fabsf(xb[4*g+j]) > fabsf(xb[4*g+i1])) i1 = j;
+            }
+            if (i0 > i1) { const int t = i0; i0 = i1; i1 = t; }
+            idx0[g] = (uint8_t) i0; idx1[g] = (uint8_t) i1;
+            const float a0 = fabsf(xb[4*g+i0]), a1 = fabsf(xb[4*g+i1]);
+            if (a0 > 0) { amean += a0; cnt++; }
+            if (a1 > 0) { amean += a1; cnt++; }
+        }
+        const float d = cnt > 0 ? amean/cnt : 1e-8f;
+        y[ib].d = GGML_FP32_TO_FP16(d > 1e-8f ? d : 1e-8f);
+        memset(y[ib].signs, 0, sizeof(y[ib].signs));
+        for (int g = 0; g < 32; ++g) {
+            const uint8_t nib = (uint8_t)(idx0[g] | (idx1[g] << 2));
+            if (g & 1) y[ib].meta[g >> 1] |= (uint8_t)(nib << 4);
+            else       y[ib].meta[g >> 1]  = nib;
+            // zero-valued survivors encode as +d (representable error; QAT-trained
+            // exactly-2-nonzero weights never hit this)
+            if (xb[4*g+idx0[g]] >= 0.0f) y[ib].signs[(2*g+0) >> 3] |= (uint8_t)(1u << ((2*g+0) & 7));
+            if (xb[4*g+idx1[g]] >= 0.0f) y[ib].signs[(2*g+1) >> 3] |= (uint8_t)(1u << ((2*g+1) & 7));
+        }
+    }
+}
+
+void dequantize_row_2of4_t1(const block_2of4_t1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    const int qk = QK_2OF4_T1;
+    assert(k % qk == 0);
+    for (int64_t ib = 0; ib < k/qk; ++ib) {
+        const float d = GGML_FP16_TO_FP32(x[ib].d);
+        float * yb = y + ib*qk;
+        memset(yb, 0, qk*sizeof(float));
+        for (int g = 0; g < 32; ++g) {
+            const uint8_t nib = (x[ib].meta[g >> 1] >> (4*(g & 1))) & 0xF;
+            const int i0 = nib & 3, i1 = (nib >> 2) & 3;
+            const int s0 = (x[ib].signs[(2*g+0) >> 3] >> ((2*g+0) & 7)) & 1;
+            const int s1 = (x[ib].signs[(2*g+1) >> 3] >> ((2*g+1) & 7)) & 1;
+            yb[4*g+i0] = s0 ? d : -d;
+            yb[4*g+i1] = s1 ? d : -d;
+        }
+    }
+}
+
+size_t quantize_2of4_t1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    (void) imatrix; // survivor choice is magnitude-based here; imatrix-guided packing lives in the offline packer
+    const size_t row_size = ggml_row_size(GGML_TYPE_2OF4_T1, n_per_row);
+    for (int64_t i = 0; i < nrows; ++i) {
+        quantize_row_2of4_t1_ref(src + i*n_per_row, (block_2of4_t1 *)((char *) dst + i*row_size), n_per_row);
+    }
+    return nrows * row_size;
+}

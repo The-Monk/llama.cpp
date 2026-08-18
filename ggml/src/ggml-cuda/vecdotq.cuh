@@ -115,6 +115,7 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 // live (and are verified: test-backend-ops -o MUL_MAT passes for q2_0, all
 // shapes, 2/2 backends), so this is a no-op for codegen.
 #define VDR_Q2_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
+#define VDR_2OF4_T1_Q8_1_MMVQ 1
 #define VDR_Q2_0_Q8_1_MMQ  2  // 2 32-element chunks per MMQ tile step
 
 #define VDR_Q4_0_Q8_1_MMVQ 2
@@ -774,6 +775,92 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     const float d8 = __low2float(bq8_1_chunk->ds);
     const float s8 = __high2float(bq8_1_chunk->ds); // = d8 * sum(u)
     return d2 * (d8 * sumi - s8);
+}
+
+// 2OF4_T1 (2:4-sparse ternary, q2.4) survivor-gather decode.
+// meta byte (2 groups) -> __byte_perm selector via a 1KB L1-resident LUT;
+// sign nibble -> +/-1 byte lane vector via a 16-entry LUT; one dp4a covers
+// the 4 survivors of 2 groups (non-survivors contribute exactly 0, so the
+// -sum(u) correction dense q2_0 needs does not apply here).
+static __device__ const uint32_t ggml_cuda_2of4_t1_sel_lut[256] = {
+    0x04040000, 0x04040001, 0x04040002, 0x04040003, 0x04040100, 0x04040101, 0x04040102, 0x04040103,
+    0x04040200, 0x04040201, 0x04040202, 0x04040203, 0x04040300, 0x04040301, 0x04040302, 0x04040303,
+    0x04050000, 0x04050001, 0x04050002, 0x04050003, 0x04050100, 0x04050101, 0x04050102, 0x04050103,
+    0x04050200, 0x04050201, 0x04050202, 0x04050203, 0x04050300, 0x04050301, 0x04050302, 0x04050303,
+    0x04060000, 0x04060001, 0x04060002, 0x04060003, 0x04060100, 0x04060101, 0x04060102, 0x04060103,
+    0x04060200, 0x04060201, 0x04060202, 0x04060203, 0x04060300, 0x04060301, 0x04060302, 0x04060303,
+    0x04070000, 0x04070001, 0x04070002, 0x04070003, 0x04070100, 0x04070101, 0x04070102, 0x04070103,
+    0x04070200, 0x04070201, 0x04070202, 0x04070203, 0x04070300, 0x04070301, 0x04070302, 0x04070303,
+    0x05040000, 0x05040001, 0x05040002, 0x05040003, 0x05040100, 0x05040101, 0x05040102, 0x05040103,
+    0x05040200, 0x05040201, 0x05040202, 0x05040203, 0x05040300, 0x05040301, 0x05040302, 0x05040303,
+    0x05050000, 0x05050001, 0x05050002, 0x05050003, 0x05050100, 0x05050101, 0x05050102, 0x05050103,
+    0x05050200, 0x05050201, 0x05050202, 0x05050203, 0x05050300, 0x05050301, 0x05050302, 0x05050303,
+    0x05060000, 0x05060001, 0x05060002, 0x05060003, 0x05060100, 0x05060101, 0x05060102, 0x05060103,
+    0x05060200, 0x05060201, 0x05060202, 0x05060203, 0x05060300, 0x05060301, 0x05060302, 0x05060303,
+    0x05070000, 0x05070001, 0x05070002, 0x05070003, 0x05070100, 0x05070101, 0x05070102, 0x05070103,
+    0x05070200, 0x05070201, 0x05070202, 0x05070203, 0x05070300, 0x05070301, 0x05070302, 0x05070303,
+    0x06040000, 0x06040001, 0x06040002, 0x06040003, 0x06040100, 0x06040101, 0x06040102, 0x06040103,
+    0x06040200, 0x06040201, 0x06040202, 0x06040203, 0x06040300, 0x06040301, 0x06040302, 0x06040303,
+    0x06050000, 0x06050001, 0x06050002, 0x06050003, 0x06050100, 0x06050101, 0x06050102, 0x06050103,
+    0x06050200, 0x06050201, 0x06050202, 0x06050203, 0x06050300, 0x06050301, 0x06050302, 0x06050303,
+    0x06060000, 0x06060001, 0x06060002, 0x06060003, 0x06060100, 0x06060101, 0x06060102, 0x06060103,
+    0x06060200, 0x06060201, 0x06060202, 0x06060203, 0x06060300, 0x06060301, 0x06060302, 0x06060303,
+    0x06070000, 0x06070001, 0x06070002, 0x06070003, 0x06070100, 0x06070101, 0x06070102, 0x06070103,
+    0x06070200, 0x06070201, 0x06070202, 0x06070203, 0x06070300, 0x06070301, 0x06070302, 0x06070303,
+    0x07040000, 0x07040001, 0x07040002, 0x07040003, 0x07040100, 0x07040101, 0x07040102, 0x07040103,
+    0x07040200, 0x07040201, 0x07040202, 0x07040203, 0x07040300, 0x07040301, 0x07040302, 0x07040303,
+    0x07050000, 0x07050001, 0x07050002, 0x07050003, 0x07050100, 0x07050101, 0x07050102, 0x07050103,
+    0x07050200, 0x07050201, 0x07050202, 0x07050203, 0x07050300, 0x07050301, 0x07050302, 0x07050303,
+    0x07060000, 0x07060001, 0x07060002, 0x07060003, 0x07060100, 0x07060101, 0x07060102, 0x07060103,
+    0x07060200, 0x07060201, 0x07060202, 0x07060203, 0x07060300, 0x07060301, 0x07060302, 0x07060303,
+    0x07070000, 0x07070001, 0x07070002, 0x07070003, 0x07070100, 0x07070101, 0x07070102, 0x07070103,
+    0x07070200, 0x07070201, 0x07070202, 0x07070203, 0x07070300, 0x07070301, 0x07070302, 0x07070303,
+};
+static __device__ const uint32_t ggml_cuda_2of4_t1_sgn_lut[16] = {
+    0xffffffff, 0xffffff01, 0xffff01ff, 0xffff0101, 0xff01ffff, 0xff01ff01, 0xff0101ff, 0xff010101, 0x01ffffff, 0x01ffff01, 0x01ff01ff, 0x01ff0101, 0x0101ffff, 0x0101ff01, 0x010101ff, 0x01010101
+};
+
+static __device__ __forceinline__ float vec_dot_2of4_t1_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_2of4_t1 * bt = (const block_2of4_t1 *) vbq + kbx;
+    const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
+
+    const float d = bt->d;
+    const int sbits = bt->signs[2*iqs + 0] | (bt->signs[2*iqs + 1] << 8);
+
+    int sumi = 0;
+#if 0 // scalar reference (kept for bisecting)
+    const int8_t * aq = (const int8_t *) bq8_1_chunk->qs;
+    for (int gl = 0; gl < 8; ++gl) {
+        const int g = 8*iqs + gl;
+        const uint8_t nib = (bt->meta[g >> 1] >> (4*(g & 1))) & 0xF;
+        const int i0 = nib & 3, i1 = (nib >> 2) & 3;
+        const int b0 = (sbits >> (2*gl + 0)) & 1;
+        const int b1 = (sbits >> (2*gl + 1)) & 1;
+        sumi += (b0 ? 1 : -1) * aq[4*gl + i0];
+        sumi += (b1 ? 1 : -1) * aq[4*gl + i1];
+    }
+#else
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+        const int mb   = bt->meta[4*iqs + m];
+        const int alo  = get_int_b4(bq8_1_chunk->qs, 2*m + 0);
+        const int ahi  = get_int_b4(bq8_1_chunk->qs, 2*m + 1);
+#ifdef GGML_USE_HIP
+        // v_perm_b32 probe-verified on gfx1201: sel bytes 0-3 pick from the
+        // SECOND operand, 4-7 from the first (HIP __byte_perm emulation is
+        // NOT trustworthy at any selector value on this toolchain).
+        const int kept = __builtin_amdgcn_perm((unsigned) ahi, (unsigned) alo, ggml_cuda_2of4_t1_sel_lut[mb]);
+#else
+        const int kept = __byte_perm(alo, ahi, ggml_cuda_2of4_t1_sel_lut[mb]); // CUDA: 0-3 -> first arg
+#endif
+        const int sgn  = (int) ggml_cuda_2of4_t1_sgn_lut[(sbits >> (4*m)) & 0xF];
+        sumi = ggml_cuda_dp4a(kept, sgn, sumi);
+    }
+#endif
+
+    return d * __low2float(bq8_1_chunk->ds) * sumi;
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
