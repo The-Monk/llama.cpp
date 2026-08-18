@@ -882,12 +882,14 @@ static __device__ __forceinline__ float vec_dot_2of4_t1_q8_1(
         const int alo  = get_int_b4(bq8_1_chunk->qs, 2*m + 0);
         const int ahi  = get_int_b4(bq8_1_chunk->qs, 2*m + 1);
 #ifdef GGML_USE_HIP
-        // v_perm_b32 probe-verified on gfx1201: sel bytes 0-3 pick from the
-        // SECOND operand, 4-7 from the first (HIP __byte_perm emulation is
-        // NOT trustworthy at any selector value on this toolchain).
+        // Raw v_perm_b32: our selector LUT uses a BYTE-per-output-lane encoding
+        // (sel byte 0-3 picks the source byte), NOT __byte_perm's nibble-per-
+        // lane encoding, so we call the builtin directly. Probe-verified on
+        // gfx1201: v_perm sel bytes 0-3 index the SECOND operand, 4-7 the first.
         const int kept = __builtin_amdgcn_perm((unsigned) ahi, (unsigned) alo, ggml_cuda_2of4_t1_sel_lut[mb]);
 #else
-        const int kept = __byte_perm(alo, ahi, ggml_cuda_2of4_t1_sel_lut[mb]); // CUDA: 0-3 -> first arg
+        // A CUDA port would need a nibble-encoded selector; left for later.
+        const int kept = __byte_perm(alo, ahi, ggml_cuda_2of4_t1_sel_lut[mb]);
 #endif
         const int sgn  = (int) (ggml_cuda_2of4_t1_sgn_lut[(sbits >> (4*m)) & 0xF]
                                 & ggml_cuda_2of4_t1_msk_lut[mb]); // v1.1 single/empty states
