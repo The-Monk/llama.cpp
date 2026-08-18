@@ -33,6 +33,7 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
     {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+    {"draft-mtp-hybrid", COMMON_SPECULATIVE_TYPE_DRAFT_MTP_HYBRID},
     {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
     {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
@@ -1305,8 +1306,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
-    common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
-        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
+    // hybrid mode: n-gram lookup seeds forced into the rolling head chain
+    bool hybrid = false;
+    common_ngram_simple_config hybrid_cfg = {};
+    int32_t hybrid_seed_max = 0;
+    std::vector<llama_tokens> hybrid_seeds; // [n_seq], per-cycle
+
+    common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq, bool hybrid_ = false)
+        : common_speculative_impl(hybrid_ ? COMMON_SPECULATIVE_TYPE_DRAFT_MTP_HYBRID : COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
     {
         auto * ctx_tgt = this->params.ctx_tgt;
@@ -1319,6 +1326,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
+        hybrid = hybrid_;
+        if (hybrid) {
+            hybrid_cfg.size_ngram = params.ngram_simple.size_n;
+            hybrid_cfg.size_mgram = params.ngram_simple.size_m;
+            hybrid_seed_max = this->params.n_max;
+            if (const char * e = getenv("GGML_SPEC_HYBRID_SEED_MAX")) {
+                hybrid_seed_max = std::min(hybrid_seed_max, atoi(e));
+            }
+            hybrid_seeds.resize(n_seq);
+            SPC_TRC("- hybrid n-gram seeding: size_n=%d, size_m=%d, seed_max=%d\n",
+                    (int) hybrid_cfg.size_ngram, (int) hybrid_cfg.size_mgram, hybrid_seed_max);
+        }
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
@@ -1562,6 +1581,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
 
+            if (hybrid) {
+                // n-gram lookup proposes the head of this cycle's draft; the
+                // MTP head rolls THROUGH these tokens (it consumes h + the
+                // token embd - it does not need to have predicted them) and
+                // then extends past them with its own predictions.
+                hybrid_seeds[seq_id] = common_ngram_simple_draft(hybrid_cfg, *dp.prompt, dp.id_last);
+                if ((int32_t) hybrid_seeds[seq_id].size() > hybrid_seed_max) {
+                    hybrid_seeds[seq_id].resize(hybrid_seed_max);
+                }
+            }
+
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
 
@@ -1621,10 +1651,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                llama_token id = cur_p->data[0].id;
 
-                // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                bool seeded = false;
+                if (hybrid) {
+                    const auto & seedq = hybrid_seeds[seq_id];
+                    const size_t taken = dparams.at(seq_id).result->size();
+                    if (taken < seedq.size()) {
+                        id     = seedq[taken]; // lookup-seeded position: forced
+                        seeded = true;
+                    }
+                }
+
+                // only collect very high-confidence draft tokens (seeded
+                // positions bypass the gate - verify arbitrates them)
+                if (!seeded && cur_p->data[0].p < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -2212,6 +2253,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
         case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
         case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_HYBRID: return "draft-mtp-hybrid";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
@@ -2266,6 +2308,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_HYBRID:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
@@ -2337,7 +2380,9 @@ common_speculative_init_result::common_speculative_init_result(
     const bool has_draft = params.speculative.has_dft();
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
-                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end()
+                         || std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP_HYBRID) != params.speculative.types.end();
     GGML_ASSERT(has_draft || spec_mtp);
 
     auto mparams = common_model_params_to_llama(params);
@@ -2427,7 +2472,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -2440,6 +2485,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_HYBRID,    params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
     }
@@ -2460,6 +2506,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_HYBRID: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq, /*hybrid=*/true));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {

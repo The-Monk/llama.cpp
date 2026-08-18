@@ -63,7 +63,9 @@ int main(int argc, char ** argv) {
     const bool has_draft = params.speculative.has_dft();
     const bool spec_mtp  = std::find(params.speculative.types.begin(),
                                       params.speculative.types.end(),
-                                      COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+                                      COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end()
+                       || std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                                      COMMON_SPECULATIVE_TYPE_DRAFT_MTP_HYBRID) != params.speculative.types.end();
 
     // [FIX card ASYNC-ACCEPT-1] Bug3: MTP is not the only drafter type whose draft()
     // depends on ctx_tgt's *just-computed* forward output. EAGLE3 and DFlash/DSpark
