@@ -3461,9 +3461,37 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
-                    if (ctx_dft) {
-                        common_context_seq_rm(ctx_dft.get(), slot.id, p0, -1);
+                    // RS-type recurrent/hybrid memory only supports partial rollback bounded by
+                    // n_rs_seq (see llama_memory_recurrent::seq_rm) -- a deeper truncation here
+                    // (e.g. a chat-turn edit/regenerate whose divergence point the checkpoint-
+                    // restore logic above didn't shrink far enough) would otherwise GGML_ABORT()
+                    // inside common_context_seq_rm(). Mirror the existing spec-decode guards
+                    // (n_rollback > llama_n_rs_seq(ctx), used at the verify-rollback and draft-size
+                    // call sites) and fall back to a full sequence clear + reprocess instead.
+                    bool did_full_clear = false;
+                    if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                        const llama_pos pos_cur    = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                        const int64_t   n_rollback = (int64_t) pos_cur - (int64_t) p0 + 1;
+
+                        if (n_rollback > (int64_t) llama_n_rs_seq(ctx_tgt)) {
+                            SLT_WRN(slot, "rollback depth %" PRId64 " exceeds n_rs_seq = %u -- clearing the "
+                                          "sequence and reprocessing the full prompt instead of a partial rollback\n",
+                                    n_rollback, llama_n_rs_seq(ctx_tgt));
+
+                            common_context_seq_rm(ctx_tgt, slot.id, -1, -1);
+                            if (ctx_dft) {
+                                common_context_seq_rm(ctx_dft.get(), slot.id, -1, -1);
+                            }
+                            slot.prompt.tokens.keep_first(0);
+                            did_full_clear = true;
+                        }
+                    }
+
+                    if (!did_full_clear) {
+                        common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
+                        if (ctx_dft) {
+                            common_context_seq_rm(ctx_dft.get(), slot.id, p0, -1);
+                        }
                     }
 
                     // If using an alora, there may be uncached tokens that come

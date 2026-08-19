@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
 #include <clocale>
 #include <cmath>
 #include <cstdio>
@@ -107,6 +108,83 @@ int main(int argc, char ** argv) {
     if (n_decode < 3) {
         fprintf(stderr, "%s : not enough prompt tokens (need >= 3, have %u)\n", __func__, n_decode);
         return 1;
+    }
+
+    // Case 6: mirrors the new tools/server guard added at the chat-turn
+    // prompt-prefix-reuse call site (server-context.cpp update_slots(), ~line
+    // 3464): before calling seq_rm, check n_rollback = pos_cur - p0 + 1 against
+    // n_rs_seq; deep rollback (> n_rs_seq) falls back to a full clear (rm_all,
+    // which always succeeds) instead of an unguarded bounded seq_rm that would
+    // GGML_ABORT(). Shallow rollback (<= n_rs_seq) must still take the fast
+    // bounded-rollback path (not silently fall back every time). Own process
+    // invocation, same rationale as case 3/4.
+    if (getenv("XCALL_CASE6_ONLY") != nullptr) {
+        // --- deep rollback: must NOT abort, must fall back to a full clear ---
+        {
+            llama_context * ctx = make_ctx(params, model, n_rs_seq);
+            if (ctx == nullptr || !decode_sequential(ctx, tokens, n_decode)) {
+                fprintf(stderr, "%s : case 6 (deep): setup failed\n", __func__);
+                return 2;
+            }
+
+            const llama_pos p0_deep       = 1; // rollback = n_decode - 1, guaranteed > n_rs_seq
+            const llama_pos pos_cur       = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+            const int64_t   n_rollback    = (int64_t) pos_cur - (int64_t) p0_deep + 1;
+            const bool      deep          = n_rollback > (int64_t) n_rs_seq;
+
+            fprintf(stderr, "%s : case 6 (deep): pos_cur=%d p0=%d n_rollback=%" PRId64 " n_rs_seq=%u deep=%d\n",
+                    __func__, pos_cur, p0_deep, n_rollback, n_rs_seq, (int) deep);
+
+            if (!deep) {
+                fprintf(stderr, "%s : case 6 (deep): FAILED -- test construction bug, not actually deep\n", __func__);
+                return 1;
+            }
+
+            // guard logic: fall back to full clear instead of the unguarded bounded seq_rm
+            if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1)) {
+                fprintf(stderr, "%s : case 6 (deep): FAILED -- even the full-clear fallback was rejected\n", __func__);
+                return 1;
+            }
+
+            // context must remain usable after the fallback (fresh sequence at pos 0)
+            if (!decode_one(ctx, tokens[0], 0)) {
+                fprintf(stderr, "%s : case 6 (deep): FAILED -- context unusable after full-clear fallback\n", __func__);
+                return 1;
+            }
+            fprintf(stderr, "%s : case 6 (deep): PASSED -- no abort, full-clear fallback taken, context usable\n", __func__);
+        }
+
+        // --- shallow rollback: must take the fast bounded path, not fall back ---
+        {
+            llama_context * ctx = make_ctx(params, model, n_rs_seq);
+            if (ctx == nullptr || !decode_sequential(ctx, tokens, n_decode)) {
+                fprintf(stderr, "%s : case 6 (shallow): setup failed\n", __func__);
+                return 2;
+            }
+
+            const llama_pos p0_shallow = (llama_pos) (n_decode - 2); // rollback depth 2, well within n_rs_seq=6
+            const llama_pos pos_cur    = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+            const int64_t   n_rollback = (int64_t) pos_cur - (int64_t) p0_shallow + 1;
+            const bool      deep       = n_rollback > (int64_t) n_rs_seq;
+
+            fprintf(stderr, "%s : case 6 (shallow): pos_cur=%d p0=%d n_rollback=%" PRId64 " n_rs_seq=%u deep=%d\n",
+                    __func__, pos_cur, p0_shallow, n_rollback, n_rs_seq, (int) deep);
+
+            if (deep) {
+                fprintf(stderr, "%s : case 6 (shallow): FAILED -- test construction bug, should be shallow\n", __func__);
+                return 1;
+            }
+
+            // guard logic: this depth must take the fast bounded seq_rm, not the full-clear fallback
+            if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, p0_shallow, -1)) {
+                fprintf(stderr, "%s : case 6 (shallow): FAILED -- fast bounded rollback path was rejected "
+                                 "(should have succeeded within n_rs_seq)\n", __func__);
+                return 1;
+            }
+            fprintf(stderr, "%s : case 6 (shallow): PASSED -- fast bounded rollback path taken, no fallback needed\n", __func__);
+        }
+
+        return 0;
     }
 
     // Case 5: decode-throughput overhead of the rotation fix's extra cont+concat
