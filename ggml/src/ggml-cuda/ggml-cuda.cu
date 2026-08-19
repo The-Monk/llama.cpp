@@ -74,6 +74,7 @@
 #include "ggml-cuda/mxfp8_selftest.cuh"
 #include "ggml-cuda/mul_mat_2of4_fp8.cuh"
 #include "ggml-cuda/mul_mat_2of4_fp8_mmq.cuh"
+#include "ggml-cuda/mul_mat_2of4_t1_mmq.cuh"
 #include "ggml-cuda/mul_mat_dense_fp8_v3.cuh"
 #include "ggml-cuda/mul_mat_dense_fp8_mmq.cuh"
 #include "ggml-cuda/int4_24_probe.cuh"
@@ -1900,6 +1901,27 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const bool ok = ggml_cuda_op_mul_mat_2of4_fp8(ctx, src0, src1, dst);
         GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_2of4_fp8 does not support this tensor shape");
         return;
+    }
+
+    // 2of4_t1 (q2.4) SWMMAC prefill: batch > MMVQ_MAX_BATCH_SIZE MUL_MAT goes
+    // through the RDNA4 sparse pipes (mul_mat_2of4_t1_mmq.cu) instead of the
+    // dequant-to-f16 fallback. Default ON; GGML_HIP_2OF4_T1_MMQ=0 restores the
+    // fallback (the PPL A/B lever). Decode (ne1 <= 8) stays on the existing
+    // mmvq path via the normal dispatch below. MUL_MAT only, single-GPU only
+    // (same scope as the 2OF4_FP8 hooks above).
+    if (src0->type == GGML_TYPE_2OF4_T1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+            src1->ne[1] > MMVQ_MAX_BATCH_SIZE && ggml_is_contiguous(src1) &&
+            GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        static const bool t1_mmq_enabled = [] {
+            const char * env = getenv("GGML_HIP_2OF4_T1_MMQ");
+            return env == nullptr || strcmp(env, "0") != 0;
+        }();
+        if (t1_mmq_enabled) {
+            const bool ok = ggml_cuda_op_mul_mat_2of4_t1_mmq(ctx, src0, src1, dst);
+            GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_2of4_t1_mmq does not support this tensor shape");
+            return;
+        }
     }
 
     // T162 follow-up (coordinator directive, "the missing measurement"): a

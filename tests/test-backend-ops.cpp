@@ -8908,6 +8908,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+    // 2of4_t1 SWMMAC prefill path (mul_mat_2of4_t1_mmq.cu): batch > 8 MUL_MAT
+    // at model-like shapes -- covers both tile geometries (N<=1024 -> 64x64x8,
+    // else 128x128x8) and the need_check edges (M and N not tile multiples).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_2OF4_T1, GGML_TYPE_F32,   96,   9,  256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_2OF4_T1, GGML_TYPE_F32,   64,  16,  128, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_2OF4_T1, GGML_TYPE_F32,  256,  32,  512, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_2OF4_T1, GGML_TYPE_F32, 1024, 512, 1024, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_2OF4_T1, GGML_TYPE_F32, 4096, 512, 2048, {1, 1}, {1, 1}));
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
