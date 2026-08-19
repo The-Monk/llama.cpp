@@ -499,11 +499,29 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         // TODO: this logic incorrectly assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are
         //       inside the same ubatch. currently with `split_equal()` this is not correct
 
-        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+        const int64_t K       = (int64_t) cparams.n_rs_seq + 1;
+        const int64_t n_new   = conv_input->ne[0] - conv_states->ne[0]; // tokens genuinely new to this call
+        const int64_t n_fresh = std::min<int64_t>(n_new, K);           // slots derivable purely from this call's own window
 
-        for (int64_t t = 1; t <= K; ++t) {
-            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
-            const int64_t s_slot = K - t;
+        // [FIX card SSM-ROLLBACK-2] same bug class as build_recurrent_attn below: for
+        // n_new < K (ordinary single/few-token decode calls), slot s_idx used to clamp
+        // to 0 for every s_slot >= n_fresh, so all of those slots read the *same*
+        // pre-call window -- duplicating "n_fresh tokens back" into every deeper slot
+        // instead of the true n_fresh..K-1-tokens-back history.
+        //
+        // Fix: rotate the surviving K - n_fresh old groups forward by n_fresh, and
+        // combine them with this call's n_fresh freshly-computed slots into a single
+        // tensor (via ggml_concat) that is written to the cache in *one* ggml_cpy.
+        // This must be a single write with an explicit data dependency on the old-tail
+        // read, not two separate ggml_cpy calls that alias conv_states_all with no
+        // src/dst edge between them -- that ordering is not guaranteed by the backend
+        // (confirmed empirically: it silently regressed the previously-correct
+        // rollback==n_fresh case). Each per-slot fresh window is materialized
+        // (ggml_cont) and reshaped to (row_count, n_seqs, 1) so it has the same shape
+        // as the old-tail slots and can be concatenated with them along the slot dim.
+        ggml_tensor * combined = nullptr;
+        for (int64_t s_slot = 0; s_slot < n_fresh; ++s_slot) {
+            const int64_t s_idx = n_new - s_slot;
 
             ggml_tensor * conv_state_last =
                 ggml_view_3d(ctx0, conv_input,
@@ -511,14 +529,31 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                         conv_input->nb[1], conv_input->nb[2],
                         ggml_row_size(conv_input->type, s_idx));
 
-            ggml_tensor * conv_state_update =
-                ggml_view_2d(ctx0,
-                        conv_states_all, row_count, n_seqs,
-                        conv_states_all->nb[1],
-                        (s_slot * mem_size + kv_head) * row_size);
+            conv_state_last = ggml_reshape_3d(ctx0, ggml_cont(ctx0, conv_state_last), row_count, n_seqs, 1);
 
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+            combined = combined == nullptr ? conv_state_last : ggml_concat(ctx0, combined, conv_state_last, 2);
         }
+
+        if (n_fresh < K) {
+            ggml_tensor * old_tail = ggml_view_3d(ctx0, conv_states_all,
+                    row_count, n_seqs, K - n_fresh,
+                    conv_states_all->nb[1],
+                    (size_t) mem_size * row_size,
+                    (size_t) kv_head * row_size);
+
+            ggml_tensor * old_tail_staged = ggml_cont(ctx0, old_tail);
+
+            combined = combined == nullptr ? old_tail_staged : ggml_concat(ctx0, combined, old_tail_staged, 2);
+        }
+
+        ggml_tensor * conv_state_update =
+            ggml_view_3d(ctx0, conv_states_all,
+                    row_count, n_seqs, combined->ne[2],
+                    conv_states_all->nb[1],
+                    (size_t) mem_size * row_size,
+                    (size_t) kv_head * row_size);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, combined, conv_state_update));
     }
 
     return conv_input;
@@ -584,55 +619,67 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
-    // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
+    // op writes the last min(n_seq_tokens, K) snapshots; trailing slots need
+    // history from before this call (see rotation fix below)
     const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
 
-    // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)
+    // [FIX card SSM-ROLLBACK-2, supersedes SSM-ROLLBACK-1] ggml_gated_delta_net()
+    // can only ever produce n_written = min(n_seq_tokens, K) snapshots from THIS
+    // call's own tokens -- it starts from the single collapsed input state `s`,
+    // not a K-deep stack. SSM-ROLLBACK-1 carried the pre-call state `s` forward
+    // into every unwritten slot n_written..K-1 unchanged, which is only correct
+    // for the *first* such slot (rollback == n_written, "undo everything this
+    // call did") -- every deeper slot instead needs history from *before* this
+    // call, which SSM-ROLLBACK-1 never provided. Consecutive single-token calls
+    // (n_seq_tokens=1, the shape of ordinary autoregressive/chat decoding, as
+    // opposed to a single multi-token spec-decode verify call) are exactly the
+    // case where this bites: rollback groups 2..K-1 silently returned "1 token
+    // back" data for every deeper depth, instead of the true 2..K-1-tokens-back
+    // state. Measured (tests/test-recurrent-rollback-crosscall.cpp, cross-call
+    // case): max|delta logit| ~8.0 vs ~0.2 baseline chunked-vs-sequential fp
+    // noise on the same model -- state corruption, not rounding.
+    //
+    // Fix: rotate the K-deep snapshot stack forward by n_written so slot j >=
+    // n_written keeps holding "j tokens back" across call boundaries: old slot i
+    // (0 <= i < K - n_written) becomes new slot i + n_written, and this call's
+    // own fresh snapshots fill slots [0, n_written). The old tail is snapshotted
+    // into an independent buffer (ggml_cont) and concatenated with the fresh
+    // snapshots into a *single* combined tensor, which is then written to the
+    // cache in *one* ggml_cpy. This is required for correctness, not just style:
+    // writing the fresh slots and the shifted-old-tail slots as two separate
+    // ggml_cpy calls both aliasing ssm_states_all with no src/dst edge between
+    // them gave the backend/graph-capture no ordering guarantee, and the old
+    // tail was observed being staged *after* the fresh write in practice --
+    // corrupting exactly the previously-correct rollback==n_written case.
+    // Concat makes the single write's source data-depend on both producers, so
+    // topological order (old tail read before the write) is enforced structurally.
     ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
         D, n_seqs, n_written,
         ggml_row_size(gdn_out->type, D),
         ggml_row_size(gdn_out->type, state_size_per_snap),
         ggml_row_size(gdn_out->type, attn_score_elems));
 
+    ggml_tensor * combined = src;
+    if (n_written < K) {
+        ggml_tensor * old_tail = ggml_view_3d(ctx0, ssm_states_all,
+            D, n_seqs, K - n_written,
+            ssm_states_all->nb[1],
+            (size_t) mem_size * row_size,
+            (size_t) kv_head * row_size);
+
+        ggml_tensor * old_tail_staged = ggml_cont(ctx0, old_tail);
+
+        combined = ggml_concat(ctx0, src, old_tail_staged, 2);
+    }
+
+    // write the produced+rotated snapshots into the recurrent cache (snapshot slot i -> rollback group i)
     ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all,
-        D, n_seqs, n_written,
+        D, n_seqs, combined->ne[2],
         ssm_states_all->nb[1],
         (size_t) mem_size * row_size,
         (size_t) kv_head * row_size);
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
-
-    // [FIX card SSM-ROLLBACK-1] ggml_gated_delta_net() can only ever produce
-    // n_written = min(n_seq_tokens, K) snapshots -- a rollback depth deeper than
-    // n_seq_tokens would need history this op call was never given (it starts
-    // from the single collapsed state `s`, not a K-deep stack). When the caller
-    // sizes n_rs_seq to the draft block width (the common spec-decode case,
-    // n_rs_seq == draft.n_max), n_seq_tokens is *always* <= n_rs_seq, so
-    // n_written < K on *every* verify call and slot index n_written (rollback ==
-    // "reject every token this call produced", the ordinary full-block-reject
-    // path) was left permanently unwritten -- reading it returned whatever
-    // stale/garbage data happened to occupy that row. Measured effect (see
-    // ssm-rollback-repro): max|Δlogit| ~1.7 on a full-block-reject rollback vs.
-    // ~0.1 baseline chunked-vs-sequential fp noise -- a state-corruption bug,
-    // not rounding.
-    //
-    // Fix: slot n_written (and, defensively, every slot beyond it up to K-1,
-    // which a well-formed caller should never reach since rollback is always
-    // bounded by the width of the *most recent* call) is exactly "zero new
-    // tokens from this call applied" == the untouched input state `s`. Carry it
-    // forward unchanged into those trailing slots so a full-block-reject
-    // rollback reads back the true pre-call state instead of stale memory.
-    if (n_written < K) {
-        ggml_tensor * s_flat = ggml_reshape_2d(ctx0, s, D, n_seqs);
-
-        for (int64_t slot = n_written; slot < K; ++slot) {
-            ggml_tensor * dst_carry = ggml_view_2d(ctx0, ssm_states_all,
-                D, n_seqs, ssm_states_all->nb[1],
-                (size_t) (kv_head + (uint32_t) slot * mem_size) * row_size);
-
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, s_flat, dst_carry));
-        }
-    }
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, combined, dst));
 
     return output;
 }

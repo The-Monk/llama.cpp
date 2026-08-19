@@ -253,6 +253,10 @@ set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED 
 llama_build_and_test(test-recurrent-state-rollback.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# Cross-call recurrent-state rollback repro (run manually with -m <hybrid model>, e.g. Bonsai-27B).
+# Not wired to the CI download-model fixture (that model isn't hybrid/recurrent).
+llama_build(test-recurrent-rollback-crosscall.cpp)
+
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
