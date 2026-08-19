@@ -438,13 +438,30 @@ bool ggml_cuda_op_mul_mat_f8e4m3_hipblaslt(ggml_backend_cuda_context & ctx, cons
 
     static const int mode = (getenv("GGML_HIP_F8E4M3_HIPBLASLT_FP8") != nullptr) ? MODE_F8 : MODE_I8;
 
-    // ---- weight -> int8/e4m3 (per-output-channel): bounded cache, pool fallback ----
+    // ---- weight -> int8/e4m3 (per-output-channel): convert-once cache ----
+    // Only static weight buffers are cached: compute-pool tensors alias device
+    // addresses across graph nodes (stale-hit hazard) and are transient anyway.
+    // On a cache miss (budget / VRAM guard / non-weights buffer) do NOT convert
+    // per call: the starved-cache mode re-runs k_requant_* every ubatch and is
+    // strictly worse than the mmq path it displaces (measured pp512 vs mmq:
+    // 1.7B fp8 -29%, 8B fp8 -12%; same mechanism as Q2_0 route's -10% at 27B).
+    // Return false -> caller falls through to mmq. Set
+    // GGML_HIP_F8E4M3_HIPBLASLT_FORCE=1 to restore the old always-route
+    // behavior (test-backend-ops probes, A/B experiments).
     int8_t * wq8_ptr = nullptr;
     float  * wsc_ptr = nullptr;
     ggml_cuda_pool_alloc<int8_t> wq8_pool;
     ggml_cuda_pool_alloc<float>  wsc_pool;
-    const cached_w * cw = try_cache_weight(src0->data, (const char *)src0->data, src0->nb[1],
-                                           N, K, n_blocks, mode, stream);
+    static const bool route_force = (getenv("GGML_HIP_F8E4M3_HIPBLASLT_FORCE") != nullptr);
+    const bool src0_cacheable = src0->buffer != nullptr &&
+        ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+    const cached_w * cw = src0_cacheable
+        ? try_cache_weight(src0->data, (const char *)src0->data, src0->nb[1],
+                           N, K, n_blocks, mode, stream)
+        : nullptr;
+    if (cw == nullptr && !route_force) {
+        return false;
+    }
     // Pre-flight VRAM guard: fall back to mmq (return false) instead of letting a pool
     // alloc OOM-abort when a near-full model leaves too little free VRAM for the transient
     // int8/fp8 + accumulator + GEMM-workspace buffers.
