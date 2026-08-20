@@ -6,31 +6,60 @@
 #   bash    -> drop to a shell
 set -euo pipefail
 
-MODEL="${MODEL:-/models/Qwen3-8B-F8E4M3.gguf}"
+MODEL="${MODEL:-/models/Qwen3-8B-Quark-F8E4M3.gguf}"
+
+# Subcommands that need a model check for one; `bash` and a model-less `serve`
+# must still work. An earlier revision exited here unconditionally, which broke
+# both -- the guard has to sit inside the dispatch, not before it.
+require_model() {
+  [ -f "$MODEL" ] && return 0
+  echo "ERROR: no GGUF at $MODEL" >&2
+  echo "  Mount your model dir:  -v /path/to/models:/models:ro" >&2
+  echo "  Name it if it differs: -e MODEL=/models/<file>.gguf" >&2
+  echo "  Present in /models:" >&2
+  ls -1 /models 2>/dev/null | sed "s|^|    |" >&2 || echo "    (nothing mounted at /models)" >&2
+  exit 1
+}
 MODEL_NAME="${MODEL_NAME:-Qwen3-8B-FP8}"
 LEM_CACHE="${LEMONADE_CACHE_DIR:-/root/.cache/lemonade}"
 PORT="${LEMONADE_PORT:-13305}"
 
+# Serving defaults. The README documents continuous batching as on by default,
+# so it has to actually be passed -- an earlier version of this file documented
+# it and never set it. Override wholesale with LLAMA_ARGS=...
+LLAMA_ARGS="${LLAMA_ARGS:--ngl 999 --cont-batching}"
+
+# Activation-quant dedup: verified lossless across every shipped format
+# (VALIDATION-2026-08-11.md; PPL byte-identical) and the cheapest decode
+# capture on the board, so the appliance defaults it ON for all subcommands.
+# ggml's check is PRESENCE-based (any value, even empty, enables), so the only
+# way to disable is to unset: pass -e GGML_HIP_DEDUP_MMVQ_QUANT=0 and this
+# block unsets it. Anything else (including leaving it alone) means enabled.
+for _v in GGML_HIP_DEDUP_MMVQ_QUANT GGML_HIP_DEDUP_MMVQ_QUANT_BATCH; do
+  eval "_val=\${$_v:-1}"
+  if [ "$_val" = "0" ]; then unset "$_v"; else export "$_v=1"; fi
+done
+unset _v _val
+
 register_model() {
   # Direct-path checkpoint: lemonade uses it verbatim when the file exists.
+  # LLAMA_ARGS is passed through recipe_options.llamacpp_args -- that is the
+  # mechanism by which --cont-batching actually reaches llama-server. A prior
+  # revision defined LLAMA_ARGS and never used it, so the documented default
+  # was silently not applied (caught by the 2026-08-10 validation pass).
   mkdir -p "$LEM_CACHE"
-  /opt/venv/bin/python - "$MODEL_NAME" "$MODEL" "$LEM_CACHE" <<'PY'
+  /opt/venv/bin/python - "$MODEL_NAME" "$MODEL" "$LEM_CACHE" "$LLAMA_ARGS" <<'PY'
 import json, os, sys
-name, ckpt, cache = sys.argv[1], sys.argv[2], sys.argv[3]
+name, ckpt, cache, llama_args = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 f = os.path.join(cache, "user_models.json")
 data = {}
 if os.path.exists(f):
     data = json.load(open(f))
-# Bake in the validated serving config (override with LLAMA_ARGS env).
-# Default: continuous batching (multi-user / vLLM-replacement; 35B-A3B fp8 peaks
-# ~537 t/s @ npl~114, mod-4 alignment, f16-KV only). Single-user latency:
-# LLAMA_ARGS="-ngl 999 --spec-type draft-mtp --spec-draft-n-max 8" (MTP, 27B 18->45).
-llama_args = os.environ.get("LLAMA_ARGS", "-ngl 999 --cont-batching --reasoning off")
 data[name] = {"checkpoint": ckpt, "recipe": "llamacpp",
-              "recipe_options": {"llamacpp_args": llama_args, "merge_args": True},
+              "recipe_options": {"llamacpp_args": llama_args},
               "suggested": True, "labels": ["custom"], "source": "local_upload"}
 json.dump(data, open(f, "w"))
-print(f"registered {name} -> {ckpt}")
+print(f"registered {name} -> {ckpt} (llamacpp_args: {llama_args})")
 PY
   # Force rocm backend + our binaries
   CFG="$LEM_CACHE/config.json"
@@ -41,7 +70,6 @@ c = json.load(open(f)) if os.path.exists(f) else {}
 c.setdefault("llamacpp", {})
 c["llamacpp"]["backend"] = "rocm"
 c["llamacpp"]["prefer_system"] = False
-c["disable_model_filtering"] = True   # local direct-path models show in the chat picker
 c["port"] = int(os.environ.get("LEMONADE_PORT", "13305"))
 c["host"] = "0.0.0.0"
 json.dump(c, open(f, "w"))
@@ -55,20 +83,14 @@ case "${1:-serve}" in
     exec /opt/venv/bin/lemonade-server-dev serve --host 0.0.0.0 --port "$PORT" --llamacpp rocm
     ;;
   bench)
+    require_model
     shift
-    exec /opt/llama/llama-bench -m "$MODEL" "${@:--p 128 -n 32 -ngl 99}"
+    exec /opt/llama/llama-bench -m "$MODEL" $( [ $# -eq 0 ] && echo "-p 128 -n 32 -ngl 99" ) "$@"
     ;;
   ppl)
+    require_model
     shift
     exec /opt/llama/llama-perplexity -m "$MODEL" "$@"
-    ;;
-  lookup)
-    # Drafter-free n-gram prompt-lookup decode — fast single-stream on repetitive/
-    # code/RAG output (no draft model, no extra VRAM). 27B 18->134, A3B 66->298 t/s
-    # at draft-max~12. temp=0 greedy is exact modulo fp8 rounding. Pass -f/-p + args.
-    shift
-    exec /opt/llama/llama-lookup -m "$MODEL" -ngl 999 \
-         --spec-draft-n-max "${DRAFT_MAX:-12}" "$@"
     ;;
   bash|sh)
     exec /bin/bash
