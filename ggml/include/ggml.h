@@ -766,6 +766,43 @@ extern "C" {
     GGML_API double ggml_type_sizef(enum ggml_type type), // ggml_type_size()/ggml_blck_size() as float
     "use ggml_row_size() instead");
 
+    // --- A5: Q2_0 dual group-size support (PORT-MANIFEST.md section A5) ---
+    // GGML_TYPE_Q2_0 = 42 serves BOTH group sizes (g64, upstream's block_q2_0;
+    // g128, this fork's format) under one public type id. The variant is
+    // detected per model at GGUF load time and bound PER TENSOR (never a
+    // second ggml_type, never serialized). ggml_blck_size()/ggml_type_size()
+    // fall back to the process-wide DEFAULT (below) only when called without
+    // a tensor in hand -- callers that have a tensor MUST prefer
+    // ggml_q2_0_variant_of(tensor) on the inference path.
+    enum ggml_q2_0_variant {
+        GGML_Q2_0_VARIANT_UNSET = 0,
+        GGML_Q2_0_VARIANT_G64   = 64,
+        GGML_Q2_0_VARIANT_G128  = 128,
+    };
+
+    // Per-tensor variant, read from tensor->extra (free in the CUDA backend,
+    // see PORT-MANIFEST.md A5.4c). Returns the process-wide default if the
+    // tensor's type is not GGML_TYPE_Q2_0 or extra was never bound.
+    GGML_API enum ggml_q2_0_variant ggml_q2_0_variant_of(const struct ggml_tensor * tensor);
+    // Binds a tensor to a variant (loader-only API; does not allocate/free
+    // tensor->extra beyond a single malloc'd tag -- see ggml.c).
+    GGML_API void ggml_q2_0_variant_bind(struct ggml_tensor * tensor, enum ggml_q2_0_variant variant);
+
+    // Process-wide DEFAULT: the fallback used by the bare ggml_blck_size()/
+    // ggml_type_size()/ggml_row_size() accessors when GGML_TYPE_Q2_0 is
+    // queried with no tensor available (e.g. llama-quantize output sizing).
+    // NOT an exclusive binding -- a second, different per-tensor variant is
+    // still allowed to coexist (A5.4). UNSET reads back as G128 (this fork's
+    // corpus default).
+    GGML_API void                   ggml_q2_0_variant_set_default(enum ggml_q2_0_variant variant);
+    GGML_API enum ggml_q2_0_variant ggml_q2_0_variant_get_default(void);
+
+    // Number of live distinct Q2_0 variants seen since process start (via
+    // ggml_q2_0_variant_bind). Used by the debug-assertion residue (A5.4e):
+    // a bare accessor call for GGML_TYPE_Q2_0 while this is > 1 indicates a
+    // caller that should have used ggml_q2_0_variant_of() instead.
+    GGML_API int ggml_q2_0_variant_live_count(void);
+
     GGML_API const char * ggml_type_name(enum ggml_type type);
     GGML_API const char * ggml_op_name  (enum ggml_op   op);
     GGML_API const char * ggml_op_symbol(enum ggml_op   op);

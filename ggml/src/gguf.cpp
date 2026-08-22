@@ -4,6 +4,7 @@
 #include "gguf.h"
 
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -448,6 +449,96 @@ bool gguf_read_emplace_helper(const struct gguf_reader & gr, std::vector<struct 
     return true;
 }
 
+// --- A5: Q2_0 dual group-size detection (PORT-MANIFEST.md section A5.2) ---
+//
+// MUST run here, inside gguf.cpp, BEFORE the per-tensor ggml_new_tensor()
+// loop below -- not in llama-model-loader.cpp as an earlier draft of the
+// design assumed. ggml_new_tensor_impl() bakes nb[] from the CURRENT
+// process-wide ggml_blck_size()/ggml_type_size() default at the moment each
+// tensor object is created (ggml.c:1828-1900); llama-model-loader.cpp only
+// gets tensors back *after* this loop has already run, by which point every
+// Q2_0 tensor's nb[] is already fixed using whatever the default was. This
+// is the one place in the whole load path where "detect, then bind" can
+// still change the outcome.
+//
+// Detection method (A5.2): byte-extent arithmetic on the LARGEST Q2_0
+// tensor in the file (largest = least sensitive to alignment slack) --
+// g64 = 0.28125 B/element, g128 = 0.265625 B/element, a 5.6% gap. Row-length
+// divisibility is a disqualifier only. general.file_type is corroboration
+// only, never decisive (Landmine B: this fork has a known C<->Python ftype
+// desync). Inconclusive -> refuse to load and report, never guess.
+static bool gguf_detect_and_bind_q2_0_variant(struct gguf_context * ctx, enum ggml_q2_0_variant * out_variant) {
+    *out_variant = GGML_Q2_0_VARIANT_UNSET;
+
+    int64_t   best_idx = -1;
+    int64_t   best_n_elements = -1;
+    for (size_t i = 0; i < ctx->info.size(); ++i) {
+        if (ctx->info[i].t.type != GGML_TYPE_Q2_0) {
+            continue;
+        }
+        int64_t n_elements = 1;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            n_elements *= ctx->info[i].t.ne[d];
+        }
+        if (n_elements > best_n_elements) {
+            best_n_elements = n_elements;
+            best_idx = (int64_t) i;
+        }
+    }
+
+    if (best_idx < 0) {
+        return true; // no Q2_0 tensors in this file -- nothing to detect, not an error
+    }
+
+    const struct gguf_tensor_info & best = ctx->info[best_idx];
+
+    // Real on-disk byte extent: offset of the next tensor by file position
+    // minus this tensor's offset (or, if this is the last tensor, the end
+    // of the data blob). Table-independent -- this is exactly the ground
+    // truth that caught gguf-py's own mis-report of a real g64 file as
+    // g128 this session (PR-116-NUMBERS.md section 4).
+    uint64_t next_offset = UINT64_MAX;
+    for (size_t i = 0; i < ctx->info.size(); ++i) {
+        if (ctx->info[i].offset > best.offset && ctx->info[i].offset < next_offset) {
+            next_offset = ctx->info[i].offset;
+        }
+    }
+    const uint64_t extent = (next_offset == UINT64_MAX) ? (ctx->size - best.offset) : (next_offset - best.offset);
+    const double   bytes_per_elem = (double) extent / (double) best_n_elements;
+
+    const double g64_bpe  = (2.0 +  64.0 / 4.0) /  64.0; // 0.28125
+    const double g128_bpe = (2.0 + 128.0 / 4.0) / 128.0; // 0.265625
+    const double tol = 0.005; // dwarfed by the 5.6% gap between the two candidates
+
+    // Secondary: divisibility disqualifier.
+    const bool divisible_64  = (best.t.ne[0] % 64)  == 0;
+    const bool divisible_128 = (best.t.ne[0] % 128) == 0;
+
+    bool is_g64  = divisible_64  && fabs(bytes_per_elem - g64_bpe)  < tol;
+    bool is_g128 = divisible_128 && fabs(bytes_per_elem - g128_bpe) < tol;
+
+    if (is_g64 == is_g128) { // neither matched, or (shouldn't happen) both matched
+        GGML_LOG_ERROR("%s: Q2_0 variant detection INCONCLUSIVE for tensor '%s': "
+                        "%.6f bytes/element (want %.6f for g64 or %.6f for g128), refusing to load\n",
+                        __func__, best.t.name, bytes_per_elem, g64_bpe, g128_bpe);
+        return false;
+    }
+
+    *out_variant = is_g64 ? GGML_Q2_0_VARIANT_G64 : GGML_Q2_0_VARIANT_G128;
+
+    // Tertiary: general.file_type, corroboration only -- log a mismatch,
+    // never let it override the byte-arithmetic verdict (Landmine B).
+    const int64_t ftype_key = gguf_find_key(ctx, "general.file_type");
+    if (ftype_key >= 0 && gguf_get_kv_type(ctx, ftype_key) == GGUF_TYPE_UINT32) {
+        GGML_LOG_INFO("%s: Q2_0 variant detected as %s (%.6f B/elem on '%s'); "
+                       "general.file_type=%u present as corroboration only, not consulted\n",
+                       __func__, is_g64 ? "g64" : "g128", bytes_per_elem, best.t.name,
+                       gguf_get_val_u32(ctx, ftype_key));
+    }
+
+    return true;
+}
+
 static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr, struct gguf_init_params params) {
     struct gguf_context * ctx = new gguf_context;
 
@@ -708,32 +799,15 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
                 ok = false;
                 break;
             }
-            const size_t  type_size = ggml_type_size(info.t.type);
-            const int64_t blck_size = ggml_blck_size(info.t.type);
-
-            // check that row size is divisible by block size
-            if (blck_size == 0 || info.t.ne[0] % blck_size != 0) {
-                GGML_LOG_ERROR("%s: tensor '%s' of type %d (%s) has %" PRId64 " elements per row, "
-                    "not a multiple of block size (%" PRId64 ")\n",
-                    __func__, info.t.name, (int) info.t.type, ggml_type_name(info.t.type), info.t.ne[0], blck_size);
-                ok = false;
-                break;
-            }
-
-            // check that the size of the tensor in bytes is representable
-            if (ok && uint64_t(ggml_nelements(&info.t)/ggml_blck_size(info.t.type)) > SIZE_MAX/ggml_type_size(info.t.type)) {
-                GGML_LOG_ERROR("%s: tensor '%s' with shape (%" PRIi64 ", %" PRIi64 ", %" PRIi64 ", %" PRIi64 ") has a size in bytes > %zu\n",
-                    __func__, info.t.name, info.t.ne[0], info.t.ne[1], info.t.ne[2], info.t.ne[3], SIZE_MAX);
-                ok = false;
-                break;
-            }
-
-            // calculate byte offsets given the tensor shape and type
-            info.t.nb[0] = type_size;
-            info.t.nb[1] = info.t.nb[0]*(info.t.ne[0]/blck_size);
-            for (int j = 2; j < GGML_MAX_DIMS; ++j) {
-                info.t.nb[j] = info.t.nb[j - 1]*info.t.ne[j - 1];
-            }
+            // A5: type_size/blck_size/divisibility/nb[] computation deferred
+            // to a follow-up pass below (once ctx->info is fully populated
+            // and the Q2_0 group-size variant for THIS file has been
+            // detected) -- see the note after this loop. Doing this inline,
+            // per-tensor, as the original code did, computes it from
+            // whatever the process default happened to be when THIS
+            // tensor's info was read, which for Q2_0 can be wrong (still
+            // UNSET/stale-from-a-previous-file) for tensors read before the
+            // file's largest Q2_0 tensor has even been seen.
         }
         if (!ok) {
             break;
@@ -751,6 +825,63 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
         return nullptr;
     }
     GGML_ASSERT(int64_t(ctx->info.size()) == n_tensors);
+
+    // A5: detect this file's Q2_0 group-size variant (if any) now that every
+    // tensor's raw type/ne/offset has been read (needs the WHOLE ctx->info,
+    // not just tensors seen so far -- the largest Q2_0 tensor used for
+    // detection is not necessarily early in the file), and set it as the
+    // process default BEFORE any type_size/blck_size/nb[] computation runs
+    // below. See gguf_detect_and_bind_q2_0_variant()'s own comment for why
+    // this must live in gguf.cpp and not llama-model-loader.cpp.
+    enum ggml_q2_0_variant q2_0_variant = GGML_Q2_0_VARIANT_UNSET;
+    if (ok) {
+        ok = ok && gguf_detect_and_bind_q2_0_variant(ctx, &q2_0_variant);
+        if (!ok) {
+            gguf_free(ctx);
+            return nullptr;
+        }
+        if (q2_0_variant != GGML_Q2_0_VARIANT_UNSET) {
+            ggml_q2_0_variant_set_default(q2_0_variant);
+        }
+    }
+
+    // Follow-up pass: now that the variant is known, compute per-tensor
+    // type_size/blck_size-derived fields (divisibility check + nb[]) for
+    // every tensor. This is the part that was originally inline in the
+    // per-tensor read loop above; A5 requires it to run strictly after
+    // detection, hence the split into two passes.
+    for (size_t i = 0; ok && i < ctx->info.size(); ++i) {
+        struct ggml_tensor & t = ctx->info[i].t;
+
+        const size_t  type_size  = ggml_type_size(t.type);
+        const int64_t blck_size  = ggml_blck_size(t.type);
+
+        if (blck_size == 0 || t.ne[0] % blck_size != 0) {
+            GGML_LOG_ERROR("%s: tensor '%s' of type %d (%s) has %" PRId64 " elements per row, "
+                "not a multiple of block size (%" PRId64 ")\n",
+                __func__, t.name, (int) t.type, ggml_type_name(t.type), t.ne[0], blck_size);
+            ok = false;
+            break;
+        }
+
+        if (uint64_t(ggml_nelements(&t)/blck_size) > SIZE_MAX/type_size) {
+            GGML_LOG_ERROR("%s: tensor '%s' with shape (%" PRIi64 ", %" PRIi64 ", %" PRIi64 ", %" PRIi64 ") has a size in bytes > %zu\n",
+                __func__, t.name, t.ne[0], t.ne[1], t.ne[2], t.ne[3], SIZE_MAX);
+            ok = false;
+            break;
+        }
+
+        t.nb[0] = type_size;
+        t.nb[1] = t.nb[0]*(t.ne[0]/blck_size);
+        for (int j = 2; j < GGML_MAX_DIMS; ++j) {
+            t.nb[j] = t.nb[j - 1]*t.ne[j - 1];
+        }
+    }
+    if (!ok) {
+        GGML_LOG_ERROR("%s: failed to compute tensor byte offsets\n", __func__);
+        gguf_free(ctx);
+        return nullptr;
+    }
 
     // we require the data section to be aligned, so take into account any padding
     if (n_tensors > 0 && !gr.seek(GGML_PAD(gr.tell(), ctx->alignment))) {
@@ -887,6 +1018,19 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
 
         ggml_set_no_alloc(ctx_data, true);
 
+        // A5: q2_0_variant was already detected (and set as the process
+        // default) in the earlier pass above, right after ctx->info was
+        // fully populated -- it must run there, before the type_size/
+        // blck_size/nb[] follow-up pass above, not here. This tensor-
+        // creation loop's ggml_new_tensor() calls also read that same
+        // process default when computing nb[] for each new tensor object,
+        // so by this point it is already correct. Here we only bind each
+        // created tensor to its variant PER-TENSOR (tensor->extra), so a
+        // later file load in the same process -- which changes the process
+        // default again -- cannot retroactively corrupt this file's already-
+        // created tensors (PORT-MANIFEST.md A5.4e: two variants coexist
+        // per-process).
+
         // create the tensors
         for (size_t i = 0; i < ctx->info.size(); ++i) {
             const struct gguf_tensor_info & info = ctx->info[i];
@@ -897,6 +1041,10 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
 
             if (!ok) {
                 break;
+            }
+
+            if (cur->type == GGML_TYPE_Q2_0 && q2_0_variant != GGML_Q2_0_VARIANT_UNSET) {
+                ggml_q2_0_variant_bind(cur, q2_0_variant);
             }
 
             ggml_set_name(cur, info.t.name);

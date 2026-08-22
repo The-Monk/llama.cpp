@@ -1366,7 +1366,14 @@ size_t ggml_nbytes(const struct ggml_tensor * tensor) {
         }
     }
     else {
-        nbytes = tensor->ne[0]*tensor->nb[0]/blck_size;
+        // A5.4b: nb[1] == ne[0]*nb[0]/blck_size by construction (see
+        // ggml_new_tensor_impl / gguf_set_tensor_type). Using nb[1] directly
+        // makes this per-tensor -- removes the only static-table dependency
+        // in the hottest size function, which is what lets a Q2_0 g64 tensor
+        // and a Q2_0 g128 tensor report correct nbytes() in the SAME process
+        // (PORT-MANIFEST.md A5.4b/A5.4e). Caller must ensure nb[] was set
+        // correctly for this tensor's actual variant at creation time.
+        nbytes = tensor->nb[1];
         for (int i = 1; i < GGML_MAX_DIMS; ++i) {
             nbytes += (tensor->ne[i] - 1)*tensor->nb[i];
         }
@@ -1379,15 +1386,61 @@ size_t ggml_nbytes_pad(const struct ggml_tensor * tensor) {
     return GGML_PAD(ggml_nbytes(tensor), GGML_MEM_ALIGN);
 }
 
+// --- A5: Q2_0 dual group-size support (see ggml.h) ---
+static int g_q2_0_variant_default    = GGML_Q2_0_VARIANT_UNSET;
+static int g_q2_0_variant_seen_mask  = 0; // bit0 = g64 bound at least once, bit1 = g128 bound at least once
+
+enum ggml_q2_0_variant ggml_q2_0_variant_of(const struct ggml_tensor * tensor) {
+    if (tensor == NULL || tensor->type != GGML_TYPE_Q2_0) {
+        return GGML_Q2_0_VARIANT_UNSET;
+    }
+    // Variant is stored directly in the extra pointer's bit pattern (not a
+    // real pointer -- tensor->extra has zero uses in ggml-cuda/ggml-hip,
+    // A5.4c) so binding costs no allocation and unbound (extra==NULL) reads
+    // back as "fall through to the process default", exactly as intended.
+    const uintptr_t tag = (uintptr_t) tensor->extra;
+    if (tag == (uintptr_t) GGML_Q2_0_VARIANT_G64 || tag == (uintptr_t) GGML_Q2_0_VARIANT_G128) {
+        return (enum ggml_q2_0_variant) tag;
+    }
+    return ggml_q2_0_variant_get_default();
+}
+
+void ggml_q2_0_variant_bind(struct ggml_tensor * tensor, enum ggml_q2_0_variant variant) {
+    GGML_ASSERT(tensor != NULL && tensor->type == GGML_TYPE_Q2_0);
+    GGML_ASSERT(variant == GGML_Q2_0_VARIANT_G64 || variant == GGML_Q2_0_VARIANT_G128);
+    tensor->extra = (void *) (uintptr_t) variant;
+    g_q2_0_variant_seen_mask |= (variant == GGML_Q2_0_VARIANT_G64) ? 1 : 2;
+}
+
+void ggml_q2_0_variant_set_default(enum ggml_q2_0_variant variant) {
+    g_q2_0_variant_default = variant;
+}
+
+enum ggml_q2_0_variant ggml_q2_0_variant_get_default(void) {
+    return g_q2_0_variant_default == GGML_Q2_0_VARIANT_UNSET
+        ? GGML_Q2_0_VARIANT_G128   // this fork's corpus default
+        : (enum ggml_q2_0_variant) g_q2_0_variant_default;
+}
+
+int ggml_q2_0_variant_live_count(void) {
+    return (g_q2_0_variant_seen_mask & 1 ? 1 : 0) + (g_q2_0_variant_seen_mask & 2 ? 1 : 0);
+}
+
 int64_t ggml_blck_size(enum ggml_type type) {
     assert(type >= 0);
     assert(type < GGML_TYPE_COUNT);
+    if (type == GGML_TYPE_Q2_0 && ggml_q2_0_variant_get_default() == GGML_Q2_0_VARIANT_G64) {
+        return 64;
+    }
     return type_traits[type].blck_size;
 }
 
 size_t ggml_type_size(enum ggml_type type) {
     assert(type >= 0);
     assert(type < GGML_TYPE_COUNT);
+    if (type == GGML_TYPE_Q2_0 && ggml_q2_0_variant_get_default() == GGML_Q2_0_VARIANT_G64) {
+        return 2 /* sizeof(ggml_half) */ + 64 / 4; // upstream's g64 block_q2_0: 18 bytes
+    }
     return type_traits[type].type_size;
 }
 
