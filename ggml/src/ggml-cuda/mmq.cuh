@@ -240,7 +240,15 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
 #define MMQ_MMA_TILE_X_K_FP4   (2*MMQ_TILE_NE_K + 8                                       + 4) // MXFP4 and NVFP4 Blackwell
 #define MMQ_MMA_TILE_X_K_NVFP4 (2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/2                         + 4) // NVFP4 Generic
 #define MMQ_MMA_TILE_X_K_Q8_1  (2*MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_0                   + 4)
-#define MMQ_MMA_TILE_X_K_Q2_K  (2*MMQ_TILE_NE_K + MMQ_TILE_NE_K                           + 4)
+// [TAG_Q2_K_DM_HALF] The x_dm region only ever holds MMQ_TILE_NE_K/2 half2 per
+// row, not MMQ_TILE_NE_K: load_tiles_q2_K writes x_dm[.. + kqsx] with
+// kqsx < threads_per_row = MMQ_ITER_K/(4*QR2_K) = 16, and vec_dot_q2_K_q8_1_mma
+// reads x_dm[.. + k0/4] with k0 < 2*MMQ_TILE_NE_K, so k0/4 < 16 as well. The old
+// full-NE_K reserve wasted 16 ints/row = 8192 B at mmq_y=128, which is what kept
+// Q2_K off mmq_x=128 (it needed 4096 B more). Stride is now 84, the same as
+// Q3_K: 84 % 8 == 4 keeps the padding scheme, and 336 B/row still staggers
+// against the 128 B bank period.
+#define MMQ_MMA_TILE_X_K_Q2_K  (2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/2                         + 4)
 #define MMQ_MMA_TILE_X_K_Q3_K  (2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/2                         + 4)
 #define MMQ_MMA_TILE_X_K_Q6_K  (2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/QI6_K   + MMQ_TILE_NE_K/8 + 7)
 
