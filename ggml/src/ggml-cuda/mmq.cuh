@@ -4984,7 +4984,21 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     // reserves it, so x=96 fits at exactly 65536 and this loop reaches it without
     // a per-type cap. Measured pp512 (sparse-llama-8B-Q2_K, R9700, r=3):
     // mmq_x 80 -> 323.94, 32 -> 1216.84, 96 -> 1949.72.
-    for (int mmq_x = 8; mmq_x <= mmq_x_max && ntiles_x_best > 1; mmq_x += 8) {
+    // [TAG_MOE_MMQ_X_CAP] MUL_MAT_ID (MoE) wants a narrower tile than dense
+    // MUL_MAT on AMD WMMA. Measured on Qwen3.6-35B-A3B-MXFP4_MOE (256 experts,
+    // 8 used, n_embd 2048, expert ff 512), interleaved 3-round A/B, r=2:
+    //   pp512  default(128) 3124.5 | x64 3487.4 (+11.6%) | x32 3292.5 | x16 3048.6
+    //   pp2048 default(128) 2997.3 | x64 3335.1 (+11.3%) | x32 3153.2
+    // The optimum is 64 at BOTH sizes even though tokens-per-expert goes 16 -> 64,
+    // so this is a property of the ids/expert kernel, NOT tile occupancy over the
+    // routed columns -- selecting mmq_x from expected tokens-per-expert is wrong,
+    // and x16 (the true average per-expert width at pp512) is the WORST of the
+    // four, below the 128 default. Keyed on ids_dst so dense MUL_MAT is untouched
+    // (Q2_K in particular wants 128 -- see TAG_Q2_K_DM_HALF).
+    const int mmq_x_max_eff = (args.ids_dst != nullptr && amd_wmma_available(cc) && mmq_x_max > 64)
+        ? 64 : mmq_x_max;
+
+    for (int mmq_x = 8; mmq_x <= mmq_x_max_eff && ntiles_x_best > 1; mmq_x += 8) {
         const int granularity = mmq_get_granularity_host(mmq_x, cc);
 
         if (mmq_x % granularity != 0 ||
