@@ -1,0 +1,28 @@
+// mul_mat_q2_K_hipblaslt.cuh - Q2_K hipBLASLt prefill GEMM route header
+//
+// Route Q2_K (2.625 bpw k-quant: 256-elem superblock, 16 sub-blocks of 16, each
+// with a 4-bit scale nibble + 4-bit min nibble in scales[16], plus superblock
+// d/dmin) through AMD tuned hipBLASLt int8 (or fp8/e4m3) GEMM for prefill
+// (M > M_THRESH), instead of the mmq/dp4a path.
+//
+// Requant strategy: FULLY dequant each weight (w = d*sc*q - dmin*mn, min baked
+// in) then requant to symmetric int8 with ONE per-output-channel scale. Because
+// the asymmetric min is folded into the dequantized weight value, there is NO
+// separate min/bias term at the GEMM level -- it is a plain symmetric int8 GEMM,
+// identical to the Q4_K/Q2_0 routes. Lossy (8-bit per-row vs per-block 2.625-bit
+// source) but PPL-gated. Same self-tuning per-shape algo cache + bounded int8
+// weight cache as the Q4_K route (the tuned GEMM algo is shape-only, independent
+// of source quant).
+
+#pragma once
+
+#include "common.cuh"
+
+// In-scope check for the hipBLASLt prefill path (Q2_K weight, F32 acts/dst, 2D,
+// RDNA4, M > threshold). Soft/opt-in: a false return falls straight through to
+// the unmodified mmq/dp4a path.
+bool ggml_cuda_q2_K_hipblaslt_prefill_supports(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+
+// Run the Q2_K prefill matmul through hipBLASLt int8/fp8. Returns false if the
+// build has no hipBLASLt (non-HIP / disabled) so the caller can fall back.
+bool ggml_cuda_op_mul_mat_q2_K_hipblaslt(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);

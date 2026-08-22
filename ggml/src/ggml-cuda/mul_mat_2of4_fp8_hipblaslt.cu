@@ -1,0 +1,576 @@
+// See mul_mat_2of4_fp8_hipblaslt.cuh for the full rationale.
+// 2OF4_FP8 prefill via hipBLASLt int8/fp8 GEMM. Structure mirrors the Q2_0 route
+// (mul_mat_q2_0_hipblaslt.cu); the ONLY 2OF4_FP8-specific part is the dequant inside
+// the two requant kernels -- everything else (activation quant, GEMM, plan/algo
+// cache, scale application) is quant-agnostic.
+
+#include "mul_mat_2of4_fp8_hipblaslt.cuh"
+#include "hipblaslt_wcache.cuh"
+
+#if defined(__HIP_PLATFORM_AMD__) && !defined(GGML_HIP_NO_HIPBLASLT)
+
+#include <hipblaslt/hipblaslt.h>
+#include <hipblaslt/hipblaslt-version.h>
+#include <hip/hip_fp16.h>
+#include <map>
+#include <tuple>
+#include <mutex>
+#include <vector>
+#include <string>
+#include <cstring>
+#include <cstdio>
+#include <sys/stat.h>
+
+namespace {
+
+constexpr int   QKK   = QK_2OF4_FP8;           // 32 elements per 2OF4_FP8 block
+constexpr float I8MAX = 127.0f;
+
+#define LT_OK(x) do { hipblasStatus_t s_ = (x); if (s_ != HIPBLAS_STATUS_SUCCESS) { \
+    GGML_LOG_ERROR("%s: hipBLASLt error %d at %s:%d\n", __func__, (int)s_, __FILE__, __LINE__); \
+    return false; } } while(0)
+
+// ---- device helpers --------------------------------------------------------
+
+__device__ __forceinline__ float sp4k_half2float(ggml_half h) {
+    return __half2float(*reinterpret_cast<const __half *>(&h));
+}
+
+// MEASURED 2026-08-22 (sparse-llama-8b-2of4-2of4fp8, R9700, pp512 r=3):
+// 1298.76 +/- 65.13 OFF -> 1513.77 +/- 57.62 ON (+16.6%), PPL 8.9531 -> 9.0329
+// (+0.89%, ch10 wikitext-2). A modest real win despite throwing the sparsity
+// away -- hipBLASLt has no structured-sparse GEMM on RDNA4, so the 2:4 block is
+// expanded to dense and the zeros ride along as ordinary operands.
+// 2OF4_FP8 dequant: expand the 2:4-structured block back to 32 DENSE values.
+// Layout is the authoritative one from dequantize_row_2of4_fp8 (ggml-quants.c):
+// 8 groups of 4; group g takes a 4-bit nibble from meta[g/2] (low nibble for
+// even g, high for odd), giving the two kept positions idx0 = nib & 3 and
+// idx1 = (nib >> 2) & 3; the kept e4m3 bytes are qs[2g+0] (-> idx0) and
+// qs[2g+1] (-> idx1). Every other position in the group is a structural zero.
+// idx1 is tested FIRST so a degenerate idx0 == idx1 block resolves to qs[2g+1],
+// matching the CPU reference write order (idx0 written, then overwritten).
+//
+// hipBLASLt has no structured-sparse GEMM on RDNA4, so the sparsity is not
+// exploited here -- this route buys the tuned dense GEMM for prefill, and the
+// zeros ride along as ordinary zero operands.
+__device__ __forceinline__ float sp4k_dequant_elem(const block_2of4_fp8 * blk, int t, float d) {
+    const int     g    = t >> 2;                    // group 0..7
+    const int     j    = t & 3;                     // position within group
+    const uint8_t byte = blk->meta[g >> 1];
+    const uint8_t nib  = ((g & 1) == 0) ? (uint8_t)(byte & 0x0F) : (uint8_t)(byte >> 4);
+    const int     idx0 = nib & 0x3;
+    const int     idx1 = (nib >> 2) & 0x3;
+    if (j == idx1) return ggml_cuda_e4m3_to_fp32(blk->qs[2*g + 1]) * d;
+    if (j == idx0) return ggml_cuda_e4m3_to_fp32(blk->qs[2*g + 0]) * d;
+    return 0.0f;
+}
+
+// Requant a 2OF4_FP8 weight row -> int8 with ONE symmetric scale per output channel.
+// One block per output row n. Output int8 row-major [N x K] (== col-major [K x N]).
+__global__ void k_requant_2of4_fp8_to_int8_perchannel(
+        const char * __restrict__ wdata, int64_t nb01,
+        int8_t * __restrict__ q8, float * __restrict__ wscale,
+        int64_t K, int64_t n_blocks) {
+    const int64_t n = blockIdx.x;                 // output channel
+    const block_2of4_fp8 * row = (const block_2of4_fp8 *)(wdata + n * nb01);
+
+    // pass 1: block-wide amax over the K dequantized weights of this row
+    float amax = 0.0f;
+    for (int64_t l = threadIdx.x; l < K; l += blockDim.x) {
+        const int64_t b = l / QKK;
+        const int     t = (int)(l % QKK);
+        const float   d    = sp4k_half2float(row[b].d);
+        const float   w    = sp4k_dequant_elem(&row[b], t, d);
+        amax = fmaxf(amax, fabsf(w));
+    }
+    __shared__ float sred[1024];
+    sred[threadIdx.x] = amax;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sred[threadIdx.x] = fmaxf(sred[threadIdx.x], sred[threadIdx.x + s]);
+        __syncthreads();
+    }
+    const float scale = (sred[0] > 0.0f) ? sred[0] / I8MAX : 1.0f;
+    if (threadIdx.x == 0) wscale[n] = scale;
+    const float inv = 1.0f / scale;
+
+    // pass 2: quantize
+    int8_t * out = q8 + n * K;
+    for (int64_t l = threadIdx.x; l < K; l += blockDim.x) {
+        const int64_t b = l / QKK;
+        const int     t = (int)(l % QKK);
+        const float   d    = sp4k_half2float(row[b].d);
+        const float   w    = sp4k_dequant_elem(&row[b], t, d);
+        int v = __float2int_rn(w * inv);
+        v = max(-127, min(127, v));
+        out[l] = (int8_t)v;
+    }
+}
+
+// Quantize activations -> int8 with ONE symmetric scale per token (column).
+__global__ void k_quantize_act_int8_percol(
+        const char * __restrict__ src1, int64_t nb1,
+        int8_t * __restrict__ x8, float * __restrict__ ascale, int64_t K) {
+    const int64_t j = blockIdx.x;                 // token / column
+    const float * col = (const float *)(src1 + j * nb1);
+
+    float amax = 0.0f;
+    for (int64_t l = threadIdx.x; l < K; l += blockDim.x) amax = fmaxf(amax, fabsf(col[l]));
+    __shared__ float sred[1024];
+    sred[threadIdx.x] = amax;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sred[threadIdx.x] = fmaxf(sred[threadIdx.x], sred[threadIdx.x + s]);
+        __syncthreads();
+    }
+    const float scale = (sred[0] > 0.0f) ? sred[0] / I8MAX : 1.0f;
+    if (threadIdx.x == 0) ascale[j] = scale;
+    const float inv = 1.0f / scale;
+
+    int8_t * out = x8 + j * K;
+    for (int64_t l = threadIdx.x; l < K; l += blockDim.x) {
+        int v = __float2int_rn(col[l] * inv);
+        v = max(-127, min(127, v));
+        out[l] = (int8_t)v;
+    }
+}
+
+// Dequant the int32 GEMM result: dst[n,j] = i32[n,j] * wscale[n] * ascale[j].
+__global__ void k_apply_scales(
+        const int32_t * __restrict__ i32, char * __restrict__ dst, int64_t nb1,
+        const float * __restrict__ wscale, const float * __restrict__ ascale,
+        int64_t N, int64_t M) {
+    const int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (idx >= N * M) return;
+    const int64_t n = idx % N;
+    const int64_t j = idx / N;
+    float * out = (float *)(dst + j * nb1);
+    out[n] = (float)i32[j * N + n] * wscale[n] * ascale[j];
+}
+
+// ============================ fp8 (E4M3) variant ============================
+constexpr float F8MAX = 448.0f;
+
+__global__ void k_requant_2of4_fp8_to_e4m3_perchannel(
+        const char * __restrict__ wdata, int64_t nb01,
+        uint8_t * __restrict__ q8, float * __restrict__ wscale,
+        int64_t K, int64_t n_blocks) {
+    const int64_t n = blockIdx.x;
+    const block_2of4_fp8 * row = (const block_2of4_fp8 *)(wdata + n * nb01);
+    float amax = 0.0f;
+    for (int64_t l = threadIdx.x; l < K; l += blockDim.x) {
+        const int64_t b = l / QKK; const int t = (int)(l % QKK);
+        const float d = sp4k_half2float(row[b].d);
+        amax = fmaxf(amax, fabsf(sp4k_dequant_elem(&row[b], t, d)));
+    }
+    __shared__ float sred[1024];
+    sred[threadIdx.x] = amax; __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sred[threadIdx.x] = fmaxf(sred[threadIdx.x], sred[threadIdx.x + s]);
+        __syncthreads();
+    }
+    const float scale = (sred[0] > 0.0f) ? sred[0] / F8MAX : 1.0f;
+    if (threadIdx.x == 0) wscale[n] = scale;
+    const float inv = 1.0f / scale;
+    uint8_t * out = q8 + n * K;
+    for (int64_t l = threadIdx.x; l < K; l += blockDim.x) {
+        const int64_t b = l / QKK; const int t = (int)(l % QKK);
+        const float d = sp4k_half2float(row[b].d);
+        out[l] = ggml_cuda_fp32_to_e4m3(sp4k_dequant_elem(&row[b], t, d) * inv);
+    }
+}
+
+__global__ void k_quantize_act_e4m3_percol(
+        const char * __restrict__ src1, int64_t nb1,
+        uint8_t * __restrict__ x8, float * __restrict__ ascale, int64_t K) {
+    const int64_t j = blockIdx.x;
+    const float * col = (const float *)(src1 + j * nb1);
+    float amax = 0.0f;
+    for (int64_t l = threadIdx.x; l < K; l += blockDim.x) amax = fmaxf(amax, fabsf(col[l]));
+    __shared__ float sred[1024];
+    sred[threadIdx.x] = amax; __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sred[threadIdx.x] = fmaxf(sred[threadIdx.x], sred[threadIdx.x + s]);
+        __syncthreads();
+    }
+    const float scale = (sred[0] > 0.0f) ? sred[0] / F8MAX : 1.0f;
+    if (threadIdx.x == 0) ascale[j] = scale;
+    const float inv = 1.0f / scale;
+    uint8_t * out = x8 + j * K;
+    for (int64_t l = threadIdx.x; l < K; l += blockDim.x) out[l] = ggml_cuda_fp32_to_e4m3(col[l] * inv);
+}
+
+__global__ void k_apply_scales_f32(
+        const float * __restrict__ acc, char * __restrict__ dst, int64_t nb1,
+        const float * __restrict__ wscale, const float * __restrict__ ascale,
+        int64_t N, int64_t M) {
+    const int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (idx >= N * M) return;
+    const int64_t n = idx % N, j = idx / N;
+    float * out = (float *)(dst + j * nb1);
+    out[n] = acc[j * N + n] * wscale[n] * ascale[j];
+}
+
+hipblasLtHandle_t get_lt_handle() {
+    static hipblasLtHandle_t h = [](){ hipblasLtHandle_t t; hipblasLtCreate(&t); return t; }();
+    return h;
+}
+
+// ---- per-shape plan cache (identical to Q2_0 route; algo is shape-only) ----
+constexpr size_t LT_WS_BYTES = 32ull << 20;
+
+struct lt_plan {
+    hipblasLtMatmulDesc_t             op   = nullptr;
+    hipblasLtMatrixLayout_t           lA   = nullptr, lB = nullptr, lD = nullptr;
+    hipblasLtMatmulHeuristicResult_t  heur{};
+    bool                              ok   = false;
+};
+
+enum gemm_mode { MODE_I8 = 0, MODE_F8 = 1 };
+
+std::map<std::tuple<int64_t,int64_t,int64_t,int>, lt_plan> g_plan_cache;
+std::mutex g_plan_mtx;
+
+// ---- persistent tuned-algo cache (shared file: tuned GEMM algo is shape-only,
+// independent of the source quant, so 2OF4_FP8 and Q2_0 share winners for a shape) --
+#define TUNE_S2(x) #x
+#define TUNE_S(x) TUNE_S2(x)
+constexpr char TUNE_MAGIC[8] = {'R','D','N','4','G','T','3','\0'};
+
+std::map<std::tuple<int64_t,int64_t,int64_t,int>, int32_t> g_disk_best;
+bool g_disk_loaded = false;
+
+const char * tune_cache_path() {
+    static std::string path = [](){
+        if (const char * e = getenv("GGML_HIP_2OF4_FP8_HIPBLASLT_TUNE_CACHE")) return std::string(e);
+        const char * home = getenv("HOME");
+        return std::string(home ? home : "/tmp") + "/.cache/ggml-rdna4-gemm-tune.bin";
+    }();
+    return path.c_str();
+}
+std::string tune_version_tag() {
+    return std::string("hipblaslt-") + TUNE_S(HIPBLASLT_VERSION_MAJOR) "." TUNE_S(HIPBLASLT_VERSION_MINOR)
+         "." TUNE_S(HIPBLASLT_VERSION_PATCH) "-" TUNE_S(HIPBLASLT_VERSION_TWEAK);
+}
+struct TuneRec { int64_t N, M, K; int32_t mode; int32_t best_index; };
+
+void load_disk_algos() {
+    if (g_disk_loaded) return;
+    g_disk_loaded = true;
+    FILE * f = fopen(tune_cache_path(), "rb");
+    if (!f) return;
+    char magic[8] = {0};
+    uint32_t vlen = 0;
+    std::string want = tune_version_tag();
+    std::string ver;
+    if (fread(magic, 1, 8, f) == 8 && memcmp(magic, TUNE_MAGIC, 8) == 0 &&
+        fread(&vlen, 4, 1, f) == 1 && vlen <= 256) {
+        ver.resize(vlen);
+        if (fread(&ver[0], 1, vlen, f) == vlen && ver == want) {
+            TuneRec r;
+            while (fread(&r, sizeof(TuneRec), 1, f) == 1) {
+                g_disk_best[std::make_tuple(r.N, r.M, r.K, (int)r.mode)] = r.best_index;
+            }
+        }
+    }
+    fclose(f);
+}
+void save_disk_algos() {
+    std::string p = tune_cache_path();
+    auto slash = p.find_last_of('/');
+    if (slash != std::string::npos) mkdir(p.substr(0, slash).c_str(), 0755);
+    FILE * f = fopen(p.c_str(), "wb");
+    if (!f) return;
+    std::string ver = tune_version_tag();
+    uint32_t vlen = (uint32_t)ver.size();
+    fwrite(TUNE_MAGIC, 1, 8, f);
+    fwrite(&vlen, 4, 1, f);
+    fwrite(ver.data(), 1, vlen, f);
+    for (auto & kv : g_disk_best) {
+        TuneRec r{ std::get<0>(kv.first), std::get<1>(kv.first), std::get<2>(kv.first),
+                   (int32_t)std::get<3>(kv.first), kv.second };
+        fwrite(&r, sizeof(TuneRec), 1, f);
+    }
+    fclose(f);
+}
+
+const lt_plan & get_plan(int64_t N, int64_t M, int64_t K, int mode) {
+    std::lock_guard<std::mutex> lk(g_plan_mtx);
+    auto key = std::make_tuple(N, M, K, mode);
+    auto it = g_plan_cache.find(key);
+    if (it != g_plan_cache.end()) {
+        return it->second;
+    }
+    const hipblasComputeType_t compute = (mode == MODE_F8) ? HIPBLAS_COMPUTE_32F : HIPBLAS_COMPUTE_32I;
+    const hipDataType scaleT = (mode == MODE_F8) ? HIP_R_32F : HIP_R_32I;
+    const hipDataType abT    = (mode == MODE_F8) ? HIP_R_8F_E4M3 : HIP_R_8I;
+    const hipDataType dT     = (mode == MODE_F8) ? HIP_R_32F : HIP_R_32I;
+    lt_plan p;
+    hipblasLtHandle_t h = get_lt_handle();
+    hipblasOperation_t opT = HIPBLAS_OP_T, opN = HIPBLAS_OP_N;
+    bool built =
+        hipblasLtMatmulDescCreate(&p.op, compute, scaleT) == HIPBLAS_STATUS_SUCCESS &&
+        hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT)) == HIPBLAS_STATUS_SUCCESS &&
+        hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN)) == HIPBLAS_STATUS_SUCCESS &&
+        hipblasLtMatrixLayoutCreate(&p.lA, abT, K, N, K) == HIPBLAS_STATUS_SUCCESS &&
+        hipblasLtMatrixLayoutCreate(&p.lB, abT, K, M, K) == HIPBLAS_STATUS_SUCCESS &&
+        hipblasLtMatrixLayoutCreate(&p.lD, dT,  N, M, N) == HIPBLAS_STATUS_SUCCESS;
+    if (built) {
+        load_disk_algos();
+        const auto dkey = std::make_tuple(N, M, K, mode);
+
+        hipblasLtMatmulPreference_t pref = nullptr;
+        size_t ws = LT_WS_BYTES; int nAlgo = 0;
+        constexpr int REQ = 64;
+        std::vector<hipblasLtMatmulHeuristicResult_t> cand(REQ);
+        if (hipblasLtMatmulPreferenceCreate(&pref) == HIPBLAS_STATUS_SUCCESS &&
+            hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)) == HIPBLAS_STATUS_SUCCESS &&
+            hipblasLtMatmulAlgoGetHeuristic(h, p.op, p.lA, p.lB, p.lD, p.lD, pref, REQ, cand.data(), &nAlgo) == HIPBLAS_STATUS_SUCCESS &&
+            nAlgo > 0) {
+            static const bool notune = (getenv("GGML_HIP_2OF4_FP8_HIPBLASLT_NOTUNE") != nullptr);
+            int best = 0;
+            auto di = g_disk_best.find(dkey);
+            if (di != g_disk_best.end() && di->second >= 0 && di->second < nAlgo) {
+                best = di->second;
+            } else if (!notune && nAlgo > 1) {
+                void *sA=nullptr,*sB=nullptr,*sD=nullptr,*sW=nullptr;
+                if (hipMalloc(&sA,(size_t)K*N)==hipSuccess && hipMalloc(&sB,(size_t)K*M)==hipSuccess &&
+                    hipMalloc(&sD,(size_t)N*M*4)==hipSuccess && hipMalloc(&sW,LT_WS_BYTES)==hipSuccess) {
+                    hipMemset(sA,1,(size_t)K*N); hipMemset(sB,1,(size_t)K*M);
+                    const int32_t ai=1,bi=0; const float af=1.f,bf=0.f;
+                    const void *alpha=(mode==MODE_F8)?(const void*)&af:(const void*)&ai;
+                    const void *beta =(mode==MODE_F8)?(const void*)&bf:(const void*)&bi;
+                    auto run=[&](hipblasLtMatmulAlgo_t &a){ return hipblasLtMatmul(h,p.op,alpha,sA,p.lA,sB,p.lB,beta,sD,p.lD,sD,p.lD,&a,sW,LT_WS_BYTES,0); };
+                    hipEvent_t e0,e1; hipEventCreate(&e0); hipEventCreate(&e1);
+                    double bestMs = 1e30;
+                    for (int i=0;i<nAlgo;i++){
+                        if (run(cand[i].algo) != HIPBLAS_STATUS_SUCCESS) continue;
+                        for(int w=0;w<2;w++) run(cand[i].algo);
+                        hipDeviceSynchronize(); hipEventRecord(e0,0);
+                        for(int r=0;r<10;r++) run(cand[i].algo);
+                        hipEventRecord(e1,0); hipEventSynchronize(e1);
+                        float ms=0; hipEventElapsedTime(&ms,e0,e1);
+                        if (ms>0 && ms<bestMs){ bestMs=ms; best=i; }
+                    }
+                    hipEventDestroy(e0); hipEventDestroy(e1);
+                }
+                if (sA) hipFree(sA); if (sB) hipFree(sB); if (sD) hipFree(sD); if (sW) hipFree(sW);
+                g_disk_best[dkey] = best;
+                save_disk_algos();
+            }
+            p.heur = cand[best];
+            p.ok = true;
+        }
+        if (pref) hipblasLtMatmulPreferenceDestroy(pref);
+    }
+    auto res = g_plan_cache.emplace(key, p);
+    return res.first->second;
+}
+
+// ---- bounded int8 weight cache (identical to Q2_0 route) -------------------
+struct cached_w { int8_t * q8 = nullptr; float * wscale = nullptr; size_t bytes = 0; };
+std::map<const void *, cached_w> g_wcache;
+size_t g_wcache_bytes = 0;
+std::mutex g_wcache_mtx;
+
+size_t wcache_budget_bytes() {
+    static size_t b = [](){
+        const char * e = getenv("GGML_HIP_2OF4_FP8_HIPBLASLT_WCACHE_MB");
+        size_t mb = e ? (size_t)atoll(e) : (size_t)12000;
+        return mb << 20;
+    }();
+    return b;
+}
+
+const cached_w * try_cache_weight(const void * key, const char * wdata, int64_t nb01,
+                                  int64_t N, int64_t K, int64_t n_blocks, int mode, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lk(g_wcache_mtx);
+    auto it = g_wcache.find(key);
+    if (it != g_wcache.end()) return &it->second;
+
+    const size_t need = (size_t)N * K + (size_t)N * sizeof(float);
+    if (g_wcache_bytes + need > wcache_budget_bytes()) return nullptr;
+    { size_t freeb = 0, totb = 0;   // VRAM-adaptive: keep headroom for the transient pool bufs
+      if (hipMemGetInfo(&freeb, &totb) == hipSuccess && freeb < need + (size_t)(2ull << 30)) return nullptr; }
+
+    cached_w c;
+    if (hipMalloc(&c.q8, (size_t)N * K) != hipSuccess) return nullptr;
+    if (hipMalloc(&c.wscale, (size_t)N * sizeof(float)) != hipSuccess) { hipFree(c.q8); return nullptr; }
+    c.bytes = need;
+    const dim3 grid((unsigned)N), block(256);
+    if (mode == 1 /*MODE_F8*/) {
+        k_requant_2of4_fp8_to_e4m3_perchannel<<<grid, block, 0, stream>>>(wdata, nb01, (uint8_t *)c.q8, c.wscale, K, n_blocks);
+    } else {
+        k_requant_2of4_fp8_to_int8_perchannel<<<grid, block, 0, stream>>>(wdata, nb01, c.q8, c.wscale, K, n_blocks);
+    }
+    g_wcache_bytes += need;
+    auto res = g_wcache.emplace(key, c);
+    return &res.first->second;
+}
+
+// Drop cached conversions whose weight pointer falls inside a buffer being freed.
+// Without this the cache key (a raw device address) can be reused by a later
+// allocation and silently return the previous model's converted weights.
+void wcache_invalidate_range(const void * base, size_t size) {
+    std::lock_guard<std::mutex> lk(g_wcache_mtx);
+    const char * b = (const char *) base;
+    for (auto it = g_wcache.begin(); it != g_wcache.end(); ) {
+        const char * k = (const char *) it->first;
+        if (k >= b && k < b + size) {
+            if (it->second.q8) hipFree(it->second.q8);
+            if (it->second.wscale) hipFree(it->second.wscale);
+            g_wcache_bytes -= it->second.bytes;
+            it = g_wcache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+struct wcache_registrar { wcache_registrar() { ggml_hipblaslt_wcache_register(wcache_invalidate_range); } };
+wcache_registrar g_wcache_registrar;
+
+} // namespace
+
+bool ggml_cuda_2of4_fp8_hipblaslt_prefill_supports(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (src0->type != GGML_TYPE_2OF4_FP8)                       return false;
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    if (src0->ne[2] != 1 || src0->ne[3] != 1)               return false;
+    if (src1->ne[2] != 1 || src1->ne[3] != 1)               return false;
+    if (src0->ne[0] != src1->ne[0] || src0->ne[0] % QKK != 0) return false;
+
+    static const int64_t M_THRESH = [](){
+        const char * e = getenv("GGML_HIP_2OF4_FP8_HIPBLASLT_MTHRESH");
+        return e ? (int64_t)atoll(e) : (int64_t)32;
+    }();
+    if (src1->ne[1] <= M_THRESH) return false;
+
+    const int device = ggml_cuda_get_device();
+    const int cc     = ggml_cuda_info().devices[device].cc;
+    return GGML_CUDA_CC_IS_RDNA4(cc);
+}
+
+bool ggml_cuda_op_mul_mat_2of4_fp8_hipblaslt(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0->type == GGML_TYPE_2OF4_FP8);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int64_t K = src0->ne[0];
+    const int64_t N = src0->ne[1];
+    const int64_t M = src1->ne[1];
+    const int64_t n_blocks = K / QKK;
+    cudaStream_t  stream = ctx.stream();
+
+    static const int mode = (getenv("GGML_HIP_2OF4_FP8_HIPBLASLT_FP8") != nullptr) ? MODE_F8 : MODE_I8;
+
+    // ---- weight -> int8/e4m3 (per-output-channel): convert-once cache ----
+    // Only static weight buffers are cached: compute-pool tensors alias device
+    // addresses across graph nodes (stale-hit hazard) and are transient anyway.
+    // On a cache miss (budget / VRAM guard / non-weights buffer) do NOT convert
+    // per call: the starved-cache mode re-runs k_requant_* every ubatch and is
+    // strictly worse than the mmq path it displaces. (The pp512 numbers behind
+    // that rule -- 1.7B fp8 -29%, 8B fp8 -12% -- were measured on the F8E4M3
+    // route this file was ported from, NOT on 2OF4_FP8; the mechanism is
+    // shared, the magnitudes are unverified here.)
+    // Return false -> caller falls through to mmq. Set
+    // GGML_HIP_2OF4_FP8_HIPBLASLT_FORCE=1 to restore the old always-route
+    // behavior (test-backend-ops probes, A/B experiments).
+    int8_t * wq8_ptr = nullptr;
+    float  * wsc_ptr = nullptr;
+    ggml_cuda_pool_alloc<int8_t> wq8_pool;
+    ggml_cuda_pool_alloc<float>  wsc_pool;
+    static const bool route_force = (getenv("GGML_HIP_2OF4_FP8_HIPBLASLT_FORCE") != nullptr);
+    const bool src0_cacheable = src0->buffer != nullptr &&
+        ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+    const cached_w * cw = src0_cacheable
+        ? try_cache_weight(src0->data, (const char *)src0->data, src0->nb[1],
+                           N, K, n_blocks, mode, stream)
+        : nullptr;
+    if (cw == nullptr && !route_force) {
+        return false;
+    }
+    // Pre-flight VRAM guard: fall back to mmq (return false) instead of letting a pool
+    // alloc OOM-abort when a near-full model leaves too little free VRAM for the transient
+    // int8/fp8 + accumulator + GEMM-workspace buffers.
+    {
+        size_t freeb = 0, totb = 0;
+        const size_t wq8_need  = cw ? 0 : (size_t)N * K;   // pool alloc for weight only on cache miss
+        const size_t transient = wq8_need + (size_t)K*M + (size_t)N*M*4 + (size_t)M*4
+                               + LT_WS_BYTES + (size_t)(64ull << 20);
+        if (hipMemGetInfo(&freeb, &totb) == hipSuccess && freeb < transient) return false;
+    }
+    if (cw) {
+        wq8_ptr = cw->q8;
+        wsc_ptr = cw->wscale;
+    } else {
+        wq8_ptr = wq8_pool.alloc(ctx.pool(), (size_t)N * K);
+        wsc_ptr = wsc_pool.alloc(ctx.pool(), (size_t)N);
+        const dim3 grid((unsigned)N), block(256);
+        if (mode == MODE_F8) {
+            k_requant_2of4_fp8_to_e4m3_perchannel<<<grid, block, 0, stream>>>(
+                (const char *)src0->data, src0->nb[1], (uint8_t *)wq8_ptr, wsc_ptr, K, n_blocks);
+        } else {
+            k_requant_2of4_fp8_to_int8_perchannel<<<grid, block, 0, stream>>>(
+                (const char *)src0->data, src0->nb[1], wq8_ptr, wsc_ptr, K, n_blocks);
+        }
+    }
+
+    // ---- activation int8/e4m3 (per-token) + accumulator, from the pool ----
+    ggml_cuda_pool_alloc<int8_t>  x8   (ctx.pool(), (size_t)K * M);
+    ggml_cuda_pool_alloc<float>   asc  (ctx.pool(), (size_t)M);
+    ggml_cuda_pool_alloc<int32_t> acc  (ctx.pool(), (size_t)N * M);
+    {
+        const dim3 grid((unsigned)M), block(256);
+        if (mode == MODE_F8) {
+            k_quantize_act_e4m3_percol<<<grid, block, 0, stream>>>(
+                (const char *)src1->data, src1->nb[1], (uint8_t *)x8.get(), asc.get(), K);
+        } else {
+            k_quantize_act_int8_percol<<<grid, block, 0, stream>>>(
+                (const char *)src1->data, src1->nb[1], x8.get(), asc.get(), K);
+        }
+    }
+
+    // ---- hipBLASLt GEMM: D(NxM) = op(A=W)[NxK] * B(X)[KxM], TN. Plan cached per (N,M,K,mode). ----
+    hipblasLtHandle_t h = get_lt_handle();
+    const lt_plan & plan = get_plan(N, M, K, mode);
+    if (!plan.ok) {
+        GGML_LOG_ERROR("%s: no hipBLASLt algo for %ldx%ldx%ld mode=%d\n", __func__, N, M, K, mode);
+        return false;
+    }
+
+    ggml_cuda_pool_alloc<char> ws(ctx.pool(), LT_WS_BYTES);
+    if (mode == MODE_F8) {
+        const float alpha = 1.0f, beta = 0.0f;
+        LT_OK(hipblasLtMatmul(h, plan.op, &alpha, wq8_ptr, plan.lA, x8.get(), plan.lB, &beta,
+                              acc.get(), plan.lD, acc.get(), plan.lD,
+                              &plan.heur.algo, ws.get(), LT_WS_BYTES, stream));
+    } else {
+        const int32_t alpha = 1, beta = 0;
+        LT_OK(hipblasLtMatmul(h, plan.op, &alpha, wq8_ptr, plan.lA, x8.get(), plan.lB, &beta,
+                              acc.get(), plan.lD, acc.get(), plan.lD,
+                              &plan.heur.algo, ws.get(), LT_WS_BYTES, stream));
+    }
+
+    // ---- dequant: dst = acc * wscale[row] * ascale[col] ----
+    {
+        const int64_t total = N * M;
+        const dim3 block(256), grid((unsigned)((total + 255) / 256));
+        if (mode == MODE_F8) {
+            k_apply_scales_f32<<<grid, block, 0, stream>>>(
+                (const float *)acc.get(), (char *)dst->data, dst->nb[1], wsc_ptr, asc.get(), N, M);
+        } else {
+            k_apply_scales<<<grid, block, 0, stream>>>(
+                acc.get(), (char *)dst->data, dst->nb[1], wsc_ptr, asc.get(), N, M);
+        }
+    }
+    return true;
+}
+
+#else  // ---- non-HIP / disabled: stubs ----
+
+bool ggml_cuda_2of4_fp8_hipblaslt_prefill_supports(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) {
+    return false;
+}
+bool ggml_cuda_op_mul_mat_2of4_fp8_hipblaslt(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) {
+    return false;
+}
+
+#endif

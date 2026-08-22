@@ -92,10 +92,13 @@
 #include "ggml-cuda/mul_mat_q2_0_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_q1_0_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_q4_K_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_q2_K_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_q8_0_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_mxfp8_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_mxfp6_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_f8e4m3_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_f8e5m2_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_2of4_fp8_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_iu4_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_f16_hipblaslt.cuh"
 #include "ggml.h"
@@ -1896,6 +1899,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    // 2OF4_FP8 hipBLASLt prefill lever (see mul_mat_2of4_fp8_hipblaslt.cuh):
+    // must be checked HERE, not with the other hipBLASLt levers further down --
+    // 2OF4_FP8 never reaches the generic dispatch (it returns from the dedicated
+    // kernel just below). Expands the 2:4 block to dense (hipBLASLt has no
+    // structured-sparse GEMM on RDNA4) then requants to per-channel int8/e4m3.
+    // Opt-in GGML_HIP_2OF4_FP8_HIPBLASLT_PREFILL (+ _FP8); unlike the two
+    // intercepts around it this one soft-fails to the dedicated kernel below
+    // instead of asserting.
+    if (src0->type == GGML_TYPE_2OF4_FP8) {
+        static const bool sp24_fp8_hipblaslt_prefill_enabled = (getenv("GGML_HIP_2OF4_FP8_HIPBLASLT_PREFILL") != nullptr);
+        if (sp24_fp8_hipblaslt_prefill_enabled && ggml_cuda_2of4_fp8_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_2of4_fp8_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+        }
+    }
+
     if (src0->type == GGML_TYPE_2OF4_FP8) {
         const bool ok = ggml_cuda_op_mul_mat_2of4_fp8(ctx, src0, src1, dst);
         GGML_ASSERT(ok && "ggml_cuda_op_mul_mat_2of4_fp8 does not support this tensor shape");
@@ -2279,6 +2299,20 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
     }
 
+    // Q2_K prefill lever (see mul_mat_q2_K_hipblaslt.cuh): route Q2_K (2.625bpw
+    // k-quant) large-M matmuls through hipBLASLt int8 (GGML_HIP_Q2_K_HIPBLASLT_PREFILL)
+    // or fp8/e4m3 (+ GGML_HIP_Q2_K_HIPBLASLT_FP8). Fully dequants (min folded in) ->
+    // per-channel int8, then the tuned int8 GEMM. Opt-in; soft-fail -> mmq/dp4a.
+    {
+        static const bool q2_K_hipblaslt_prefill_enabled = (getenv("GGML_HIP_Q2_K_HIPBLASLT_PREFILL") != nullptr);
+        if (q2_K_hipblaslt_prefill_enabled && ggml_cuda_q2_K_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_q2_K_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+            // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
+        }
+    }
+
     // Q8_0 prefill lever (see mul_mat_q8_0_hipblaslt.cuh): route Q8_0 (8.5bpw,
     // 32-elem block, symmetric int8 x per-block scale) large-M matmuls through
     // hipBLASLt int8 (GGML_HIP_Q8_0_HIPBLASLT_PREFILL) or fp8 (+ _FP8). Opt-in;
@@ -2287,6 +2321,20 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         static const bool q8_0_hipblaslt_prefill_enabled = (getenv("GGML_HIP_Q8_0_HIPBLASLT_PREFILL") != nullptr);
         if (q8_0_hipblaslt_prefill_enabled && ggml_cuda_q8_0_hipblaslt_prefill_supports(src0, src1, dst)) {
             if (ggml_cuda_op_mul_mat_q8_0_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+            // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
+        }
+    }
+
+    // F8E5M2 prefill lever (see mul_mat_f8e5m2_hipblaslt.cuh): route F8E5M2 (signed OCP
+    // e5m2/bf8 elems + per-block fp16 scale) large-M matmuls through hipBLASLt
+    // int8/fp8 GEMM. Source decodes as e5m2; fp8 mode computes in e4m3.
+    // Opt-in GGML_HIP_F8E5M2_HIPBLASLT_PREFILL (+ _FP8); soft-fail -> mmq/dp4a.
+    {
+        static const bool f8e5m2_hipblaslt_prefill_enabled = (getenv("GGML_HIP_F8E5M2_HIPBLASLT_PREFILL") != nullptr);
+        if (f8e5m2_hipblaslt_prefill_enabled && ggml_cuda_f8e5m2_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_f8e5m2_hipblaslt(ctx, src0, src1, dst)) {
                 return;
             }
             // else: hipBLASLt unavailable/failed -> fall through to dp4a/mmq.
