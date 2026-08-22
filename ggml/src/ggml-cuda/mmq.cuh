@@ -3997,7 +3997,7 @@ static __device__ __forceinline__ void mmq_write_back_dp4a(
                 continue;
             }
 
-            dst[ids_dst[j]*stride + i] = sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size];
+            dst[(ids_dst ? ids_dst[j] : j)*stride + i] = sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size];
         }
     }
 }
@@ -4045,7 +4045,7 @@ static __device__ __forceinline__ void mmq_write_back_mma(
                     continue;
                 }
 
-                dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                dst[(ids_dst ? ids_dst[j] : j)*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
             }
         }
     }
@@ -4297,7 +4297,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr load_tiles_mmq_t load_tiles = mmq_type_traits<mmq_x, mmq_y, need_check, type>::load_tiles;
 
     extern __shared__ int data_mul_mat_q[];
-    int * tile_y = data_mul_mat_q + mmq_x;
+    // ids tile is absent for plain MUL_MAT -- see [TAG_MMQ_IDS_SMEM].
+    int * tile_y = data_mul_mat_q + (ids_dst ? mmq_x : 0);
     int * tile_x = tile_y + GGML_PAD(mmq_x*MMQ_TILE_Y_K, nwarps*warp_size);
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
@@ -4447,17 +4448,22 @@ static __global__ void mul_mat_q(
     // For regular matrix multiplications this is never changed.
     // For MoE the correct indices are loaded from ids_dst.
     extern __shared__ int ids_dst_shared[]; // Stored at beginning of shared memory.
+    // [TAG_MMQ_IDS_SMEM] For plain MUL_MAT there is no ids tile at all: the
+    // identity permutation it used to hold is applied directly in write_back.
+    const bool use_ids = ids_dst != nullptr;
+    if (use_ids) {
 #pragma unroll
-    for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
-        const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+        for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
+            const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
 
-        if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
-            break;
+            if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
+                break;
+            }
+
+            ids_dst_shared[j] = j;
         }
-
-        ids_dst_shared[j] = j;
+        __syncthreads();
     }
-    __syncthreads();
 
     // On non-CDNA AMD or old CUDA the performance with stream-k was worse, use conventional tiling instead:
 #if (defined(GGML_USE_HIP) && !defined(CDNA)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
@@ -4511,7 +4517,7 @@ static __global__ void mul_mat_q(
 
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+            (x, offset_x, y + offset_y, use_ids ? ids_dst_shared : nullptr, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, use_mixed_bf8_act);
         return;
     }
@@ -4591,7 +4597,7 @@ static __global__ void mul_mat_q(
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+            (x, offset_x, y + offset_y, use_ids ? ids_dst_shared : nullptr, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, use_mixed_bf8_act);
 
         kbc += blocks_per_ne00.z;
@@ -4660,7 +4666,7 @@ static __global__ void mul_mat_q(
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-        (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+        (x, offset_x, y + offset_y, use_ids ? ids_dst_shared : nullptr, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, use_mixed_bf8_act);
 }
 
@@ -4817,10 +4823,18 @@ struct mmq_args {
 };
 
 template<ggml_type type>
-static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int cc, const int warp_size, const int nwarps) {
+static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int cc, const int warp_size, const int nwarps,
+        const bool use_ids) {
     const tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, mmq_y);
     const int mmq_tile_x_k = mmq_get_mma_tile_x_k(type);
-    const size_t nbs_ids = mmq_x*sizeof(int);
+    // [TAG_MMQ_IDS_SMEM] The ids tile is only read by MUL_MAT_ID. Plain MUL_MAT
+    // used to reserve it anyway and fill it with the identity permutation, which
+    // cost mmq_x*4 B of LDS for nothing. That reservation is what kept Q2_K off
+    // its spill-free tiles on RDNA4 (it missed mmq_x=96 by exactly these bytes).
+    // GGML_CUDA_MMQ_IDS_SMEM_LEGACY=1 restores the old always-reserve behaviour
+    // (A/B instrument + safety valve if a shape ever misbehaves without the tile).
+    static const bool ids_smem_legacy = getenv("GGML_CUDA_MMQ_IDS_SMEM_LEGACY") != nullptr;
+    const size_t nbs_ids = (use_ids || ids_smem_legacy) ? mmq_x*sizeof(int) : 0;
     const size_t nbs_x = (turing_mma_available(cc) || amd_mfma_available(cc) || amd_wmma_available(cc)) ? mmq_y*mmq_tile_x_k*sizeof(int) : txs.qs*sizeof(int) + txs.dm*sizeof(half2) + txs.sc*sizeof(int);
     const size_t nbs_y = mmq_x * (sizeof(block_q8_1_mmq));
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
@@ -4837,7 +4851,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
-    const int nbytes_shared = mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps);
+    const int nbytes_shared = mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps, args.ids_dst != nullptr);
 
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false>), nbytes_shared);
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true>), nbytes_shared);
@@ -4953,10 +4967,20 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     int mmq_x_best  = 0;
     int ntiles_x_best = INT_MAX;
 
+    // [TAG_Q2_K_WMMA_MMQ_X_HISTORY] Q2_K on RDNA4 used to land on mmq_x=80, which
+    // spills 731 VGPRs / 2264 B scratch per lane and made Q2_K prefill ~7x slower
+    // than its k-quant siblings (pp512 312 vs Q4_K 2305 / Q5_K 3597 on the same
+    // 8B model). Its spill-free tiles (96/112/128) were unreachable because the
+    // ids tile was reserved for every matmul -- at mmq_x=96 Q2_K missed smpbo by
+    // exactly those mmq_x*4 bytes. With [TAG_MMQ_IDS_SMEM] plain MUL_MAT no longer
+    // reserves it, so x=96 fits at exactly 65536 and this loop reaches it without
+    // a per-type cap. Measured pp512 (sparse-llama-8B-Q2_K, R9700, r=3):
+    // mmq_x 80 -> 323.94, 32 -> 1216.84, 96 -> 1949.72.
     for (int mmq_x = 8; mmq_x <= mmq_x_max && ntiles_x_best > 1; mmq_x += 8) {
         const int granularity = mmq_get_granularity_host(mmq_x, cc);
 
-        if (mmq_x % granularity != 0 || mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps) > smpbo) {
+        if (mmq_x % granularity != 0 ||
+                mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps, args.ids_dst != nullptr) > smpbo) {
             continue;
         }
 
@@ -4965,6 +4989,15 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
         if (ntiles_x < ntiles_x_best) {
             mmq_x_best = mmq_x;
             ntiles_x_best = ntiles_x;
+        }
+    }
+
+    // EXPERIMENT (2026-08-22, Q2_K prefill spill investigation): force a specific
+    // mmq_x to measure the spill/perf relationship. Remove once the fix lands.
+    if (const char * e = getenv("GGML_CUDA_MMQ_X_FORCE")) {
+        const int forced = atoi(e);
+        if (forced > 0) {
+            mmq_x_best = forced;
         }
     }
 
