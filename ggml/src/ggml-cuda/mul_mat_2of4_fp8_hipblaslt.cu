@@ -426,7 +426,10 @@ void wcache_invalidate_range(const void * base, size_t size) {
         }
     }
 }
-struct wcache_registrar { wcache_registrar() { ggml_hipblaslt_wcache_register(wcache_invalidate_range); } };
+struct wcache_registrar {
+    wcache_registrar()  { ggml_hipblaslt_wcache_register  (wcache_invalidate_range); }
+    ~wcache_registrar() { ggml_hipblaslt_wcache_unregister(wcache_invalidate_range); }
+};
 wcache_registrar g_wcache_registrar;
 
 } // namespace

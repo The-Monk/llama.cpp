@@ -18,5 +18,15 @@ typedef void (*ggml_hipblaslt_wcache_invalidator)(const void * base, size_t size
 
 void ggml_hipblaslt_wcache_register(ggml_hipblaslt_wcache_invalidator fn);
 
+// Every registered function MUST be unregistered before the library that owns it
+// is unloaded. ggml_backend_load_all() can find libggml-hip twice (once via
+// LD_LIBRARY_PATH and once in the directory of the executable); under RTLD_GLOBAL
+// both copies of the registrar resolve to the FIRST copy of the registry, so the
+// second copy of the library leaves its function pointers in the first copy of the
+// vector. When that second copy is then dlclosed, invalidate() would call into an
+// unmapped page and segfault at teardown. Each registrar therefore unregisters
+// itself from its destructor, which runs at library fini -- before the unmap.
+void ggml_hipblaslt_wcache_unregister(ggml_hipblaslt_wcache_invalidator fn);
+
 // Drop every cached entry whose weight pointer lies in [base, base+size).
 void ggml_hipblaslt_wcache_invalidate(const void * base, size_t size);

@@ -1,4 +1,5 @@
 #include "hipblaslt_wcache.cuh"
+#include <algorithm>
 #include <mutex>
 #include <vector>
 
@@ -14,6 +15,13 @@ void ggml_hipblaslt_wcache_register(ggml_hipblaslt_wcache_invalidator fn) {
     if (!fn) return;
     std::lock_guard<std::mutex> lk(registry_mtx());
     registry().push_back(fn);
+}
+
+void ggml_hipblaslt_wcache_unregister(ggml_hipblaslt_wcache_invalidator fn) {
+    if (!fn) return;
+    std::lock_guard<std::mutex> lk(registry_mtx());
+    auto & v = registry();
+    v.erase(std::remove(v.begin(), v.end(), fn), v.end());
 }
 
 void ggml_hipblaslt_wcache_invalidate(const void * base, size_t size) {
