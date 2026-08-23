@@ -732,8 +732,14 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
 #pragma unroll
     for (int j2 = 0; j2 < 4; ++j2) {
         const int b  = bq1_0->qs[offset + j2];
-        const int lo = ( b       | (b << 7) | (b << 14) | (b << 21)) & 0x01010101; // bits 0..3 -> bytes
-        const int hi = ((b >> 4) | (b << 3) | (b << 10) | (b << 17)) & 0x01010101; // bits 4..7 -> bytes
+        // Multiply-based bit spread: bit i must land at byte i (position 8i), so we
+        // need copies at shift 7i -- exactly what multiplying by a constant with bits
+        // at {0,7,14,21} = 0x00204081 produces. Stray copies land at positions
+        // i+7j which are byte-aligned only when i==j (mod 8), so the mask removes
+        // them. Bit-identical to the shift-or chain, 5 ops per byte instead of 8;
+        // operands fit in 24 bits so this lowers to full-rate v_mul_u32_u24.
+        const int lo = ( b        * 0x00204081) & 0x01010101; // bits 0..3 -> bytes
+        const int hi = ((b >> 4)  * 0x00204081) & 0x01010101; // bits 4..7 -> bytes
         sumi = ggml_cuda_dp4a(lo, get_int_b4(bq8_1_chunk->qs, 2*j2 + 0), sumi);
         sumi = ggml_cuda_dp4a(hi, get_int_b4(bq8_1_chunk->qs, 2*j2 + 1), sumi);
     }
