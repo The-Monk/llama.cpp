@@ -769,11 +769,16 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     int sumi = 0;   // = dot(c, u), c in {0,1,2,3}
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
+        // Multiply-based spread (same trick as vec_dot_q1_0_q8_1, different stride):
+        // a 2-bit code i sits at bit 2i and must land at byte i (bit 8i), so it needs
+        // a copy at shift 6i -- multiplying by bits {0,6,12,18} = 0x00041041. Strays
+        // land at 2i+6j, byte-aligned only when i==j, so the existing mask clears
+        // them. 8-bit x 19-bit operands, 27-bit product => full-rate v_mul_u32_u24.
         const int b0 = (qs0 >> (j*8)) & 0xFF;
-        const int s0 = (b0 | (b0 << 6) | (b0 << 12) | (b0 << 18)) & 0x03030303; // 4 codes -> 4 bytes
+        const int s0 = (b0 * 0x00041041) & 0x03030303; // 4 codes -> 4 bytes
         sumi = ggml_cuda_dp4a(s0, get_int_b4(bq8_1_chunk->qs, j), sumi);
         const int b1 = (qs1 >> (j*8)) & 0xFF;
-        const int s1 = (b1 | (b1 << 6) | (b1 << 12) | (b1 << 18)) & 0x03030303;
+        const int s1 = (b1 * 0x00041041) & 0x03030303;
         sumi = ggml_cuda_dp4a(s1, get_int_b4(bq8_1_chunk->qs, 4 + j), sumi);
     }
 
