@@ -654,6 +654,8 @@ static __global__ void mul_mat_vec_q(
     const uint32_t sample_y    = sample_dst;
 
     bool use_gate = false;
+    bool use_split = false;                 // [TAG_MMVQ_PAIR]
+    float * split_dst = nullptr;            // [TAG_MMVQ_PAIR]
     bool use_bias = false;
     bool use_gate_bias = false;
     bool use_scale = false;
@@ -666,6 +668,8 @@ static __global__ void mul_mat_vec_q(
     ggml_glu_op active_glu;
 
     if constexpr (has_fusion) {
+        split_dst     = (float *) fusion.split_dst;   // [TAG_MMVQ_PAIR]
+        use_split     = split_dst != nullptr;
         use_gate      = fusion.gate      != nullptr;
         use_bias      = fusion.x_bias    != nullptr;
         use_gate_bias = fusion.gate_bias != nullptr && use_gate;
@@ -791,6 +795,11 @@ static __global__ void mul_mat_vec_q(
     }
 
     dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
+    if constexpr (has_fusion) {   // [TAG_MMVQ_PAIR]
+        if (use_split) {
+            split_dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
+        }
+    }
 
     // sum up partial sums and write back result
 #pragma unroll
@@ -820,7 +829,7 @@ static __global__ void mul_mat_vec_q(
                         result *= x_scales;
                     }
                     result += x_biases[j];
-                    if (use_gate) {
+                    if (use_gate && !use_split) {   // [TAG_MMVQ_PAIR]
                         float gate_value = tmp_gate[j][i];
                         if constexpr (type == GGML_TYPE_NVFP4) {
                             gate_value *= gate_scales;
@@ -843,12 +852,17 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
                 dst[j*stride_col_dst + i] = result;
+                if constexpr (has_fusion) {   // [TAG_MMVQ_PAIR]
+                    if (use_split) {
+                        split_dst[j*stride_col_dst + i] = tmp_gate[j][i];
+                    }
+                }
             }
         }
     }
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, gate_bias, x_bias, x_scale, gate_scale, tmp_gate, use_split, split_dst);
     }
     if constexpr (type != GGML_TYPE_NVFP4) {
         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
@@ -1378,6 +1392,15 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
             GGML_ASSERT(!ids || fusion->x_bias->ne[1] == src0->ne[2]);
             fusion_local.x_bias = fusion->x_bias->data;
+        }
+        if (fusion->split_dst) {   // [TAG_MMVQ_PAIR]
+            GGML_ASSERT(fusion->gate != nullptr);
+            GGML_ASSERT(fusion->split_dst->type == GGML_TYPE_F32);
+            GGML_ASSERT(ggml_are_same_shape(fusion->split_dst, dst));
+            GGML_ASSERT(ggml_is_contiguous(fusion->split_dst));
+            GGML_ASSERT(fusion->x_bias == nullptr && fusion->gate_bias == nullptr);
+            GGML_ASSERT(fusion->x_scale == nullptr && fusion->gate_scale == nullptr);
+            fusion_local.split_dst = fusion->split_dst->data;
         }
         if (fusion->gate) {
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));

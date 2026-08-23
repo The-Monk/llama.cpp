@@ -3911,6 +3911,97 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// [TAG_MMVQ_PAIR] Two decode MUL_MATs that consume the SAME activation and have
+// identical weight geometry can share one mmvq launch: the kernel already walks
+// two weight streams for the gate/up GLU fusion, so we reuse that machinery and
+// only change the epilogue to write two separate outputs.
+//
+// The win is on tiny matmuls. Bonsai-27B ssm_alpha/ssm_beta are 48x5120 (34 KB)
+// and measure 3.03 us each at 11 GB/s -- ~98% launch and memory latency, not
+// bandwidth. At 12 workgroups they cannot fill the GPU no matter how they are
+// launched (verified: a wave-count sweep reproduces 11 GB/s at 12 waves), so the
+// only fix is to stop launching them separately.
+//
+// The partner is not adjacent (alpha and beta are 6 nodes apart, separated by
+// the ADD/SOFTPLUS/MUL that consume alpha), so it is hoisted. Hoisting is only
+// safe if nothing in between writes storage the partner reads or writes --
+// ggml-alloc reuses buffers, so that is checked against real byte ranges below.
+//
+// Returns the partner node index, or -1.
+static int ggml_cuda_find_mmvq_pair(const ggml_cgraph * cgraph, int i, int cc) {
+    static const bool enabled = getenv("GGML_CUDA_MMVQ_PAIR") != nullptr &&
+                                std::atoi(getenv("GGML_CUDA_MMVQ_PAIR")) != 0;
+    static const bool trace   = getenv("GGML_CUDA_MMVQ_PAIR_TRACE") != nullptr;
+    if (!enabled) {
+        return -1;
+    }
+
+    const ggml_tensor * a = cgraph->nodes[i];
+    if (a->op != GGML_OP_MUL_MAT || a->src[2] != nullptr) {
+        return -1;
+    }
+
+    const ggml_tensor * wa  = a->src[0];
+    const ggml_tensor * act = a->src[1];
+
+    // decode only: single token, no channels/samples, and a type mmvq handles
+    if (act->ne[1] != 1 || act->ne[2] != 1 || act->ne[3] != 1) return -1;
+    if (wa->ne[2]  != 1 || wa->ne[3]  != 1)                    return -1;
+    if (a->type != GGML_TYPE_F32 || !ggml_is_contiguous(a))    return -1;
+    if (!ggml_cuda_should_use_mmvq(wa->type, cc, act->ne[1]))  return -1;
+
+    auto overlaps = [](const ggml_tensor * x, const ggml_tensor * y) {
+        if (!x || !y || !x->buffer || !y->buffer || !x->data || !y->data) return true;
+        const int64_t xs = (int64_t) x->data;
+        const int64_t xe = xs + ggml_backend_buft_get_alloc_size(x->buffer->buft, x);
+        const int64_t ys = (int64_t) y->data;
+        const int64_t ye = ys + ggml_backend_buft_get_alloc_size(y->buffer->buft, y);
+        return (ys <= xs && xs < ye) || (xs <= ys && ys < xe);
+    };
+
+    const int max_lookahead = 8;
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + max_lookahead; ++j) {
+        const ggml_tensor * b = cgraph->nodes[j];
+
+        if (b->op == GGML_OP_MUL_MAT && b->src[1] == act && b->src[2] == nullptr) {
+            const ggml_tensor * wb = b->src[0];
+            const bool same_geom =
+                wb->type == wa->type && ggml_are_same_stride(wb, wa) &&
+                wb->ne[0] == wa->ne[0] && wb->ne[1] == wa->ne[1] &&
+                wb->ne[2] == 1 && wb->ne[3] == 1 &&
+                b->type == GGML_TYPE_F32 && ggml_is_contiguous(b) &&
+                ggml_are_same_shape(b, a) && b != a && wb != wa;
+            if (same_geom) {
+                // Hoisting b to i is only legal if no node strictly between them
+                // writes anything b depends on, or b's own output.
+                for (int k = i + 1; k < j; ++k) {
+                    const ggml_tensor * mid = cgraph->nodes[k];
+                    if (ggml_cuda_is_view_or_noop(mid)) continue;
+                    if (overlaps(mid, b) || overlaps(mid, wb) || overlaps(mid, act)) {
+                        return -1;
+                    }
+                }
+                if (overlaps(a, b)) {
+                    return -1;
+                }
+                // GGML_CUDA_MMVQ_PAIR_TRACE=1 prints every merge. This exists to
+                // prove a test actually EXECUTES this path: prefill perplexity and
+                // test-backend-ops both report 0 fires, i.e. they do not cover it.
+                if (trace) {
+                    fprintf(stderr, "PAIR_FIRE %s + %s\n", wa->name, wb->name);
+                }
+                return j;
+            }
+        }
+
+        // a later node reading/writing our activation ends the search
+        if (!ggml_cuda_is_view_or_noop(b) && overlaps(b, act)) {
+            return -1;
+        }
+    }
+    return -1;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4771,8 +4862,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // [TAG_MMVQ_PAIR] nodes already produced by an earlier grouped launch
+            std::vector<bool> mmvq_pair_done(cgraph->n_nodes, false);
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (mmvq_pair_done[i]) {
+                    continue;
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -4841,6 +4938,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #else
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
+
+                // [TAG_MMVQ_PAIR] fold a shape-identical sibling matmul into this launch
+                {
+                    const int pair_j = ggml_cuda_find_mmvq_pair(cgraph, i, ggml_cuda_info().devices[cuda_ctx->device].cc);
+                    if (pair_j > i) {
+                        ggml_cuda_mm_fusion_args_host pair_fusion{};
+                        pair_fusion.gate      = cgraph->nodes[pair_j]->src[0];
+                        pair_fusion.split_dst = cgraph->nodes[pair_j];
+                        ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, node, &pair_fusion);
+                        mmvq_pair_done[pair_j] = true;
+                        if (!is_concurrent_event_active) {
+                            try_launch_concurrent_event(node);
+                        }
+                        continue;
+                    }
+                }
 
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {

@@ -1909,6 +1909,10 @@ struct ggml_backend_cuda_context {
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
+    // [TAG_MMVQ_PAIR] When set, `gate` is NOT a GLU gate: it is a second,
+    // independent weight matrix that shares this matmul's activation, and its
+    // result is written here instead of being combined into one output.
+    const ggml_tensor * split_dst = nullptr;
     const ggml_tensor * gate_bias = nullptr;
     const ggml_tensor * x_scale = nullptr;
     const ggml_tensor * gate_scale = nullptr;
@@ -1917,6 +1921,7 @@ struct ggml_cuda_mm_fusion_args_host {
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
     const void * gate = nullptr;
+    void * split_dst = nullptr;   // [TAG_MMVQ_PAIR]
     const void * gate_bias = nullptr;
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
