@@ -393,7 +393,10 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
             // PC-sampled 9.5% of the kernel -- plus the long live ranges
             // feeding the mmq_x=128 scratch spills).
             const int bits4  = (qs0 >> (j*4)) & 0x0F;
-            const int spread = (bits4 | (bits4 << 7) | (bits4 << 14) | (bits4 << 21)) & 0x01010101;
+            // one v_mul_u32_u24 replaces the shift-or chain: bit i must reach byte i
+            // (bit 8i), i.e. a copy at shift 7i = multiply by bits {0,7,14,21}.
+            // Strays are not byte-aligned, so the existing mask clears them.
+            const int spread = (bits4 * 0x00204081) & 0x01010101;
             unpacked_bytes[j] = ((spread << 1) + 0x7F7F7F7F) ^ 0x80808080;
         }
 
@@ -474,6 +477,8 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
             // 2-bit spread to {0,1,2} bytes, then c-1 per byte carry-free:
             // (c + 0x7F) ^ 0x80 (see the q1_0 unpack above)
             const int codes  = (qs0 >> (j*8)) & 0xFF;
+            // 2-bit codes: code i at bit 2i must reach byte i (bit 8i) => copy at
+            // shift 6i = multiply by bits {0,6,12,18}. Mask clears the strays.
             const int spread = (codes | (codes << 6) | (codes << 12) | (codes << 18)) & 0x03030303;
             unpacked_bytes[j] = (spread + 0x7F7F7F7F) ^ 0x80808080;
         }
@@ -482,6 +487,8 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
             // 2-bit spread to {0,1,2} bytes, then c-1 per byte carry-free:
             // (c + 0x7F) ^ 0x80 (see the q1_0 unpack above)
             const int codes  = (qs1 >> (j*8)) & 0xFF;
+            // 2-bit codes: code i at bit 2i must reach byte i (bit 8i) => copy at
+            // shift 6i = multiply by bits {0,6,12,18}. Mask clears the strays.
             const int spread = (codes | (codes << 6) | (codes << 12) | (codes << 18)) & 0x03030303;
             unpacked_bytes[4 + j] = (spread + 0x7F7F7F7F) ^ 0x80808080;
         }

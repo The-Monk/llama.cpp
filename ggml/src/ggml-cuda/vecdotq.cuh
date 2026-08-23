@@ -728,7 +728,11 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     // select chain that materialized +-1 bytes (~2.5x the VALU ops on a
     // VALU-bound kernel; measured 43.96 -> see VALIDATION log, Bonsai-27B).
     const int offset = iqs * 4;
-    int sumi = 0;   // = dot(c, u), c in {0,1}
+    // Two independent accumulators: every dp4a used to feed the SAME sumi, making
+    // an 8-deep serial chain that the compiler padded with s_delay_alu/s_wait_alu.
+    // Integer addition is associative, so splitting and summing at the end is
+    // bit-identical while halving the dependency depth.
+    int sumi_a = 0, sumi_b = 0;   // = dot(c, u), c in {0,1}
 #pragma unroll
     for (int j2 = 0; j2 < 4; ++j2) {
         const int b  = bq1_0->qs[offset + j2];
@@ -738,11 +742,17 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
         // i+7j which are byte-aligned only when i==j (mod 8), so the mask removes
         // them. Bit-identical to the shift-or chain, 5 ops per byte instead of 8;
         // operands fit in 24 bits so this lowers to full-rate v_mul_u32_u24.
-        const int lo = ( b        * 0x00204081) & 0x01010101; // bits 0..3 -> bytes
-        const int hi = ((b >> 4)  * 0x00204081) & 0x01010101; // bits 4..7 -> bytes
-        sumi = ggml_cuda_dp4a(lo, get_int_b4(bq8_1_chunk->qs, 2*j2 + 0), sumi);
-        sumi = ggml_cuda_dp4a(hi, get_int_b4(bq8_1_chunk->qs, 2*j2 + 1), sumi);
+        // NOTE the & 0x0F: multiplication ADDS the shifted copies, so the input must
+        // be narrow enough that they never overlap. With shift 7 a 4-bit input spans
+        // 0..3 / 7..10 / 14..17 / 21..24 -- disjoint. An 8-bit input overlaps at bit 7
+        // and the carry lands in bit 8, which the mask keeps (wrong for 64/256 bytes).
+        // Only bits 0..3 survive the mask anyway, so this is exactly the OR chain.
+        const int lo = ((b & 0x0F) * 0x00204081) & 0x01010101; // bits 0..3 -> bytes
+        const int hi = ((b >> 4)   * 0x00204081) & 0x01010101; // bits 4..7 -> bytes
+        sumi_a = ggml_cuda_dp4a(lo, get_int_b4(bq8_1_chunk->qs, 2*j2 + 0), sumi_a);
+        sumi_b = ggml_cuda_dp4a(hi, get_int_b4(bq8_1_chunk->qs, 2*j2 + 1), sumi_b);
     }
+    const int sumi = sumi_a + sumi_b;
 
     const float d8 = __low2float(bq8_1_chunk->ds);
     const float s8 = __high2float(bq8_1_chunk->ds); // = d8 * sum(u)
@@ -766,7 +776,9 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     const int qs1 = bq2_0->qs[offset + 4] | (bq2_0->qs[offset + 5] << 8) |
                     (bq2_0->qs[offset + 6] << 16) | (bq2_0->qs[offset + 7] << 24);
 
-    int sumi = 0;   // = dot(c, u), c in {0,1,2,3}
+    // Two independent accumulators (see vec_dot_q1_0_q8_1): bit-identical, halves
+    // the dp4a dependency depth.
+    int sumi_a = 0, sumi_b = 0;   // = dot(c, u), c in {0,1,2,3}
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         // Multiply-based spread (same trick as vec_dot_q1_0_q8_1, different stride):
@@ -774,13 +786,16 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
         // a copy at shift 6i -- multiplying by bits {0,6,12,18} = 0x00041041. Strays
         // land at 2i+6j, byte-aligned only when i==j, so the existing mask clears
         // them. 8-bit x 19-bit operands, 27-bit product => full-rate v_mul_u32_u24.
+        // NO multiply form here: 4 codes need shift 6, and an 8-bit input's copies
+        // overlap at bits 6..7, carrying into bit 8 (wrong for 96/256 inputs).
         const int b0 = (qs0 >> (j*8)) & 0xFF;
-        const int s0 = (b0 * 0x00041041) & 0x03030303; // 4 codes -> 4 bytes
-        sumi = ggml_cuda_dp4a(s0, get_int_b4(bq8_1_chunk->qs, j), sumi);
+        const int s0 = (b0 | (b0 << 6) | (b0 << 12) | (b0 << 18)) & 0x03030303; // 4 codes -> 4 bytes
+        sumi_a = ggml_cuda_dp4a(s0, get_int_b4(bq8_1_chunk->qs, j), sumi_a);
         const int b1 = (qs1 >> (j*8)) & 0xFF;
-        const int s1 = (b1 * 0x00041041) & 0x03030303;
-        sumi = ggml_cuda_dp4a(s1, get_int_b4(bq8_1_chunk->qs, 4 + j), sumi);
+        const int s1 = (b1 | (b1 << 6) | (b1 << 12) | (b1 << 18)) & 0x03030303;
+        sumi_b = ggml_cuda_dp4a(s1, get_int_b4(bq8_1_chunk->qs, 4 + j), sumi_b);
     }
+    const int sumi = sumi_a + sumi_b;
 
     const float d8 = __low2float(bq8_1_chunk->ds);
     const float s8 = __high2float(bq8_1_chunk->ds); // = d8 * sum(u)
