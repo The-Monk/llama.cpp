@@ -776,8 +776,23 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     const int qs1 = bq2_0->qs[offset + 4] | (bq2_0->qs[offset + 5] << 8) |
                     (bq2_0->qs[offset + 6] << 16) | (bq2_0->qs[offset + 7] << 24);
 
-    // Two independent accumulators (see vec_dot_q1_0_q8_1): bit-identical, halves
-    // the dp4a dependency depth.
+    // Independent accumulators: bit-identical (integer adds reassociate exactly),
+    // and each one shortens the serial dp4a chain.
+    //
+    // Context for the null result recorded below (T212, measured on gfx1201):
+    // Q2_0 decode is LATENCY bound, not
+    // capacity bound -- at the achieved point it uses only 38% of instruction
+    // issue and 63% of memory bandwidth, so neither pipe is saturated and the
+    // limiter is the dependent unpack->dp4a chain. Registers are nearly free
+    // here: the kernel requests 83 VGPRs and the HW allocation granularity is
+    // 24, so anything up to 96 requested still allocates 96 and still yields
+    // 16 waves/SIMD. Past 96 the next granule (120) costs 25% occupancy --
+    // that is the hard budget, verified with rga --livereg.
+    // MEASURED NULL, do not retry: splitting these into FOUR accumulators
+    // (chain depth 4 -> 2) costs zero registers (83 VGPRs either way, still
+    // allocates 96, still 16 waves/SIMD) and changes nothing --
+    // Bonsai-27B-Q2_0 tg64, 3 interleaved rounds: 50.33 -> 50.10 (-0.5%,
+    // inside noise). The dp4a accumulator chain is not the latency bottleneck.
     int sumi_a = 0, sumi_b = 0;   // = dot(c, u), c in {0,1,2,3}
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -796,6 +811,7 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
         sumi_b = ggml_cuda_dp4a(s1, get_int_b4(bq8_1_chunk->qs, 4 + j), sumi_b);
     }
     const int sumi = sumi_a + sumi_b;
+
 
     const float d8 = __low2float(bq8_1_chunk->ds);
     const float s8 = __high2float(bq8_1_chunk->ds); // = d8 * sum(u)

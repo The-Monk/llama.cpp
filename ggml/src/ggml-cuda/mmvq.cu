@@ -535,15 +535,36 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 // roc10 mmvq slim-to-upstream. Re-measured on gfx1201
                 // (Bonsai-27B Q2_0, tg128, r=5): nwarps=8 52.28 +/- 0.32 vs
                 // nwarps=1 50.84 +/- 0.30, so the drop cost 2.8%.
-                // NOTE: Q1_0 is deliberately NOT here -- same test says it
-                // REGRESSES 8.2% at nwarps=8 (67.6 -> 62.1), because its
-                // cheaper vec_dot doesn't pay for the cross-warp LDS
-                // reduction + barrier that nwarps>1 introduces.
+                // NOTE: Q1_0 WAS deliberately not here, on a test that only
+                // sampled 1 vs 8 and found -8.2% (67.6 -> 62.1). The curve
+                // between them is NOT monotonic, so that conclusion was right
+                // about 8 and wrong about "more warps". Full sweep on gfx1201,
+                // Bonsai-27B-Q1_0, tg128 r=5, interleaved, 3 rounds, medians
+                // (2026-08-24), every variant correctness-gated with
+                // test-backend-ops -o MUL_MAT before being timed:
+                //   nwarps  1     3     6     7     8     10    12    15
+                //   t/s     69.75 73.37 74.73 74.47 69.38 71.89 65.12 66.52
+                //   vs 1     --    +5.2% +7.1% +6.8% -0.5% +3.1% -6.6% -4.6%
+                // Peak 6-7; >=8 is at or below baseline. Q1_0 takes nwarps=6
+                // in its own case below.
+                // Corroborated by counters, not t/s alone: same bytes moved
+                // (GL2C_EA_RDREQ 0.972x) for 7% fewer GPU cycles
+                // (GRBM_GUI_ACTIVE 0.930x) => 138.0 -> 148.3 bytes/cycle, so
+                // the win is real bandwidth rather than a timing artifact.
+                // CAVEAT: wave concurrency saturates immediately -- nwarps 3
+                // and 6 have IDENTICAL cycles, so 6x the waves buys the same
+                // 7% that 3x buys. This lever is spent; the remaining gap to
+                // Q8_0-class efficiency (Q1_0 ~46% of roofline vs 94%) is
+                // elsewhere.
                 case GGML_TYPE_Q2_0:
                 // F8E5M2: nwarps=8 19.87 +/- 0.08 vs nwarps=1 19.63 +/- 0.06
                 // (Qwen3.6-27B, tg128, r=5) = +1.2%. Small but outside noise.
                 case GGML_TYPE_F8E5M2:
                     return 8;
+                // Q1_0: swept 1..15, peak at 6 (+7.1% vs the shipped nwarps=1).
+                // See the sweep table above.
+                case GGML_TYPE_Q1_0:
+                    return 6;
                 default:
                     return 1;
             }
