@@ -735,6 +735,17 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     // Integer addition is associative, so splitting and summing at the end is
     // bit-identical while halving the dependency depth.
     int sumi_a = 0, sumi_b = 0;   // = dot(c, u), c in {0,1}
+    // MEASURED NULL, do not retry (T212, 2026-08-24): the "Q1_0 issues 1.56x
+    // more TEX_LOAD per byte than Q2_0 because it does four separate byte loads
+    // here, where Q2_0 ORs them into one int" theory is WRONG. Rewriting this
+    // to assemble the dword first and extract by shift -- i.e. Q2_0's exact
+    // idiom -- emits the SAME NUMBER OF LOADS: global_load count 20 vs 20
+    // (rga --isa, mul_mat_vec_q<41,1,false,false>). The compiler already merges
+    // these, as it was already found to for Q2_0 (T212 dead hypothesis 2).
+    // Bonsai-27B-Q1_0 tg128 r=3, 3 interleaved rounds via LD_LIBRARY_PATH
+    // library snapshots: 73.54 -> 73.57 mean (+0.04%, noise +/-1.2). VGPR 56->54,
+    // both far under the 96 cliff. The 1.56x/byte is structural -- the same
+    // per-block load work spread over half as many bytes -- not a source shape.
 #pragma unroll
     for (int j2 = 0; j2 < 4; ++j2) {
         const int b  = bq1_0->qs[offset + j2];
@@ -832,7 +843,48 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
 // truncation), and q*3 <= 255*3 < 2^10 stays clear of the neighboring lane
 // before the >>8. Verified bit-exact vs the scalar reference on the host,
 // exhaustively per lane and over 2M random words (all 5 trit positions).
+// T212 CEILING PROBE (diagnostic, WRONG RESULTS when enabled at compile time).
+// block_tq1_0 is 54 bytes and qs sits at byte offset 6 (behind d and qh), so it
+// is 2-aligned, never 4-aligned -- get_int_b2 must issue TWO 16-bit loads per
+// int (measured: 24 global_loads vs Q2_0's 9). Making it one aligned dword load
+// requires padding the block to a multiple of 4, which is a FORMAT change and
+// breaks upstream TQ1_0 compatibility. Before paying that, bound the prize:
+// this reads the SAME 16-bit half twice, halving the load count and dropping
+// the shift+or, at the cost of correctness. Upper bound only -- a real aligned
+// load also returns the right bytes, but cannot be cheaper than this.
+#ifndef GGML_TQ1_0_LOAD_CEILING_PROBE
+#define GGML_TQ1_0_LOAD_CEILING_PROBE 0
+#endif
+static __device__ __forceinline__ int ggml_cuda_tq1_0_get_int(const void * x, const int i32) {
+#if GGML_TQ1_0_LOAD_CEILING_PROBE
+    const uint16_t * x16 = (const uint16_t *) x;
+    const int lo = x16[2*i32 + 0];
+    return lo | (lo << 16);           // one load, wrong data, valid timing
+#else
+    return get_int_b2(x, i32);
+#endif
+}
+
 static __device__ __forceinline__ int ggml_cuda_tq1_0_extract4(const int x, const int p3) {
+#if defined(GGML_USE_HIP) && defined(__gfx1201__)
+    // v_perm_b32 form: 9 ops instead of 15. Two independent savings, both from
+    // letting the byte-permute do work the scalar form spends shifts+masks on:
+    //   (a) the odd-byte split is a byte gather, not a shift+mask. Selector byte
+    //       0x0C emits a constant 0x00, so one perm builds {x1,0,x3,0}.
+    //   (b) the (*3 >> 8) & mask tail is just "take byte 1 of each 16-bit lane".
+    //       Each lane holds v <= 255, so v*3 <= 765 occupies bits 0..9 and cannot
+    //       carry into the neighbouring lane -- byte1 IS (v*3)>>8 exactly. So the
+    //       final perm selects me.byte1, mo.byte1, me.byte3, mo.byte3 and the two
+    //       shifts, two masks and the or all disappear into it.
+    // Bit-identical to the scalar path by construction, not by approximation.
+    const int even = x & 0x00FF00FF;
+    const int odd  = (int) __builtin_amdgcn_perm((uint32_t) x, (uint32_t) x, 0x0C030C01u);
+    const int qe   = (even * p3) & 0x00FF00FF;
+    const int qo   = (odd  * p3) & 0x00FF00FF;
+    const int me   = qe * 3;
+    const int mo   = qo * 3;
+    return (int) __builtin_amdgcn_perm((uint32_t) mo, (uint32_t) me, 0x07030501u);
+#else
     const int even = x & 0x00FF00FF;
     const int odd  = (x >> 8) & 0x00FF00FF;
     const int qe   = (even * p3) & 0x00FF00FF;
@@ -840,6 +892,7 @@ static __device__ __forceinline__ int ggml_cuda_tq1_0_extract4(const int x, cons
     const int te   = ((qe * 3) >> 8) & 0x00FF00FF;
     const int to   = ((qo * 3) >> 8) & 0x00FF00FF;
     return te | (to << 8);
+#endif
 }
 
 static __device__ __forceinline__ float vec_dot_tq1_0_q8_1(
@@ -874,8 +927,8 @@ static __device__ __forceinline__ float vec_dot_tq1_0_q8_1(
         const int p = (int)((pow3_packed >> (7*iqs)) & 0x7F);
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
-            const int x0 = get_int_b2(bq->qs, 2*k + 0);
-            const int x1 = get_int_b2(bq->qs, 2*k + 1);
+            const int x0 = ggml_cuda_tq1_0_get_int(bq->qs, 2*k + 0);
+            const int x1 = ggml_cuda_tq1_0_get_int(bq->qs, 2*k + 1);
             sumi_a = ggml_cuda_dp4a(ggml_cuda_tq1_0_extract4(x0, p), get_int_b4(bq8->qs, 2*k + 0), sumi_a);
             sumi_b = ggml_cuda_dp4a(ggml_cuda_tq1_0_extract4(x1, p), get_int_b4(bq8->qs, 2*k + 1), sumi_b);
         }
@@ -887,7 +940,7 @@ static __device__ __forceinline__ float vec_dot_tq1_0_q8_1(
         const int p1 = (int)((pow3_packed >> (7*(n0 + 1))) & 0x7F);
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
-            const int x = get_int_b2(bq->qs, 8 + k); // bytes 32+4k .. 35+4k
+            const int x = ggml_cuda_tq1_0_get_int(bq->qs, 8 + k); // bytes 32+4k .. 35+4k
             sumi_a = ggml_cuda_dp4a(ggml_cuda_tq1_0_extract4(x, p0), get_int_b4(bq8->qs, k    ), sumi_a);
             sumi_b = ggml_cuda_dp4a(ggml_cuda_tq1_0_extract4(x, p1), get_int_b4(bq8->qs, 4 + k), sumi_b);
         }
