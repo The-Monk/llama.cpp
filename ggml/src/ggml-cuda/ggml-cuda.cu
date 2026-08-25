@@ -4984,6 +4984,24 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
 
+                // T212 CEILING PROBE (diagnostic, PRODUCES WRONG RESULTS).
+                // GGML_HIP_SKIP_RMS_NORM=1 skips RMS_NORM dispatches entirely to
+                // bound the maximum possible saving from fusing rms_norm into
+                // quantize_q8_1. This is an UPPER bound and unreachable in
+                // practice: a real fusion still performs the norm arithmetic,
+                // it only removes the dispatch and the activation round-trip.
+                // If the ceiling is small, do not build the fusion.
+                // Value-parsed, NOT presence-checked: a presence check makes
+                // GGML_HIP_SKIP_RMS_NORM=0 *enable* the probe, which is the
+                // footgun already noted for GGML_HIP_F8E5M2_DOT4.
+                static const bool skip_rms_norm = [] {
+                    const char * e = getenv("GGML_HIP_SKIP_RMS_NORM");
+                    return e && e[0] && e[0] != '0';
+                }();
+                if (skip_rms_norm && node->op == GGML_OP_RMS_NORM) {
+                    continue;
+                }
+
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
