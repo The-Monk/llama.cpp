@@ -5799,6 +5799,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_2OF4_F16:
                     case GGML_TYPE_IU4:
                         return op->op == GGML_OP_MUL_MAT;
+                    // TQ1_0 (upstream ternary, CPU-only upstream): fork adds the
+                    // MMVQ batch-1 decode (vec_dot_tq1_0_q8_1) + dequant fallback
+                    // (convert.cu) for larger batches. MUL_MAT only -- MUL_MAT_ID
+                    // is unwired/untested for this type.
+                    case GGML_TYPE_TQ1_0:
+                        return op->op == GGML_OP_MUL_MAT;
                     default:
                         return false;
                 }

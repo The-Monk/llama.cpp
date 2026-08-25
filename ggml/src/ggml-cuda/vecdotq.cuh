@@ -117,6 +117,8 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 #define VDR_Q2_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
 #define VDR_Q2_0_Q8_1_MMQ  2  // 2 32-element chunks per MMQ tile step
 
+#define VDR_TQ1_0_Q8_1_MMVQ 1 // one 32-element chunk (= one q8_1 block) per vec_dot call
+
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
 
@@ -816,6 +818,100 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     const float d8 = __low2float(bq8_1_chunk->ds);
     const float s8 = __high2float(bq8_1_chunk->ds); // = d8 * sum(u)
     return d2 * (d8 * sumi - s8);
+}
+
+// TQ1_0 (upstream ternary, 1.6875 bpw): 256 elements/block, 5 trits packed
+// base-3 per qs byte (48 bytes -> 240 elements) + 4 trits per qh byte
+// (4 bytes -> 16 elements). Scalar decode of one element (ggml-quants.c
+// dequantize_row_tq1_0): q = byte*pow3[n]; code = ((uint16)q*3)>>8 in {0,1,2};
+// value = (code-1)*d.
+//
+// SWAR trit extraction: pull trit n out of 4 packed bytes at once. The two
+// 16-bit lanes of `even`/`odd` never interfere: byte*pow3[n] <= 255*81 < 2^16
+// before the &0x00FF00FF re-narrow (which reproduces the scalar uint8_t
+// truncation), and q*3 <= 255*3 < 2^10 stays clear of the neighboring lane
+// before the >>8. Verified bit-exact vs the scalar reference on the host,
+// exhaustively per lane and over 2M random words (all 5 trit positions).
+static __device__ __forceinline__ int ggml_cuda_tq1_0_extract4(const int x, const int p3) {
+    const int even = x & 0x00FF00FF;
+    const int odd  = (x >> 8) & 0x00FF00FF;
+    const int qe   = (even * p3) & 0x00FF00FF;
+    const int qo   = (odd  * p3) & 0x00FF00FF;
+    const int te   = ((qe * 3) >> 8) & 0x00FF00FF;
+    const int to   = ((qo * 3) >> 8) & 0x00FF00FF;
+    return te | (to << 8);
+}
+
+static __device__ __forceinline__ float vec_dot_tq1_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_tq1_0 * bq = (const block_tq1_0 *) vbq + kbx;
+
+    // iqs in 0..7 (QI_TQ1_0 positions) selects one 32-element chunk, which is
+    // exactly one q8_1 activation block -- required so the -sum(u) offset can
+    // come from the q8_1 stored sum (same identity as vec_dot_q2_0_q8_1:
+    // codes c in {0,1,2}, symbols s = c-1, dot(s,u) = dot(c,u) - sum(u)).
+    //
+    // Element order (must match dequantize_row_tq1_0 EXACTLY):
+    //   qs bytes  0..31: elem n*32 + m       (n=0..4, m=0..31) -> elems   0..159
+    //   qs bytes 32..47: elem 160 + n*16 + m (n=0..4, m=0..15) -> elems 160..239
+    //   qh bytes  0..3 : elem 240 + n*4 + j  (n=0..3, j=0..3)  -> elems 240..255
+    // So 4 consecutive elements = trit n of 4 adjacent bytes = one dp4a operand.
+    //
+    // NOTE: block_tq1_0 is 54 bytes -> only 2-byte aligned; all quant loads
+    // must go through get_int_b2 (16-bit loads), never get_int_b4.
+    const block_q8_1 * bq8 = bq8_1 + iqs;
+
+    // pow3[n] = {1,3,9,27,81} packed in 7-bit slots of a 64-bit constant so a
+    // divergent runtime n costs a shift instead of a scratch-memory array.
+    const uint64_t pow3_packed = 1ull | (3ull << 7) | (9ull << 14) | (27ull << 21) | (81ull << 28);
+
+    // Two independent accumulators shorten the serial dp4a chain (bit-identical:
+    // integer adds reassociate exactly). Same pattern as vec_dot_q2_0_q8_1.
+    int sumi_a = 0, sumi_b = 0; // = dot(c, u), c in {0,1,2}
+    if (iqs < 5) {
+        // elems 32*iqs .. 32*iqs+31 = trit iqs of qs bytes 0..31
+        const int p = (int)((pow3_packed >> (7*iqs)) & 0x7F);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int x0 = get_int_b2(bq->qs, 2*k + 0);
+            const int x1 = get_int_b2(bq->qs, 2*k + 1);
+            sumi_a = ggml_cuda_dp4a(ggml_cuda_tq1_0_extract4(x0, p), get_int_b4(bq8->qs, 2*k + 0), sumi_a);
+            sumi_b = ggml_cuda_dp4a(ggml_cuda_tq1_0_extract4(x1, p), get_int_b4(bq8->qs, 2*k + 1), sumi_b);
+        }
+    } else if (iqs < 7) {
+        // iqs==5: elems 160..191 = trits 0,1 of qs bytes 32..47
+        // iqs==6: elems 192..223 = trits 2,3 of qs bytes 32..47
+        const int n0 = 2*(iqs - 5);
+        const int p0 = (int)((pow3_packed >> (7*(n0 + 0))) & 0x7F);
+        const int p1 = (int)((pow3_packed >> (7*(n0 + 1))) & 0x7F);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int x = get_int_b2(bq->qs, 8 + k); // bytes 32+4k .. 35+4k
+            sumi_a = ggml_cuda_dp4a(ggml_cuda_tq1_0_extract4(x, p0), get_int_b4(bq8->qs, k    ), sumi_a);
+            sumi_b = ggml_cuda_dp4a(ggml_cuda_tq1_0_extract4(x, p1), get_int_b4(bq8->qs, 4 + k), sumi_b);
+        }
+    } else {
+        // iqs==7: elems 224..239 = trit 4 of qs bytes 32..47,
+        //         elems 240..255 = trits 0..3 of qh bytes 0..3
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int x = get_int_b2(bq->qs, 8 + k);
+            sumi_a = ggml_cuda_dp4a(ggml_cuda_tq1_0_extract4(x, 81), get_int_b4(bq8->qs, k), sumi_a);
+        }
+        const int h = get_int_b2(bq->qh, 0);
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            const int p = (int)((pow3_packed >> (7*n)) & 0x7F); // constant-folded after unroll
+            sumi_b = ggml_cuda_dp4a(ggml_cuda_tq1_0_extract4(h, p), get_int_b4(bq8->qs, 4 + n), sumi_b);
+        }
+    }
+    const int sumi = sumi_a + sumi_b;
+
+    const float d  = bq->d;
+    const float d8 = __low2float(bq8->ds);
+    const float s8 = __high2float(bq8->ds); // = d8 * sum(u)
+    return d * (d8 * sumi - s8);
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(

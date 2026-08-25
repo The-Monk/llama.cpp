@@ -8936,6 +8936,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 4096,  2, 4096, {1, 1}, {1, 1}));
 
+    // TQ1_0 (upstream ternary, 1.6875 bpw): CPU-only upstream (excluded from
+    // all_types with a "TODO: implement for all backends" note); the fork adds
+    // a CUDA/HIP MMVQ decode (vec_dot_tq1_0_q8_1) + dequant fallback, so give
+    // it the same n=1..9 coverage all_types members get (n=1..8 rides MMVQ,
+    // n=9 crosses MMVQ_MAX_BATCH_SIZE into the dequant+cublas fallback), plus
+    // real decode hidden-size shapes and a multi-block-per-row prefill case.
+    for (int i = 1; i < 10; ++i) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 16, i, 256, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 16, i, 1024, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 4096,  1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 1024, 512, 1024, {1, 1}, {1, 1}));
+
     // Stage 25: F8E4M3/F8E5M2 had ZERO test-backend-ops MUL_MAT coverage at
     // all before this (found while re-validating the already-shipped T79/
     // card-137 native fp8/bf8 V_DOT4 decode paths, vecdotq.cuh) -- same gap

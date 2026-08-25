@@ -173,6 +173,47 @@ static __global__ void dequantize_block_q6_K(const void * __restrict__ vx, dst_t
     dequantize_q6_K(vx, i, yy + i*QK_K, threadIdx.x);
 }
 
+// TQ1_0 (upstream ternary, 1.6875 bpw): needed so MUL_MAT batches above the
+// MMVQ limit can take the dequant+cublas fallback. 64 threads/block, each
+// thread decodes 4 consecutive elements. Element order matches
+// dequantize_row_tq1_0 (ggml-quants.c) EXACTLY:
+//   qs bytes  0..31: elem n*32 + m       (n=0..4, m=0..31)
+//   qs bytes 32..47: elem 160 + n*16 + m (n=0..4, m=0..15)
+//   qh bytes  0..3 : elem 240 + n*4 + j  (n=0..3, j=0..3)
+template<typename dst_t>
+static __global__ void dequantize_block_tq1_0(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int64_t i = blockIdx.x;
+    const block_tq1_0 * x = (const block_tq1_0 *) vx;
+
+    const int64_t tid = threadIdx.x; // 0..63, elements 4*tid .. 4*tid+3
+
+    const float d = x[i].d;
+    dst_t * y = yy + i*QK_K + 4*tid;
+
+    const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+
+    int             n;   // trit position
+    const uint8_t * src; // 4 adjacent source bytes
+    if (tid < 40) {                              // elems 0..159:   trit tid/8 of qs[4*(tid%8) ..]
+        n   = tid / 8;
+        src = x[i].qs + 4*(tid % 8);
+    } else if (tid < 60) {                       // elems 160..239: trit (tid-40)/4 of qs[32 + 4*((tid-40)%4) ..]
+        n   = (tid - 40) / 4;
+        src = x[i].qs + 32 + 4*((tid - 40) % 4);
+    } else {                                     // elems 240..255: trit tid-60 of qh[0..3]
+        n   = tid - 60;
+        src = x[i].qh;
+    }
+
+    const uint8_t p = pow3[n];
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint8_t q  = src[l] * p;
+        const int16_t xi = ((uint16_t) q * 3) >> 8;
+        y[l] = ggml_cuda_cast<dst_t>((float) (xi - 1) * d);
+    }
+}
+
 template<typename dst_t>
 static __global__ void dequantize_block_iq2_xxs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
     const int64_t i = blockIdx.x;
@@ -324,6 +365,12 @@ template<typename dst_t>
 static void dequantize_row_q6_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
     dequantize_block_q6_K<<<nb, 64, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
+static void dequantize_row_tq1_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+    dequantize_block_tq1_0<<<nb, 64, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
@@ -495,6 +542,8 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return dequantize_row_q5_K_cuda;
         case GGML_TYPE_Q6_K:
             return dequantize_row_q6_K_cuda;
+        case GGML_TYPE_TQ1_0:
+            return dequantize_row_tq1_0_cuda;
         case GGML_TYPE_IQ2_XXS:
             return dequantize_row_iq2_xxs_cuda;
         case GGML_TYPE_IQ2_XS:
@@ -555,6 +604,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_q5_K_cuda;
         case GGML_TYPE_Q6_K:
             return dequantize_row_q6_K_cuda;
+        case GGML_TYPE_TQ1_0:
+            return dequantize_row_tq1_0_cuda;
         case GGML_TYPE_IQ2_XXS:
             return dequantize_row_iq2_xxs_cuda;
         case GGML_TYPE_IQ2_XS:
@@ -620,6 +671,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_q5_K_cuda;
         case GGML_TYPE_Q6_K:
             return dequantize_row_q6_K_cuda;
+        case GGML_TYPE_TQ1_0:
+            return dequantize_row_tq1_0_cuda;
         case GGML_TYPE_IQ2_XXS:
             return dequantize_row_iq2_xxs_cuda;
         case GGML_TYPE_IQ2_XS:

@@ -454,6 +454,15 @@ typedef struct {
 } block_tq1_0;
 static_assert(sizeof(block_tq1_0) == sizeof(ggml_half) + QK_K / 64 + (QK_K - 4 * QK_K / 64) / 5, "wrong tq1_0 block size/padding");
 
+// TQ1_0 MMVQ decode (CUDA/HIP): QI_TQ1_0 is the number of vec_dot positions
+// per 256-element block, chosen so each position covers exactly one 32-element
+// q8_1 activation block (256/32 = 8). This lets vec_dot_tq1_0_q8_1 apply the
+// dot(s,u) = dot(c,u) - sum(u) offset via the q8_1 stored sum, exactly like
+// vec_dot_q2_0_q8_1 does. NOTE: deliberately NOT the qk/(4*qr) convention --
+// MMVQ only uses qi to partition work across threads.
+#define QR_TQ1_0 1
+#define QI_TQ1_0 8
+
 // 2.0625 bpw
 typedef struct {
     uint8_t qs[QK_K/4]; // 2 bits per element
