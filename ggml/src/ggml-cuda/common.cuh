@@ -1898,6 +1898,16 @@ struct ggml_backend_cuda_context {
     // declaration order).
     const ggml_tensor * mmvq_quant_cache_tensor = nullptr;
     std::unique_ptr<ggml_cuda_pool_alloc<char>> mmvq_quant_cache_buf;
+    // What PRODUCED the cached bytes. The cache is consumed by a later sibling
+    // matmul, which must not reinterpret a buffer written by a different
+    // quantizer or sized for a different shape. Keying on the tensor pointer
+    // alone cannot detect either, and the failure is silent wrong output rather
+    // than a crash. Keyed on the function rather than on src0->type because
+    // quantize_row_q8_1_cuda ignores the type (GGML_UNUSED(type_src0)), so a
+    // type key would force needless misses between siblings that legitimately
+    // share a producer.
+    void * mmvq_quant_cache_fn = nullptr;
+    size_t mmvq_quant_cache_bytes = 0;
 
     static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(int device, int stream_no);
 

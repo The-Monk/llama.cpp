@@ -1515,25 +1515,38 @@ void ggml_cuda_mul_mat_vec_q(
     const bool dedup_quant_fp8_ok  = true;
     const bool dedup_quant_batch_ok = ne11 == 1 || (ne11 > 1 && ggml_cuda_dedup_mmvq_quant_batch_enabled());
     const bool dedup_quant = ggml_cuda_dedup_mmvq_quant_enabled() && !ids && dedup_quant_batch_ok && dedup_quant_fp8_ok;
+
+    // F8E4M3 now uses standard q8_1 activations (T77 dot2 decode) like every
+    // other mmvq type; the former native-e4m3 activation quantizer (T79,
+    // quantize_row_f8e4m3_for_mmvq_cuda) is retained but unused. Selected HERE,
+    // above the cache lookup, so the producer forms part of the cache key.
+    const quantize_cuda_t quantize_src1 = quantize_row_q8_1_cuda;
+    const size_t dedup_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+
+    // A hit requires the same activation tensor AND the same producer AND the
+    // same buffer size. Tensor identity alone is not sufficient: a sibling
+    // reading a buffer written by a different quantizer, or sized for a
+    // different shape, gets silently wrong bytes rather than a crash. Costs
+    // two scalar compares on a path that exists to skip a whole kernel.
     const bool dedup_hit   = dedup_quant &&
-        ctx.mmvq_quant_cache_tensor == src1 && ctx.mmvq_quant_cache_buf;
+        ctx.mmvq_quant_cache_tensor == src1 && ctx.mmvq_quant_cache_buf &&
+        ctx.mmvq_quant_cache_fn == (void *) quantize_src1 &&
+        ctx.mmvq_quant_cache_bytes == dedup_bytes;
 
     // dedup_quant (hit OR miss-that-populates) ALWAYS routes data through
     // ctx.mmvq_quant_cache_buf, never through the local src1_q8_1 -- so the
     // local buffer must be skipped (size 0) whenever dedup_quant is true, not
     // just on a hit.
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), dedup_quant ? 0 : ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), dedup_quant ? 0 : dedup_bytes);
     if (!dedup_hit) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        // F8E4M3 now uses standard q8_1 activations (T77 dot2 decode) like
-        // every other mmvq type; the former native-e4m3 activation quantizer
-        // (T79, quantize_row_f8e4m3_for_mmvq_cuda) is retained but unused.
-        const quantize_cuda_t quantize_src1 = quantize_row_q8_1_cuda;
         if (dedup_quant) {
-            ctx.mmvq_quant_cache_buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+            ctx.mmvq_quant_cache_buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), dedup_bytes);
             ctx.mmvq_quant_cache_tensor = src1;
+            ctx.mmvq_quant_cache_fn     = (void *) quantize_src1;
+            ctx.mmvq_quant_cache_bytes  = dedup_bytes;
             quantize_src1(src1_d, nullptr, ctx.mmvq_quant_cache_buf->get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         } else {
             quantize_src1(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
