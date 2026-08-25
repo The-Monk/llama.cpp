@@ -843,25 +843,46 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
 // truncation), and q*3 <= 255*3 < 2^10 stays clear of the neighboring lane
 // before the >>8. Verified bit-exact vs the scalar reference on the host,
 // exhaustively per lane and over 2M random words (all 5 trit positions).
-// T212 CEILING PROBE (diagnostic, WRONG RESULTS when enabled at compile time).
-// block_tq1_0 is 54 bytes and qs sits at byte offset 6 (behind d and qh), so it
-// is 2-aligned, never 4-aligned -- get_int_b2 must issue TWO 16-bit loads per
-// int (measured: 24 global_loads vs Q2_0's 9). Making it one aligned dword load
-// requires padding the block to a multiple of 4, which is a FORMAT change and
-// breaks upstream TQ1_0 compatibility. Before paying that, bound the prize:
-// this reads the SAME 16-bit half twice, halving the load count and dropping
-// the shift+or, at the cost of correctness. Upper bound only -- a real aligned
-// load also returns the right bytes, but cannot be cheaper than this.
+// LOAD WIDTH: MEASURED NULL. Do not retry -- the premise was wrong twice.
+//
+// The claim was that sizeof(block_tq1_0)==54 makes block bases alternate
+// 4-aligned/2-aligned (they do; qs is at struct offset 0, an earlier note here
+// saying offset 6 behind d and qh was simply wrong), forcing get_int_b2 to
+// issue two 16-bit loads per int -- "24 global loads against Q2_0's 9" -- and
+// that fixing it needed the block padded to 56 bytes, a format break.
+//
+// Both halves are false. Check the ISA before believing either:
+//   - get_int_b2 ALREADY merges. Eight consecutive get_int_b2 calls compile to
+//     exactly TWO global_load_b128, i.e. 32 bytes in two instructions, which is
+//     optimal. RDNA4 supports unaligned global access, so the compiler merges
+//     straight through the 2-byte-aligned base without needing 4-alignment.
+//     The 24-load figure was never in the emitted code.
+//   - An explicit "load the two enclosing aligned dwords and funnel them with
+//     v_alignbit_b32" rewrite is strictly WORSE. Masking the pointer through
+//     uintptr_t launders away the global-address-space inference, so the two
+//     global_load_b128 degrade to flat_load_b128, an extra flat_load_b32
+//     appears, and 8 v_alignbit_b32 are added on top. Measured on Bonsai-27B:
+//     34.87 -> 31.55 t/s.
+//
+// The old ceiling probe below does NOT bound load width, which is why it looked
+// like a 7% prize. Reading the same 16-bit half twice halves the BYTES fetched,
+// so it measures a bandwidth reduction that no correct kernel can have. It
+// bounds nothing achievable. Kept only because it is cheap and because the
+// distinction -- fewer load INSTRUCTIONS vs fewer load BYTES -- is exactly the
+// thing that made this look like an open lever for a day.
+//
+// TQ1_0's remaining gap to Q2_0 is ALU, not memory: 3.65x the dynamic VALU for
+// 0.754x the bytes. Look there, or at the format, not at the load path.
 #ifndef GGML_TQ1_0_LOAD_CEILING_PROBE
 #define GGML_TQ1_0_LOAD_CEILING_PROBE 0
 #endif
 static __device__ __forceinline__ int ggml_cuda_tq1_0_get_int(const void * x, const int i32) {
 #if GGML_TQ1_0_LOAD_CEILING_PROBE
     const uint16_t * x16 = (const uint16_t *) x;
-    const int lo = x16[2*i32 + 0];
-    return lo | (lo << 16);           // one load, wrong data, valid timing
+    const int lo16 = x16[2*i32 + 0];
+    return lo16 | (lo16 << 16);       // fewer BYTES, not fewer loads; wrong data
 #else
-    return get_int_b2(x, i32);
+    return get_int_b2(x, i32);        // merges to global_load_b128; leave it
 #endif
 }
 
@@ -911,8 +932,9 @@ static __device__ __forceinline__ float vec_dot_tq1_0_q8_1(
     //   qh bytes  0..3 : elem 240 + n*4 + j  (n=0..3, j=0..3)  -> elems 240..255
     // So 4 consecutive elements = trit n of 4 adjacent bytes = one dp4a operand.
     //
-    // NOTE: block_tq1_0 is 54 bytes -> only 2-byte aligned; all quant loads
-    // must go through get_int_b2 (16-bit loads), never get_int_b4.
+    // NOTE: block_tq1_0 is 54 bytes, so block bases alternate 4-/2-aligned.
+    // get_int_b2 handles that and the compiler merges it to global_load_b128;
+    // get_int_b4 would be wrong here. See the LOAD WIDTH note above.
     const block_q8_1 * bq8 = bq8_1 + iqs;
 
     // pow3[n] = {1,3,9,27,81} packed in 7-bit slots of a 64-bit constant so a
