@@ -765,14 +765,38 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
     // compute the total size of the data section, taking into account the alignment
     {
         ctx->size = 0;
+        // Mirror of the hint prism-v7 emits for the opposite mismatch. This fork
+        // reads Q2_0 as the Prism group-128 block (QK2_0 128, 34 B/block). Mainline
+        // llama.cpp reassigned ggml type id 42 to the official group-64 Q2_0
+        // (18 B/block), so an official file loaded here drifts by 1/64 byte per
+        // element and surfaces as a bare offset mismatch on the FOLLOWING tensor --
+        // which reads like file corruption and is not. Track what the size would be
+        // under the group-64 interpretation so we can say what actually happened.
+        size_t size_if_official_q2 = 0;
+        bool   has_q2_0            = false;
         for (size_t i = 0; i < ctx->info.size(); ++i) {
             const gguf_tensor_info & ti = ctx->info[i];
             if (ti.offset != ctx->size) {
                 GGML_LOG_ERROR("%s: tensor '%s' has offset %" PRIu64 ", expected %zu\n",
                     __func__, ti.t.name, ti.offset, ctx->size);
+                if (has_q2_0 && ti.offset == size_if_official_q2) {
+                    GGML_LOG_ERROR("%s: this file is the OFFICIAL group-64 Q2_0 layout (18 bytes/block), "
+                        "but this build reads ggml type id 42 as the Prism group-128 Q2_0 (34 bytes/block)\n", __func__);
+                    GGML_LOG_ERROR("%s: the file is not corrupt -- use a mainline llama.cpp build (or prism-b10658+), "
+                        "or obtain the group-128 build of this model\n", __func__);
+                }
                 GGML_LOG_ERROR("%s: failed to read tensor data\n", __func__);
                 gguf_free(ctx);
                 return nullptr;
+            }
+            // What this tensor would occupy if type 42 meant the official
+            // group-64 Q2_0: 18 B per 64 elements instead of 34 B per 128.
+            if (ti.t.type == GGML_TYPE_Q2_0) {
+                has_q2_0 = true;
+                const int64_t ne = ggml_nelements(&ti.t);
+                size_if_official_q2 += GGML_PAD((size_t) (ne / 64) * 18, ctx->alignment);
+            } else {
+                size_if_official_q2 += GGML_PAD(ggml_nbytes(&ti.t), ctx->alignment);
             }
             size_t padded_size = GGML_PAD(ggml_nbytes(&ti.t), ctx->alignment);
             if (SIZE_MAX - ctx->size < padded_size) {
