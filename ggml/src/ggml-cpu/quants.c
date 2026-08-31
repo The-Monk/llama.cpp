@@ -325,9 +325,50 @@ void ggml_vec_dot_q1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     *s = sumf;
 }
 
+// A5 (PORT-MANIFEST.md): block_q2_0 (this fork's g128 production layout) and
+// block_q2_0_g64 (upstream's g64 layout) share one shape of inner loop --
+// each Q2_0 block maps to qk/32 Q8_0 blocks of 32 elements. The CPU vec_dot
+// ABI (ggml_vec_dot_t) is keyed by ggml_type only and carries no tensor, so
+// (unlike the per-TENSOR dispatch used on the CUDA/HIP decode path, mmvq.cu)
+// this can only resolve the process-wide DEFAULT variant
+// (ggml_q2_0_variant_get_default(), A5.3) -- correct for the common case of
+// one Q2_0 variant loaded at a time (this port's validation gates), and a
+// documented residual limitation for a hypothetical single CPU-backend
+// process running two Q2_0 models of different variants concurrently.
+static float ggml_vec_dot_q2_0_q8_0_block(const ggml_half d0_half, const uint8_t * GGML_RESTRICT qs_base,
+        const block_q8_0 * GGML_RESTRICT yb0, int blocks_per_q2_0) {
+    const float d0 = GGML_CPU_FP16_TO_FP32(d0_half);
+    float sumi = 0.0f;
+    for (int k = 0; k < blocks_per_q2_0; k++) {
+        const block_q8_0 * GGML_RESTRICT yb = &yb0[k];
+        const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+        int sumi_block = 0;
+
+        const uint8_t * GGML_RESTRICT qs = &qs_base[k * 8];
+        const int8_t  * GGML_RESTRICT qy = yb->qs;
+
+        for (int b = 0; b < 8; ++b) {
+            const uint8_t byte = qs[b];
+            // Extract 4 two-bit values, map {0,1,2,3} -> {-1,0,1,2}
+            sumi_block += ((int)((byte >> 0) & 3) - 1) * qy[b*4 + 0];
+            sumi_block += ((int)((byte >> 2) & 3) - 1) * qy[b*4 + 1];
+            sumi_block += ((int)((byte >> 4) & 3) - 1) * qy[b*4 + 2];
+            sumi_block += ((int)((byte >> 6) & 3) - 1) * qy[b*4 + 3];
+        }
+
+        sumi += d1 * sumi_block;
+    }
+    return d0 * sumi;
+}
+
 void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    const int qk = QK2_0;
+    const enum ggml_q2_0_variant variant = ggml_q2_0_variant_get_default();
+    const int qk = (variant == GGML_Q2_0_VARIANT_G64) ? QK2_0_G64 : QK2_0;
     const int nb = n / qk;
+    // One Q2_0 block (qk weights) maps to qk/32 Q8_0 blocks (32 elements
+    // each) regardless of variant -- derived from qk, not hardcoded (this
+    // was hardcoded to "4", g128-only, before the A5 dual-format port).
+    const int blocks_per_q2_0 = qk / 32;
 
     assert(n % qk == 0);
     assert(nrc == 1);
@@ -336,38 +377,20 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     UNUSED(by);
     UNUSED(bs);
 
-    const block_q2_0 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
 
     float sumf = 0.0f;
 
-    for (int i = 0; i < nb; i++) {
-        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
-
-        float sumi = 0.0f;
-
-        // g128 (PrismML/roc8 layout): one Q2_0 block (128 weights) maps to four Q8_0 blocks
-        for (int k = 0; k < 4; k++) {
-            const block_q8_0 * GGML_RESTRICT yb = &y[i * 4 + k];
-            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
-            int sumi_block = 0;
-
-            const uint8_t * GGML_RESTRICT qs = &x[i].qs[k * 8];
-            const int8_t  * GGML_RESTRICT qy = yb->qs;
-
-            for (int b = 0; b < 8; ++b) {
-                const uint8_t byte = qs[b];
-                // Extract 4 two-bit values, map {0,1,2,3} -> {-1,0,1,2}
-                sumi_block += ((int)((byte >> 0) & 3) - 1) * qy[b*4 + 0];
-                sumi_block += ((int)((byte >> 2) & 3) - 1) * qy[b*4 + 1];
-                sumi_block += ((int)((byte >> 4) & 3) - 1) * qy[b*4 + 2];
-                sumi_block += ((int)((byte >> 6) & 3) - 1) * qy[b*4 + 3];
-            }
-
-            sumi += d1 * sumi_block;
+    if (variant == GGML_Q2_0_VARIANT_G64) {
+        const block_q2_0_g64 * GGML_RESTRICT x = vx;
+        for (int i = 0; i < nb; i++) {
+            sumf += ggml_vec_dot_q2_0_q8_0_block(x[i].d, x[i].qs, &y[i * blocks_per_q2_0], blocks_per_q2_0);
         }
-
-        sumf += d0 * sumi;
+    } else {
+        const block_q2_0 * GGML_RESTRICT x = vx;
+        for (int i = 0; i < nb; i++) {
+            sumf += ggml_vec_dot_q2_0_q8_0_block(x[i].d, x[i].qs, &y[i * blocks_per_q2_0], blocks_per_q2_0);
+        }
     }
 
     *s = sumf;

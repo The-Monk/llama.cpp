@@ -637,6 +637,11 @@ bool ggml_cuda_iu4_mmq_supports(const ggml_tensor * src0, const ggml_tensor * sr
     if (src0->type != GGML_TYPE_IU4 && src0->type != GGML_TYPE_Q2_0 && src0->type != GGML_TYPE_Q1_0) {
         return false;
     }
+    // A5 (PORT-MANIFEST.md A5.6, KEEP-GATED): the Q2_0 arm reinterprets the
+    // ternary bits g128-style; a g64 tensor must fall through.
+    if (src0->type == GGML_TYPE_Q2_0 && ggml_q2_0_variant_of(src0) != GGML_Q2_0_VARIANT_G128) {
+        return false;
+    }
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }

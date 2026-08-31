@@ -200,6 +200,10 @@ bool ggml_cuda_q2_0_wmma_decode_supports(const ggml_tensor * src0, const ggml_te
     if (src0->type != GGML_TYPE_Q2_0) {
         return false;
     }
+    // A5 (PORT-MANIFEST.md A5.6, DROP-listed but still present): g128-only.
+    if (ggml_q2_0_variant_of(src0) != GGML_Q2_0_VARIANT_G128) {
+        return false;
+    }
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
@@ -389,6 +393,11 @@ bool ggml_cuda_op_mul_mat_q2_0_wmma(ggml_backend_cuda_context & ctx, const ggml_
 // --- W2A4 dot8 decode entry points (T213) ----------------------------------
 bool ggml_cuda_q2_0_dot8_decode_supports(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (src0->type != GGML_TYPE_Q2_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // A5 (PORT-MANIFEST.md A5.6): the ternary unpack this kernel does is
+    // block-layout-specific (g128, this fork's production layout).
+    if (ggml_q2_0_variant_of(src0) != GGML_Q2_0_VARIANT_G128) {
         return false;
     }
     if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {

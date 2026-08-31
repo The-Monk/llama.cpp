@@ -1309,6 +1309,36 @@ static __device__ __forceinline__ float get_alibi_slope(
     return powf(base, exph);
 }
 
+// A5 (PORT-MANIFEST.md section A5.4d): ggml_type_size()/ggml_blck_size()
+// are keyed on ggml_type ALONE and, for GGML_TYPE_Q2_0, can only ever
+// report the process-wide DEFAULT variant (A5.3, ggml.c) -- correct for the
+// common case but wrong for a src0 tensor whose BOUND variant
+// (ggml_q2_0_variant_of, set per-tensor at load, ggml.c) differs from the
+// process default (e.g. a g64 model loaded while the default is g128, or
+// vice-versa). Every Q2_0-reachable stride/size computation in the CUDA
+// backend that has the tensor in hand should go through these instead of
+// the bare accessors -- this is the fix for the "~20 reachable stride
+// sites" the manifest calls out (mmvq.cu's s01/s02/s03 and siblings).
+static __host__ __forceinline__ size_t ggml_cuda_q2_0_type_size(const struct ggml_tensor * t) {
+    if (t->type != GGML_TYPE_Q2_0) {
+        return ggml_type_size(t->type);
+    }
+    return ggml_q2_0_variant_of(t) == GGML_Q2_0_VARIANT_G64
+        ? (size_t) sizeof(block_q2_0_g64)
+        : (size_t) sizeof(block_q2_0);
+}
+static __host__ __forceinline__ int64_t ggml_cuda_q2_0_blck_size(const struct ggml_tensor * t) {
+    if (t->type != GGML_TYPE_Q2_0) {
+        return ggml_blck_size(t->type);
+    }
+    return ggml_q2_0_variant_of(t) == GGML_Q2_0_VARIANT_G64 ? QK2_0_G64 : QK2_0;
+}
+// Convenience: true iff this src0 tensor is Q2_0 AND bound to the g64
+// (upstream) variant. False for every other type, including g128 Q2_0.
+static __host__ __forceinline__ bool ggml_cuda_q2_0_is_g64(const struct ggml_tensor * t) {
+    return t->type == GGML_TYPE_Q2_0 && ggml_q2_0_variant_of(t) == GGML_Q2_0_VARIANT_G64;
+}
+
 template <ggml_type type>
 struct ggml_cuda_type_traits;
 

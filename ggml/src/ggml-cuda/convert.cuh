@@ -16,6 +16,29 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type);
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 
+// A5 (PORT-MANIFEST.md): the ggml_get_to_*_cuda() getters above are keyed
+// on ggml_type alone and, like every other bare Q2_0 accessor, can only
+// resolve the process-wide DEFAULT variant for GGML_TYPE_Q2_0 -- wrong for
+// a src0 tensor bound to the OTHER variant. These direct entry points are
+// for callers that HAVE the src0 tensor (ggml_cuda_q2_0_is_g64(), common.cuh)
+// and need the g64-specific dequant explicitly, bypassing the type-keyed
+// getters.
+void ggml_cuda_q2_0_g64_to_fp32(const void * vx, float * y, int64_t k, cudaStream_t stream);
+void ggml_cuda_q2_0_g64_to_fp16(const void * vx, half * y, int64_t k, cudaStream_t stream);
+void ggml_cuda_q2_0_g64_to_bf16(const void * vx, nv_bfloat16 * y, int64_t k, cudaStream_t stream);
+// Non-contiguous counterparts (a permuted/viewed src0 -- e.g.
+// test-backend-ops' permuted-batch-dims MUL_MAT cases; a real loaded GGUF
+// weight matrix is always contiguous).
+void ggml_cuda_q2_0_g64_to_fp32_nc(const void * vx, float * y,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream);
+void ggml_cuda_q2_0_g64_to_fp16_nc(const void * vx, half * y,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream);
+void ggml_cuda_q2_0_g64_to_bf16_nc(const void * vx, nv_bfloat16 * y,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream);
+
 // TODO more general support for non-contiguous inputs
 
 template<typename T>

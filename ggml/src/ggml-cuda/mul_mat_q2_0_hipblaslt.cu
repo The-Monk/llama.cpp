@@ -453,6 +453,10 @@ wcache_registrar g_wcache_registrar;
 
 bool ggml_cuda_q2_0_hipblaslt_prefill_supports(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (src0->type != GGML_TYPE_Q2_0)                       return false;
+    // A5 (PORT-MANIFEST.md A5.6, KEEP-GATED): this kernel's weight-conversion
+    // cache assumes g128 (34 B/block) packing. A g64 tensor must fall
+    // through to the unmodified dp4a/mmq path instead of being misread.
+    if (ggml_q2_0_variant_of(src0) != GGML_Q2_0_VARIANT_G128) return false;
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
     if (src0->ne[2] != 1 || src0->ne[3] != 1)               return false;
     if (src1->ne[2] != 1 || src1->ne[3] != 1)               return false;

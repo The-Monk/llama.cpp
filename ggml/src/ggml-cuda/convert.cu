@@ -312,6 +312,37 @@ static void dequantize_block_cont_cuda(const void * __restrict__ vx, dst_t * __r
     dequantize_block_cuda<qk, qr, dequantize_kernel, dst_t>(vx, y, k, 1, 1, 1, k/qk, k/qk, k/qk, stream);
 }
 
+// A5 (PORT-MANIFEST.md): direct g64 entry points (see convert.cuh) -- the
+// same dequantize_block_cont_cuda template instantiated with QK2_0_G64 and
+// dequantize_q2_0_g64 instead of the g128 defaults the type-keyed getters
+// below always return. dequantize_block_cont_cuda/dequantize_block_cuda are
+// QK2_0-agnostic (only qk and the dequantize_kernel differ), so this is a
+// direct instantiation, not a reimplementation.
+void ggml_cuda_q2_0_g64_to_fp32(const void * vx, float * y, int64_t k, cudaStream_t stream) {
+    dequantize_block_cont_cuda<QK2_0_G64, QR2_0, dequantize_q2_0_g64>(vx, y, k, stream);
+}
+void ggml_cuda_q2_0_g64_to_fp16(const void * vx, half * y, int64_t k, cudaStream_t stream) {
+    dequantize_block_cont_cuda<QK2_0_G64, QR2_0, dequantize_q2_0_g64>(vx, y, k, stream);
+}
+void ggml_cuda_q2_0_g64_to_bf16(const void * vx, nv_bfloat16 * y, int64_t k, cudaStream_t stream) {
+    dequantize_block_cont_cuda<QK2_0_G64, QR2_0, dequantize_q2_0_g64>(vx, y, k, stream);
+}
+void ggml_cuda_q2_0_g64_to_fp32_nc(const void * vx, float * y,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream) {
+    dequantize_block_cuda<QK2_0_G64, QR2_0, dequantize_q2_0_g64>(vx, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);
+}
+void ggml_cuda_q2_0_g64_to_fp16_nc(const void * vx, half * y,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream) {
+    dequantize_block_cuda<QK2_0_G64, QR2_0, dequantize_q2_0_g64>(vx, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);
+}
+void ggml_cuda_q2_0_g64_to_bf16_nc(const void * vx, nv_bfloat16 * y,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream) {
+    dequantize_block_cuda<QK2_0_G64, QR2_0, dequantize_q2_0_g64>(vx, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);
+}
+
 static void dequantize_block_q8_0_f16_cuda(const void * __restrict__ vx, half * __restrict__ y, const int64_t k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_Q8_0_NE_ALIGN - 1) / CUDA_Q8_0_NE_ALIGN;
     if (k % CUDA_Q8_0_NE_ALIGN == 0) {

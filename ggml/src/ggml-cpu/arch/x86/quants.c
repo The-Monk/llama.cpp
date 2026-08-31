@@ -700,6 +700,19 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
 
 void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    // A5 (PORT-MANIFEST.md A5.6): this AVX2 kernel hardcodes 4x 32-element
+    // q8_0 blocks = 128 elements per q2_0 block -- it is a g128-only kernel
+    // and reads out of bounds on a g64 block (qs[16], not qs[32]). Gate on
+    // the process-DEFAULT variant (this ABI carries no tensor, so it cannot
+    // resolve per-tensor -- see ggml_vec_dot_q2_0_q8_0_generic) and fall
+    // back to the generic reference path, which handles both variants, for
+    // anything other than g128.
+#if defined(__AVX2__)
+    if (ggml_q2_0_variant_get_default() != GGML_Q2_0_VARIANT_G128) {
+        ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+        return;
+    }
+#endif
     const int qk = QK2_0;
     const int nb = n / qk;
 

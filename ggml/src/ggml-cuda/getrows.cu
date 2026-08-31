@@ -298,7 +298,11 @@ static void ggml_cuda_get_rows_switch_src0_type(
         const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        // A5 (PORT-MANIFEST.md): per-tensor Q2_0 group-size variant, resolved
+        // by ggml_cuda_op_get_rows (which has the src0 tensor). Ignored for
+        // every type other than GGML_TYPE_Q2_0.
+        const bool q2_0_g64 = false) {
     switch (src0_type) {
         case GGML_TYPE_F16:
             get_rows_cuda_float((const half *) src0_d, src1_d, dst_d,
@@ -321,8 +325,15 @@ static void ggml_cuda_get_rows_switch_src0_type(
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q2_0:
-            get_rows_cuda_q<QK2_0, QR2_0, dequantize_q2_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            // A5: g128 (block_q2_0, this fork's production layout) vs g64
+            // (block_q2_0_g64, upstream's layout) selected per src0 tensor.
+            if (q2_0_g64) {
+                get_rows_cuda_q<QK2_0_G64, QR2_0, dequantize_q2_0_g64>(src0_d, src1_d, dst_d,
+                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            } else {
+                get_rows_cuda_q<QK2_0, QR2_0, dequantize_q2_0>(src0_d, src1_d, dst_d,
+                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            }
             break;
         case GGML_TYPE_Q4_0:
             get_rows_cuda_q<QK4_0, QR4_0, dequantize_q4_0>(src0_d, src1_d, dst_d,
@@ -431,23 +442,23 @@ void get_rows_cuda(
         int64_t ne00, size_t nb01, size_t nb02, size_t nb03,
         int64_t ne10, int64_t ne11, int64_t ne12, size_t nb10, size_t nb11, size_t nb12,
         size_t nb1, size_t nb2, size_t nb3,
-        cudaStream_t stream) {
+        cudaStream_t stream, const bool q2_0_g64) {
     switch (dst_type) {
         case GGML_TYPE_F32:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (float *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, q2_0_g64);
             break;
         case GGML_TYPE_I32:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (int32_t *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, q2_0_g64);
             break;
         case GGML_TYPE_F16:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (half *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, q2_0_g64);
             break;
         case GGML_TYPE_BF16:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (nv_bfloat16 *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, q2_0_g64);
             break;
         default:
             GGML_ABORT("%s: unsupported dst type: %s\n", __func__, ggml_type_name(dst_type));
@@ -466,12 +477,15 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src1->type == GGML_TYPE_I32);
     GGML_ASSERT(ne13 == 1);
 
-    GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
+    // A5: ggml_cuda_q2_0_type_size resolves THIS tensor's bound Q2_0
+    // variant (common.cuh) rather than the bare accessor's process default.
+    GGML_ASSERT(src0->nb[0] == ggml_cuda_q2_0_type_size(src0));
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
 
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
-        ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+        ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream,
+        ggml_cuda_q2_0_is_g64(src0));
 }
 
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

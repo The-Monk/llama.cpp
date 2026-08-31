@@ -1454,7 +1454,10 @@ size_t ggml_row_size(enum ggml_type type, int64_t ne) {
 double ggml_type_sizef(enum ggml_type type) {
     assert(type >= 0);
     assert(type < GGML_TYPE_COUNT);
-    return ((double)(type_traits[type].type_size))/type_traits[type].blck_size;
+    // A5: go through the accessors (ggml_type_size/ggml_blck_size above),
+    // not the raw static table -- same class of bug as ggml_quantize_chunk's
+    // start%blck_size assert (found by exercising the g64 path).
+    return ((double) ggml_type_size(type)) / ggml_blck_size(type);
 }
 
 const char * ggml_type_name(enum ggml_type type) {
@@ -8046,7 +8049,14 @@ size_t ggml_quantize_chunk(
         GGML_ASSERT(imatrix != NULL);
     }
 
-    GGML_ASSERT(start % type_traits[type].blck_size == 0);
+    // A5 (PORT-MANIFEST.md): use the accessor, not the raw static table --
+    // type_traits[GGML_TYPE_Q2_0].blck_size is a compile-time constant
+    // (always 128, this fork's g128 default) and does not see the
+    // process-wide variant default (ggml_q2_0_variant_get_default). Found
+    // by exercising this port's g64 kernel path through test-backend-ops:
+    // GGML_ASSERT(start % type_traits[type].blck_size == 0) fired for
+    // EVERY Q2_0 g64 case because it checked against 128 instead of 64.
+    GGML_ASSERT(start % ggml_blck_size(type) == 0);
     GGML_ASSERT(start % n_per_row == 0);
 
     ggml_quantize_init(type); // this is noop if already initialized

@@ -294,6 +294,10 @@ bool ggml_cuda_q2_0_fp8route_mmq_supports(const ggml_tensor * src0, const ggml_t
     if (src0->type != GGML_TYPE_Q2_0) {
         return false;
     }
+    // A5 (PORT-MANIFEST.md A5.6, KEEP-GATED/DEFER): g128-only kernel.
+    if (ggml_q2_0_variant_of(src0) != GGML_Q2_0_VARIANT_G128) {
+        return false;
+    }
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }

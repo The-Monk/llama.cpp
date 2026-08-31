@@ -772,22 +772,29 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     return d1 * (2.0f * d8 * (float) sumi - s8);
 }
 
-static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+// A5 (PORT-MANIFEST.md section A5.5): the 2c-1 decode algorithm below is
+// QK2_0-agnostic -- proven on branch q2_0-g64-experiment (commit
+// 340afd96cd) by flipping QK2_0 128->64 globally and observing this
+// function needed ZERO changes (offset = iqs*8 and the qs[]-byte reads
+// never depend on the block's total width, only on which 8-byte chunk iqs
+// selects). Templated on `d` (already-widened scale) + a raw qs pointer so
+// it serves BOTH block_q2_0 (g128, this fork's production layout) and
+// block_q2_0_g64 (g64, upstream's layout) without duplicating the body --
+// each variant gets a thin wrapper below that extracts d/qs from its own
+// struct and calls this core.
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1_core(
+        const float d2, const uint8_t * __restrict__ qs, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
 
-    const block_q2_0 * bq2_0 = (const block_q2_0 *) vbq + kbx;
-
-    // Q2_0: 128 elements with ONE scale, 2 bits per element (4 per byte). code c -> symbol s = c-1.
+    // Q2_0: qk elements with ONE scale, 2 bits per element (4 per byte). code c -> symbol s = c-1.
     // Use the identity dot(s,u) = dot(c,u) - sum(u): bit-spread the codes (no per-code subtract/borrow)
     // and apply the -sum(u) offset once via the q8_1 stored sum s8 = d8*sum(u).
-    const float d2 = bq2_0->d;
     const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
 
     const int offset = iqs * 8;
-    const int qs0 = bq2_0->qs[offset + 0] | (bq2_0->qs[offset + 1] << 8) |
-                    (bq2_0->qs[offset + 2] << 16) | (bq2_0->qs[offset + 3] << 24);
-    const int qs1 = bq2_0->qs[offset + 4] | (bq2_0->qs[offset + 5] << 8) |
-                    (bq2_0->qs[offset + 6] << 16) | (bq2_0->qs[offset + 7] << 24);
+    const int qs0 = qs[offset + 0] | (qs[offset + 1] << 8) |
+                    (qs[offset + 2] << 16) | (qs[offset + 3] << 24);
+    const int qs1 = qs[offset + 4] | (qs[offset + 5] << 8) |
+                    (qs[offset + 6] << 16) | (qs[offset + 7] << 24);
 
     // Independent accumulators: bit-identical (integer adds reassociate exactly),
     // and each one shortens the serial dp4a chain.
@@ -829,6 +836,26 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     const float d8 = __low2float(bq8_1_chunk->ds);
     const float s8 = __high2float(bq8_1_chunk->ds); // = d8 * sum(u)
     return d2 * (d8 * sumi - s8);
+}
+
+// g128 (this fork's production/Bonsai layout): the ORIGINAL vec_dot_q2_0_q8_1
+// signature/name, unchanged call sites, now a thin wrapper over the shared
+// core so this remains the default GGML_TYPE_Q2_0 vec_dot everywhere it was
+// before A5.
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const block_q2_0 * bq2_0 = (const block_q2_0 *) vbq + kbx;
+    return vec_dot_q2_0_q8_1_core(bq2_0->d, bq2_0->qs, bq8_1, iqs);
+}
+
+// g64 (upstream's official layout, A5): same algorithm, block_q2_0_g64
+// (18 B/block, qs[16]) instead of block_q2_0 (34 B/block, qs[32]). Selected
+// at runtime per-tensor by the mmvq.cu dispatch (ggml_q2_0_variant_of), not
+// by the ggml_type -- both wrappers coexist under GGML_TYPE_Q2_0.
+static __device__ __forceinline__ float vec_dot_q2_0_g64_q8_1(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const block_q2_0_g64 * bq2_0 = (const block_q2_0_g64 *) vbq + kbx;
+    return vec_dot_q2_0_q8_1_core(bq2_0->d, bq2_0->qs, bq8_1, iqs);
 }
 
 // TQ1_0 (upstream ternary, 1.6875 bpw): 256 elements/block, 5 trits packed

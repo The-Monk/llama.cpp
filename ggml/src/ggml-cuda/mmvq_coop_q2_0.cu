@@ -56,6 +56,9 @@ __global__ void k_coop_q2_0_decode(
 
 bool ggml_cuda_q2_0_coop_decode_supports(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (src0->type != GGML_TYPE_Q2_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    // A5 (PORT-MANIFEST.md A5.6): g128-only (reuses vec_dot_q2_0_q8_1 on the
+    // g128 struct directly, not the templated core).
+    if (ggml_q2_0_variant_of(src0) != GGML_Q2_0_VARIANT_G128) return false;
     if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) return false;
     if (src1->ne[1] != 1) return false;                      // M=1 decode only
     if (src0->ne[0] != src1->ne[0] || src0->ne[0] % QK2_0 != 0) return false;

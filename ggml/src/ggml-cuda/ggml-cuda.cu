@@ -1455,7 +1455,9 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     cudaStream_t main_stream = ctx.stream();
     CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), main_stream));
 
-    const size_t src0_ts = ggml_type_size(src0->type);
+    // A5: per-tensor Q2_0 variant size (common.cuh), not the bare
+    // type-keyed accessor -- see the g64/cuBLAS-fallback note below.
+    const size_t src0_ts = ggml_cuda_q2_0_type_size(src0);
     GGML_ASSERT(nb00 == src0_ts);
     int64_t s01 = nb01 / src0_ts;
     int64_t s02 = nb02 / src0_ts;
@@ -1484,17 +1486,53 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src0_alloc.alloc(ggml_nelements(src0));
 
         if (ggml_is_contiguously_allocated(src0)) {
-            const auto convert_func = traits::convert(src0->type);
-            GGML_ASSERT(convert_func != nullptr);
-            convert_func(src0->data, src0_alloc.get(), ggml_nelements(src0), main_stream);
-            const size_t src0_bs = ggml_blck_size(src0->type);
+            // A5 (PORT-MANIFEST.md): traits::convert(src0->type) is keyed on
+            // the TYPE alone and, for Q2_0, resolves only the process
+            // DEFAULT variant (ggml_get_to_*_cuda, convert.cu) -- wrong for
+            // a src0 tensor bound to the OTHER variant. This cuBLAS fallback
+            // IS a live path for a g64 Q2_0 tensor (mmq was deliberately
+            // disabled for g64 above, in the caller of should_use_mmq --
+            // PORT-MANIFEST.md A5 kernel-layer scope), so route it to the
+            // dedicated g64 dequant instead of the type-keyed getter.
+            if (ggml_cuda_q2_0_is_g64(src0)) {
+                if constexpr (std::is_same_v<cuda_t, float>) {
+                    ggml_cuda_q2_0_g64_to_fp32(src0->data, src0_alloc.get(), ggml_nelements(src0), main_stream);
+                } else if constexpr (std::is_same_v<cuda_t, half>) {
+                    ggml_cuda_q2_0_g64_to_fp16(src0->data, src0_alloc.get(), ggml_nelements(src0), main_stream);
+                } else if constexpr (std::is_same_v<cuda_t, nv_bfloat16>) {
+                    ggml_cuda_q2_0_g64_to_bf16(src0->data, src0_alloc.get(), ggml_nelements(src0), main_stream);
+                } else {
+                    GGML_ABORT("A5: no g64 Q2_0 dequant for this cuBLAS compute_type");
+                }
+            } else {
+                const auto convert_func = traits::convert(src0->type);
+                GGML_ASSERT(convert_func != nullptr);
+                convert_func(src0->data, src0_alloc.get(), ggml_nelements(src0), main_stream);
+            }
+            const size_t src0_bs = ggml_cuda_q2_0_blck_size(src0);
             s01 *= src0_bs;
             s02 *= src0_bs;
             s03 *= src0_bs;
         } else {
-            const auto convert_func = traits::convert_nc(src0->type);
-            GGML_ASSERT(convert_func != nullptr);
-            convert_func(src0->data, src0_alloc.get(), ne00, ne01, ne02, ne03, s01, s02, s03, main_stream);
+            // A5: non-contiguous src0 (e.g. a permuted view -- test-backend-ops'
+            // permuted-batch-dims MUL_MAT cases; a real loaded GGUF weight
+            // matrix is always contiguous) needs the same g64-vs-getter
+            // branch as the contiguous case above.
+            if (ggml_cuda_q2_0_is_g64(src0)) {
+                if constexpr (std::is_same_v<cuda_t, float>) {
+                    ggml_cuda_q2_0_g64_to_fp32_nc(src0->data, src0_alloc.get(), ne00, ne01, ne02, ne03, s01, s02, s03, main_stream);
+                } else if constexpr (std::is_same_v<cuda_t, half>) {
+                    ggml_cuda_q2_0_g64_to_fp16_nc(src0->data, src0_alloc.get(), ne00, ne01, ne02, ne03, s01, s02, s03, main_stream);
+                } else if constexpr (std::is_same_v<cuda_t, nv_bfloat16>) {
+                    ggml_cuda_q2_0_g64_to_bf16_nc(src0->data, src0_alloc.get(), ne00, ne01, ne02, ne03, s01, s02, s03, main_stream);
+                } else {
+                    GGML_ABORT("A5: no g64 Q2_0 dequant for this cuBLAS compute_type");
+                }
+            } else {
+                const auto convert_func = traits::convert_nc(src0->type);
+                GGML_ASSERT(convert_func != nullptr);
+                convert_func(src0->data, src0_alloc.get(), ne00, ne01, ne02, ne03, s01, s02, s03, main_stream);
+            }
             s01 = ne00;
             s02 = ne01*s01;
             s03 = ne02*s02;
@@ -2434,7 +2472,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     {
         const int cc            = ggml_cuda_info().devices[ctx.device].cc;
         const int warp_size     = ggml_cuda_info().devices[ctx.device].warp_size;
-        use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
+        use_mul_mat_q           = use_mul_mat_q             && (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0) && !ggml_cuda_q2_0_is_g64(src0)) /* A5: g64 MMQ not ported, PORT-MANIFEST.md */;
         use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
         use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
         use_mul_mat_vec_q       = use_mul_mat_vec_q         && ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]);
@@ -2537,7 +2575,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+    if ((ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0) && !ggml_cuda_q2_0_is_g64(src0)) /* A5: g64 MMQ not ported, PORT-MANIFEST.md */) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -2564,7 +2602,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         }
     }
 
-    if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
+    if ((ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2]) && !ggml_cuda_q2_0_is_g64(src0)) /* A5: g64 MMQ not ported, PORT-MANIFEST.md */) {
         return false;
     }
 
@@ -2605,7 +2643,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if ((ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02) && !ggml_cuda_q2_0_is_g64(src0)) /* A5: g64 MMQ not ported, PORT-MANIFEST.md */) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }

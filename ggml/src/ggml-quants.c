@@ -71,6 +71,39 @@ void quantize_row_q1_0_ref(const float * GGML_RESTRICT x, block_q1_0 * GGML_REST
     }
 }
 
+// A5 (PORT-MANIFEST.md): shared core, QK2_0-agnostic (proven on branch
+// q2_0-g64-experiment, commit 340afd96cd, by flipping QK2_0 globally and
+// observing the algorithm itself needed zero changes -- same reasoning as
+// the CUDA/CPU dot-product cores). Writes one block's `d` (ggml_half) and
+// `qs` (qk/4 bytes) from `qk` source floats; the two public entry points
+// below just supply the block-struct-specific d/qs pointers and pick qk.
+static void quantize_block_q2_0_core(const float * GGML_RESTRICT x, ggml_half * GGML_RESTRICT d_out, uint8_t * GGML_RESTRICT qs_out, int qk) {
+    float amax = 0.0f;
+    for (int j = 0; j < qk; j++) {
+        const float a = fabsf(x[j]);
+        if (a > amax) amax = a;
+    }
+    const float d = amax;
+    const float id = d > 0.0f ? 1.0f / d : 0.0f;
+
+    *d_out = GGML_FP32_TO_FP16(d);
+
+    for (int j = 0; j < qk / 4; ++j) {
+        qs_out[j] = 0;
+    }
+
+    // 2-bit code c = round(w/d)+1 clamped to [0,3]; symbol s = c-1 in {-1,0,+1,+2}
+    for (int j = 0; j < qk; ++j) {
+        const float w = x[j];
+        int q = (int)roundf(w * id) + 1;
+        if (q < 0) q = 0;
+        if (q > 3) q = 3;
+        const int byte_index = j / 4;
+        const int bit_offset = (j % 4) * 2;
+        qs_out[byte_index] |= ((uint8_t)q << bit_offset);
+    }
+}
+
 void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK2_0;
 
@@ -79,30 +112,25 @@ void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_REST
     const int nb = k / qk;
 
     for (int i = 0; i < nb; i++) {
-        float amax = 0.0f;
-        for (int j = 0; j < qk; j++) {
-            const float a = fabsf(x[i*qk + j]);
-            if (a > amax) amax = a;
-        }
-        const float d = amax;
-        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+        quantize_block_q2_0_core(x + i*qk, &y[i].d, y[i].qs, qk);
+    }
+}
 
-        y[i].d = GGML_FP32_TO_FP16(d);
+// g64 (upstream's official layout, A5): same algorithm, block_q2_0_g64
+// (18 B/block) instead of block_q2_0 (34 B/block). Used by quantize_q2_0()
+// when the process-wide Q2_0 default (ggml_q2_0_variant_get_default,
+// ggml.h/ggml.c) is bound to g64 -- llama-quantize sets this default
+// before writing a new GGUF so `llama-quantize --type Q2_0` now emits the
+// upstream-compatible g64 layout by default (see src/llama-quant.cpp).
+void quantize_row_q2_0_g64_ref(const float * GGML_RESTRICT x, block_q2_0_g64 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK2_0_G64;
 
-        for (int j = 0; j < qk / 4; ++j) {
-            y[i].qs[j] = 0;
-        }
+    assert(k % qk == 0);
 
-        // 2-bit code c = round(w/d)+1 clamped to [0,3]; symbol s = c-1 in {-1,0,+1,+2}
-        for (int j = 0; j < qk; ++j) {
-            const float w = x[i*qk + j];
-            int q = (int)roundf(w * id) + 1;
-            if (q < 0) q = 0;
-            if (q > 3) q = 3;
-            const int byte_index = j / 4;
-            const int bit_offset = (j % 4) * 2;
-            y[i].qs[byte_index] |= ((uint8_t)q << bit_offset);
-        }
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        quantize_block_q2_0_core(x + i*qk, &y[i].d, y[i].qs, qk);
     }
 }
 
@@ -2589,14 +2617,30 @@ size_t quantize_q1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
 // (round-trip-inverse of dequantize_row_q2_0). imatrix is ignored, same as the
 // q1_0 ref path (the ref quantizer picks its own per-block scale).
 size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    // A5 (PORT-MANIFEST.md): the OUTPUT group size is the process-wide Q2_0
+    // default (ggml_q2_0_variant_get_default, ggml.c). llama-quantize sets
+    // this to g64 before writing a new Q2_0 GGUF, matching upstream's
+    // layout by default; loading/reading a g128 (this fork's own Bonsai
+    // corpus) still works unchanged because that is a load-time detection,
+    // not a write-time one. ggml_row_size() already resolves the correct
+    // (18 B or 34 B) row size for whichever variant is bound.
+    const bool g64 = ggml_q2_0_variant_get_default() == GGML_Q2_0_VARIANT_G64;
     if (!quant_weights) {
-        quantize_row_q2_0_ref(src, dst, (int64_t)nrow*n_per_row);
+        if (g64) {
+            quantize_row_q2_0_g64_ref(src, dst, (int64_t)nrow*n_per_row);
+        } else {
+            quantize_row_q2_0_ref(src, dst, (int64_t)nrow*n_per_row);
+        }
         return nrow * ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
     }
     size_t row_size = ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
     char * qrow = (char *)dst;
     for (int64_t row = 0; row < nrow; ++row) {
-        quantize_row_q2_0_ref(src, (block_q2_0*)qrow, n_per_row);
+        if (g64) {
+            quantize_row_q2_0_g64_ref(src, (block_q2_0_g64*)qrow, n_per_row);
+        } else {
+            quantize_row_q2_0_ref(src, (block_q2_0*)qrow, n_per_row);
+        }
         src += n_per_row;
         qrow += row_size;
     }
@@ -6059,7 +6103,24 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             } break;
         case GGML_TYPE_Q2_0:
             {
-                VALIDATE_ROW_DATA_D_F16_IMPL(block_q2_0, data, nb);
+                // A5 (PORT-MANIFEST.md): VALIDATE_ROW_DATA_D_F16_IMPL casts
+                // `data` to a fixed struct type and indexes it at that
+                // struct's sizeof() stride -- block_q2_0 (g128, 34 B) is
+                // wrong for g64 (18 B) data, and vice versa; `nb` above is
+                // already variant-correct (via ggml_type_size), but reading
+                // it with the wrong stride walks into the middle of
+                // neighboring blocks and reports spurious NaN/Inf, exactly
+                // as caught live: llama-quantize on a Q2_0-g64 output
+                // (ggml_q2_0_variant_get_default()==G64, set by
+                // llama-quant.cpp before quantizing) failed validation on
+                // real, correctly-encoded data. No tensor is available here
+                // (bare ggml_type API), so this resolves the process
+                // default (A5.3), same limitation as the CPU vec_dot.
+                if (ggml_q2_0_variant_get_default() == GGML_Q2_0_VARIANT_G64) {
+                    VALIDATE_ROW_DATA_D_F16_IMPL(block_q2_0_g64, data, nb);
+                } else {
+                    VALIDATE_ROW_DATA_D_F16_IMPL(block_q2_0, data, nb);
+                }
             } break;
         case GGML_TYPE_Q4_0:
             {

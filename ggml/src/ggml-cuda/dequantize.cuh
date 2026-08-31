@@ -23,9 +23,12 @@ static __device__ __forceinline__ void dequantize_q1_0(const void * vx, const in
     v.y = (2*bit_1 - 1) * d;
 }
 
-static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
-    const block_q2_0 * x = (const block_q2_0 *) vx;
-
+// A5 (PORT-MANIFEST.md): shared core, QK2_0-agnostic (only the block TYPE
+// differs between g128/block_q2_0 and g64/block_q2_0_g64 -- the byte/bit
+// arithmetic on iqs is identical either way, same reasoning as
+// vec_dot_q2_0_q8_1_core in vecdotq.cuh).
+template <typename block_q2_0_t>
+static __device__ __forceinline__ void dequantize_q2_0_core(const block_q2_0_t * x, const int64_t ib, const int iqs, float2 & v){
     const float d = x[ib].d;
 
     // Q2_0: 2 bits per element, 4 elements per byte. code c in {0,1,2,3} -> symbol c-1 in {-1,0,+1,+2}
@@ -39,6 +42,17 @@ static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const in
 
     v.x = (c0 - 1) * d;
     v.y = (c1 - 1) * d;
+}
+
+static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    dequantize_q2_0_core((const block_q2_0 *) vx, ib, iqs, v);
+}
+
+// g64 (upstream's official layout, A5): same algorithm, block_q2_0_g64
+// instead of block_q2_0. Used by the dequant/get_rows dispatch when the
+// src0 tensor is bound to GGML_Q2_0_VARIANT_G64 (ggml_q2_0_variant_of).
+static __device__ __forceinline__ void dequantize_q2_0_g64(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    dequantize_q2_0_core((const block_q2_0_g64 *) vx, ib, iqs, v);
 }
 
 static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){

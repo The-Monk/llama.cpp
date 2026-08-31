@@ -16,6 +16,9 @@ extern "C" {
 // Quantization
 GGML_API void quantize_row_q1_0_ref(const float * GGML_RESTRICT x, block_q1_0 * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t k);
+// A5 (PORT-MANIFEST.md): g64 (upstream layout) counterpart, selected by
+// quantize_q2_0() via ggml_q2_0_variant_get_default().
+GGML_API void quantize_row_q2_0_g64_ref(const float * GGML_RESTRICT x, block_q2_0_g64 * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_q4_1_ref(const float * GGML_RESTRICT x, block_q4_1 * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_q5_0_ref(const float * GGML_RESTRICT x, block_q5_0 * GGML_RESTRICT y, int64_t k);

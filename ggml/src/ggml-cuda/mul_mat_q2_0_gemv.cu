@@ -119,6 +119,10 @@ bool ggml_cuda_q2_0_gemv_supports(const ggml_tensor * src0, const ggml_tensor * 
     if (src0->type != GGML_TYPE_Q2_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
+    // A5 (PORT-MANIFEST.md A5.6, DROP-listed but still present): g128-only.
+    if (ggml_q2_0_variant_of(src0) != GGML_Q2_0_VARIANT_G128) {
+        return false;
+    }
     if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
         return false;
     }

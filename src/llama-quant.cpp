@@ -973,6 +973,23 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     model->load_hparams(ml);
     model->load_stats  (ml);
 
+    // A5 (PORT-MANIFEST.md): llama-quantize writes NEW Q2_0 output in the
+    // g64 (upstream/mainline) layout by default, matching mainline
+    // llama.cpp's GGML_TYPE_Q2_0=42 reassignment -- NOT this fork's own
+    // g128 (Bonsai/PrismML) production layout. This is set AFTER the input
+    // model has finished loading (ml/model->load_* above, which may have
+    // auto-detected and bound a DIFFERENT default from the SOURCE file's
+    // own Q2_0 tensors, e.g. re-quantizing a g128 Bonsai GGUF -- that
+    // detection is for READING the source and must not be disturbed) and
+    // BEFORE any output tensor is created, so it governs only the WRITE
+    // side (quantize_q2_0(), ggml-quants.c, and the output gguf's nb[]).
+    // Scope: this only covers the whole-model `--type Q2_0` case (the
+    // common one); a per-tensor `--tensor-type ...=Q2_0` override is not
+    // covered and keeps whatever default was already bound.
+    if (default_type == GGML_TYPE_Q2_0) {
+        ggml_q2_0_variant_set_default(GGML_Q2_0_VARIANT_G64);
+    }
+
     quantize_state_impl qs(*model, params);
 
     if (params->only_copy) {

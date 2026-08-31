@@ -98,6 +98,7 @@ typedef sycl::half2 ggml_half2;
 
 #define QI2_0 (QK2_0 / 32)
 #define QR2_0 1
+#define QI2_0_G64 (QK2_0_G64 / 32) // A5: g64 variant of QI2_0 (see block_q2_0_g64 above)
 
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
@@ -207,6 +208,22 @@ typedef struct {
     uint8_t qs[QK2_0 / 4]; // 2 bits per element
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
+
+// A5 dual group-size (PORT-MANIFEST.md section A5): mainline llama.cpp
+// reassigned GGML_TYPE_Q2_0=42 to this layout -- 64 elements/block, one
+// ggml_half scale, 2 bits/element (16 B qs) = 18 B/block. This fork's own
+// production corpus (Bonsai) uses the 128-element block_q2_0 above (34
+// B/block); BOTH coexist under the single public type id 42, selected at
+// runtime per tensor via ggml_q2_0_variant_of()/ggml_q2_0_variant_bind()
+// (ggml.h). block_q2_0 (QK2_0=128) remains the process DEFAULT (A5.3) --
+// this struct is never referenced by the static type_traits table, only by
+// code that has explicitly resolved the per-tensor/per-process variant.
+#define QK2_0_G64 64
+typedef struct {
+    ggml_half d;               // delta
+    uint8_t qs[QK2_0_G64 / 4]; // 2 bits per element
+} block_q2_0_g64;
+static_assert(sizeof(block_q2_0_g64) == sizeof(ggml_half) + QK2_0_G64 / 4, "wrong q2_0_g64 block size/padding");
 
 #define QK4_0 32
 typedef struct {

@@ -8,7 +8,10 @@ void get_rows_cuda(
         int64_t ne00, size_t nb01, size_t nb02, size_t nb03,
         int64_t ne10, int64_t ne11, int64_t ne12, size_t nb10, size_t nb11, size_t nb12,
         size_t nb1, size_t nb2, size_t nb3,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        // A5 (PORT-MANIFEST.md): true iff src0 is a Q2_0 tensor bound to the
+        // g64 (upstream) variant. Ignored for every other type.
+        bool q2_0_g64 = false);
 
 void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
