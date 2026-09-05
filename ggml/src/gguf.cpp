@@ -792,6 +792,27 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
         {
             ok = ok && gr.read(info.t.type);
 
+            // PQ2_0 interop (published PrismML ggufs).
+            //
+            // Upstream PrismML splits the two ternary group sizes across two
+            // ggml type ids: 42 (Q2_0) is g64 and 142 (PQ2_0) is g128. Our A5
+            // dual-format instead lets id 42 serve BOTH and detects which from
+            // the tensor sizes (see the deferred pass below).
+            //
+            // block_pq2_0 and our block_q2_0 are byte-identical -- fp16 scale +
+            // QK/4 code bytes = 34 B at QK=128 (verified: prism/prism
+            // ggml-common.h QK_PQ2_0 == 128, ours QK2_0 == 128) -- so a
+            // published PQ2_0 file simply IS a g128 Q2_0 file. Remap the id
+            // here, before the range check, so the existing A5 detection and
+            // the tuned g128 kernels apply unchanged.
+            //
+            // Deliberately NOT added to the ggml_type enum: that would force
+            // GGML_TYPE_COUNT 50 -> 143 and leave a sparse type_traits array
+            // (ids 50..141 zero-filled, so blck_size would read back 0).
+            if ((int) info.t.type == 142 /* GGML_TYPE_PQ2_0 upstream */) {
+                info.t.type = GGML_TYPE_Q2_0;
+            }
+
             // check that tensor type is within defined range
             if (info.t.type < 0 || info.t.type >= GGML_TYPE_COUNT) {
                 GGML_LOG_ERROR("%s: tensor '%s' has invalid ggml type %d. should be in [0, %d)\n",
