@@ -439,10 +439,51 @@ struct ggml_cuda_unroll<1> {
     }
 };
 
+// T245: DPP-based warp-reduce fast path for width==32 (RDNA4/gfx1201 only).
+// HIP's __shfl_xor_sync lowers unconditionally to ds_bpermute_b32 (LDS
+// crossbar round trip) for every butterfly step -- confirmed by disasm on
+// this exact toolchain, unchanged since the original 2026-07-05 audit.
+// RDNA4's DPP16 (ISA doc sec 7.9.1) does in-VALU lane-XOR permutes with NO
+// LDS round trip, but is HARD-LIMITED to within a 16-lane row (the ISA
+// doc's own words: "out of range" = crossing the 0..15/16..31 boundary) --
+// so only offsets 8/4/2/1 (which stay inside one row) can use it; offset 16
+// (crossing rows) stays on the proven-correct ds_bpermute path via
+// __shfl_xor_sync. Verified end-to-end via an isolated correctness probe
+// (bit-exact vs the shfl_xor reference, all 32 lanes, both int and float)
+// before this change -- see the T245 kanban card for the probe source.
+// BONUS found via disasm, not by design: the compiler fuses each DPP
+// permute+add into a single v_add_nc_u32_dpp instruction, so this is not
+// just a latency-domain change -- it also cuts total instruction count for
+// a 32-wide reduction from 10 (5x ds_bpermute + 5x separate add) to 6
+// (1x ds_bpermute + 1x add + 4x fused dpp-add).
+template <int N>
+static __device__ __forceinline__ int dpp_row_xmask_i32(int x) {
+    return __builtin_amdgcn_update_dpp(0, x, 0x160 | N, 0xf, 0xf, 1);
+}
+template <int N>
+static __device__ __forceinline__ float dpp_row_xmask_f32(float x) {
+    return __builtin_amdgcn_update_dpp(0.0f, x, 0x160 | N, 0xf, 0xf, 1);
+}
+
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_sum(int x) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
     return __reduce_add_sync(0xffffffff, x);
+#elif defined(GGML_USE_HIP) && defined(__gfx1201__)
+    if constexpr (width == 32) {
+        x = x + __shfl_xor_sync(0xffffffff, x, 16, 32);
+        x = x + dpp_row_xmask_i32<8>(x);
+        x = x + dpp_row_xmask_i32<4>(x);
+        x = x + dpp_row_xmask_i32<2>(x);
+        x = x + dpp_row_xmask_i32<1>(x);
+        return x;
+    } else {
+#pragma unroll
+        for (int offset = width/2; offset > 0; offset >>= 1) {
+            x += __shfl_xor_sync(0xffffffff, x, offset, width);
+        }
+        return x;
+    }
 #else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
@@ -454,11 +495,28 @@ static __device__ __forceinline__ int warp_reduce_sum(int x) {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
+#if defined(GGML_USE_HIP) && defined(__gfx1201__)
+    if constexpr (width == 32) {
+        x = x + __shfl_xor_sync(0xffffffff, x, 16, 32);
+        x = x + dpp_row_xmask_f32<8>(x);
+        x = x + dpp_row_xmask_f32<4>(x);
+        x = x + dpp_row_xmask_f32<2>(x);
+        x = x + dpp_row_xmask_f32<1>(x);
+        return x;
+    } else {
+#pragma unroll
+        for (int offset = width/2; offset > 0; offset >>= 1) {
+            x += __shfl_xor_sync(0xffffffff, x, offset, width);
+        }
+        return x;
+    }
+#else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         x += __shfl_xor_sync(0xffffffff, x, offset, width);
     }
     return x;
+#endif
 }
 
 template<int width = WARP_SIZE>
@@ -514,11 +572,34 @@ static __device__ __forceinline__ int warp_reduce_any(int x) {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_max(float x) {
+#if defined(GGML_USE_HIP) && defined(__gfx1201__)
+    // T245: same DPP fast path as warp_reduce_sum, see that function's
+    // doctrine comment. fmaxf composes with dpp_row_xmask_f32 the same way
+    // addition does; whether the compiler ALSO fuses it into a single DPP
+    // instruction (like the add case) or emits a separate move+max is a
+    // disasm question, not a correctness one -- either way this is still a
+    // pure latency-domain win over ds_bpermute for the within-row steps.
+    if constexpr (width == 32) {
+        x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, 16, 32));
+        x = fmaxf(x, dpp_row_xmask_f32<8>(x));
+        x = fmaxf(x, dpp_row_xmask_f32<4>(x));
+        x = fmaxf(x, dpp_row_xmask_f32<2>(x));
+        x = fmaxf(x, dpp_row_xmask_f32<1>(x));
+        return x;
+    } else {
+#pragma unroll
+        for (int offset = width/2; offset > 0; offset >>= 1) {
+            x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, offset, width));
+        }
+        return x;
+    }
+#else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, offset, width));
     }
     return x;
+#endif
 }
 
 template<typename T, int width = WARP_SIZE>

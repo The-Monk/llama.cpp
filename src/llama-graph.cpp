@@ -3420,6 +3420,28 @@ ggml_tensor * llm_graph_context::build_rs(
                     get_state_rows);
 }
 
+ggml_tensor * llm_graph_context::build_rs_state_view(
+        llm_graph_input_rs * inp,
+        ggml_tensor * s,
+            int32_t   state_size,
+            int32_t   n_seqs) const {
+    const auto * kv_state = inp->mctx;
+
+    const uint32_t n_rs     = kv_state->get_n_rs();
+    const uint32_t rs_head  = kv_state->get_head();
+
+    GGML_ASSERT(n_seqs == 1 && n_rs == 1); // caller-checked fast-path precondition
+
+    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+
+    // Correctness argument: the offset baked into this view is only valid for
+    // the graph currently being built. The graph is unconditionally rebuilt
+    // (never reused) whenever rs_head or rs_z change -- llm_graph_input_rs::
+    // can_reuse checks both -- so a reused graph can never carry a stale
+    // offset here.
+    return ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], rs_head*states->nb[1]);
+}
+
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
     llm_graph_input_rs * inp,
     const llama_ubatch & ubatch,

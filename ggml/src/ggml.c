@@ -6380,7 +6380,11 @@ struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_tensor  * g,
         struct ggml_tensor  * beta,
         struct ggml_tensor  * state,
-        int64_t               K) {
+        int64_t               K,
+        struct ggml_tensor  * ssm_dt,
+        struct ggml_tensor  * ssm_a,
+        bool                   l2norm_qk,
+        float                  l2norm_eps) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6394,6 +6398,20 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(g->type == GGML_TYPE_F32);
     GGML_ASSERT(beta->type == GGML_TYPE_F32);
     GGML_ASSERT(state->type == GGML_TYPE_F32);
+
+    // fused beta/alpha glue (GGML_GDN_FUSED_BA): g/beta above are the RAW
+    // pre-activation alpha/beta in this mode; ssm_dt/ssm_a (bias/scale, one
+    // scalar per head) ride as extra srcs and the kernel computes
+    // sigmoid(beta) / softplus(alpha+ssm_dt)*ssm_a internally.
+    const bool fused_ba = ssm_dt != NULL && ssm_a != NULL;
+    if (fused_ba) {
+        GGML_ASSERT(ggml_is_contiguous(ssm_dt));
+        GGML_ASSERT(ggml_is_contiguous(ssm_a));
+        GGML_ASSERT(ssm_dt->type == GGML_TYPE_F32);
+        GGML_ASSERT(ssm_a->type  == GGML_TYPE_F32);
+        GGML_ASSERT(g->ne[0] == 1); // fused mode: scalar gate only (no KDA)
+        GGML_ASSERT(ssm_dt->ne[0] == g->ne[1] && ssm_a->ne[0] == g->ne[1]); // one scalar per head
+    }
 
     const int64_t S_v      = v->ne[0];
     const int64_t H        = v->ne[1];
@@ -6415,6 +6433,9 @@ struct ggml_tensor * ggml_gated_delta_net(
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
+    ggml_set_op_params_i32(result, 1, fused_ba ? 1 : 0);
+    ggml_set_op_params_i32(result, 2, l2norm_qk ? 1 : 0);
+    ggml_set_op_params_f32(result, 3, l2norm_eps);
 
     result->op     = GGML_OP_GATED_DELTA_NET;
     result->src[0] = q;
@@ -6423,6 +6444,8 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+    result->src[6] = fused_ba ? ssm_dt : NULL;
+    result->src[7] = fused_ba ? ssm_a  : NULL;
 
     return result;
 }

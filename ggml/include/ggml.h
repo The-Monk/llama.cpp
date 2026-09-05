@@ -2624,6 +2624,24 @@ extern "C" {
     // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
+    // EXPERIMENT (env-gated GGML_GDN_FUSED_BA, ported from PrismML
+    // megakernel/rmsnorm-qmv-fuse commit c92cf5ebc, Metal orig): pass
+    // ssm_dt/ssm_a (both nullable, shape [H]) to fold the beta/alpha glue
+    // (sigmoid(beta), softplus(alpha+ssm_dt)*ssm_a) into the kernel instead
+    // of 4 separate elementwise ops upstream. When non-null, `g` and `beta`
+    // are the RAW (pre-activation) alpha/beta tensors instead of the
+    // precomputed gate/beta-sigmoid values -- same shapes as the
+    // non-fused call ([1|S_v, H, T, B] and [1, H, T, B]). KDA (per-channel
+    // gate) is not supported in fused mode; only the scalar-gate path used
+    // by qwen35/Bonsai.
+    // EXPERIMENT (env-gated GGML_GDN_FUSED_L2NORM, T180 follow-on): when
+    // l2norm_qk is true, `q` and `k` are the RAW (pre-L2-norm) tensors and
+    // the kernel L2-normalizes each (token, head) row internally --
+    // scale = rsqrtf(fmaxf(sum(x^2), l2norm_eps^2)), matching
+    // ggml-cuda/norm.cu's l2_norm_f32 bit-for-bit -- instead of two upstream
+    // GGML_OP_L2_NORM dispatches (one for q, one for k) per layer. When
+    // false, q/k are the ALREADY-normalized tensors (existing behavior,
+    // l2norm_eps unused).
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2632,7 +2650,11 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
-            int64_t               K);
+            int64_t               K,
+            struct ggml_tensor  * ssm_dt,    // NULL when not fusing beta/alpha glue
+            struct ggml_tensor  * ssm_a,     // NULL when not fusing beta/alpha glue
+            bool                   l2norm_qk,  // true: q/k are raw, kernel L2-normalizes internally
+            float                  l2norm_eps); // only used when l2norm_qk
 
     // DSA lightning indexer
     //

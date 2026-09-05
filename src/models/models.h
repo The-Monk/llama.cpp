@@ -47,6 +47,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 int           il);
 
     // use the ggml_gated_delta_net fused operator (K=1; state has shape [S_v, S_v, H_v, n_seqs])
+    // ssm_dt/ssm_a (both nullable): GGML_GDN_FUSED_BA glue fusion, see ggml_gated_delta_net.
+    // l2norm_qk/l2norm_eps: GGML_GDN_FUSED_L2NORM, see ggml_gated_delta_net.
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_fused(
                 ggml_tensor * q,
                 ggml_tensor * k,
@@ -54,7 +56,11 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * g,
                 ggml_tensor * b,
                 ggml_tensor * s,
-                        int   il);
+                        int   il,
+                ggml_tensor * ssm_dt = nullptr,
+                ggml_tensor * ssm_a  = nullptr,
+                bool          l2norm_qk = false,
+                float         l2norm_eps = 0.0f);
 
     // choose one of two implementations above based on the number of tokens
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net(
@@ -64,7 +70,11 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * g,
                 ggml_tensor * b,
                 ggml_tensor * s,
-                        int   il);
+                        int   il,
+                ggml_tensor * ssm_dt = nullptr,
+                ggml_tensor * ssm_a  = nullptr,
+                bool          l2norm_qk = false,
+                float         l2norm_eps = 0.0f);
 
     // read conv state from cache, concat with qkv_mixed, write back (single slot or per-token)
     // qkv_mixed: (qkv_dim, n_seq_tokens, n_seqs); returns conv_input: (kernel_size + n_seq_tokens - 1, channels, n_seqs)
@@ -87,7 +97,11 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        g,
             ggml_tensor *        b,
             ggml_tensor *        s,
-            int                  il);
+            int                  il,
+            ggml_tensor *        ssm_dt = nullptr,
+            ggml_tensor *        ssm_a  = nullptr,
+            bool                  l2norm_qk = false,
+            float                 l2norm_eps = 0.0f);
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {

@@ -377,7 +377,11 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * g,
         ggml_tensor * b,
         ggml_tensor * s,
-        int           il) {
+        int           il,
+        ggml_tensor * ssm_dt,
+        ggml_tensor * ssm_a,
+        bool          l2norm_qk,
+        float         l2norm_eps) {
     const int64_t S_k      = q->ne[0];
     const int64_t H_k      = q->ne[1];
     const int64_t n_tokens = q->ne[2];
@@ -399,7 +403,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
+    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1, ssm_dt, ssm_a, l2norm_qk, l2norm_eps);
     if (n_tokens == 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
     } else {
@@ -429,20 +433,31 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * g,
         ggml_tensor * b,
         ggml_tensor * s,
-        int           il) {
+        int           il,
+        ggml_tensor * ssm_dt,
+        ggml_tensor * ssm_a,
+        bool          l2norm_qk,
+        float         l2norm_eps) {
     const int64_t n_seq_tokens = q->ne[2];
 
+    // ssm_dt/ssm_a (fused beta/alpha glue) and l2norm_qk/l2norm_eps (fused
+    // L2-norm) are only threaded through the fused K=1 kernel path -- the
+    // chunking/autoregressive reference paths never received either
+    // optimization (the Metal original didn't for beta/alpha; l2norm follows
+    // the same precedent rather than risk an unverified reference-path change).
     if (n_seq_tokens == 1) {
         if (cparams.fused_gdn_ar) {
-            return build_delta_net_fused(q, k, v, g, b, s, il);
+            return build_delta_net_fused(q, k, v, g, b, s, il, ssm_dt, ssm_a, l2norm_qk, l2norm_eps);
         }
+        GGML_ASSERT(!l2norm_qk && "GGML_GDN_FUSED_L2NORM requires cparams.fused_gdn_ar (always true in this fork; if that ever changes, this assert catches the mismatch instead of silently feeding raw q/k to the reference path)");
         return build_delta_net_autoregressive(q, k, v, g, b, s, il);
     }
 
     if (cparams.fused_gdn_ch) {
-        return build_delta_net_fused(q, k, v, g, b, s, il);
+        return build_delta_net_fused(q, k, v, g, b, s, il, ssm_dt, ssm_a, l2norm_qk, l2norm_eps);
     }
 
+    GGML_ASSERT(!l2norm_qk && "GGML_GDN_FUSED_L2NORM requires cparams.fused_gdn_ch (always true in this fork; see the n_seq_tokens==1 branch's identical assert)");
     return build_delta_net_chunking(q, k, v, g, b, s, il);
 }
 
@@ -533,7 +548,11 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor *        g,
         ggml_tensor *        b,
         ggml_tensor *        s,
-        int                  il) {
+        int                  il,
+        ggml_tensor *        ssm_dt,
+        ggml_tensor *        ssm_a,
+        bool                  l2norm_qk,
+        float                 l2norm_eps) {
     const auto * mctx_cur   = inp->mctx;
     const auto   kv_head    = mctx_cur->get_head();
     const uint32_t mem_size = mctx_cur->get_size();
@@ -546,7 +565,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const bool keep = cparams.n_rs_seq > 0;
 
     if (!keep) {
-        auto attn_out = build_delta_net(q, k, v, g, b, s, il);
+        auto attn_out = build_delta_net(q, k, v, g, b, s, il, ssm_dt, ssm_a, l2norm_qk, l2norm_eps);
         ggml_tensor * output    = attn_out.first;
         ggml_tensor * new_state = attn_out.second;
         cb(output, "attn_output", il);
@@ -564,7 +583,10 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t K = cparams.n_rs_seq + 1;
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    // l2norm_qk/fused_ba always false here: qwen35.cpp's GGML_GDN_FUSED_BA/
+    // GGML_GDN_FUSED_L2NORM gates require cparams.n_rs_seq==0 (i.e. !keep) --
+    // this branch (keep==true) never receives either fusion.
+    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K, nullptr, nullptr, false, 0.0f);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {

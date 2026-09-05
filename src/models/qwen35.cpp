@@ -359,25 +359,59 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
+    // EXPERIMENT (env-gated GGML_GDN_FUSED_BA, ported from PrismML
+    // megakernel/rmsnorm-qmv-fuse commit c92cf5ebc): fold sigmoid(beta) and
+    // softplus(alpha+ssm_dt)*ssm_a into the GDN kernel, skipping 4 separate
+    // elementwise dispatches/layer. Fused K=1 decode path only.
+    //
+    // KNOWN LIMITATION: only the CUDA/HIP kernel implements FusedBA
+    // (gated_delta_net.cu); ggml-cpu's reference kernel does not read
+    // op_params[1]/src[6]/src[7] and would silently treat beta/g as
+    // already-activated if this op ever ran on CPU with the flag set. Safe
+    // only under full GPU offload (-ngl 99).
+    //
+    // Gate requires cparams.n_rs_seq == 0: build_recurrent_attn's keep==true
+    // branch (rollback active) passes gate/beta straight into the base
+    // ggml_gated_delta_net call with explicit nullptr,nullptr for ssm_dt/
+    // ssm_a, so raw unactivated values must never reach that path.
+    const bool gdn_fused_ba = getenv("GGML_GDN_FUSED_BA") != nullptr && n_seq_tokens == 1 && cparams.n_rs_seq == 0;
+
+    // GGML_GDN_FUSED_L2NORM (T180 follow-on): fold the two upstream
+    // GGML_OP_L2_NORM dispatches (q_conv, k_conv) into the GDN kernel,
+    // matching GGML_GDN_FUSED_BA's exact gating discipline above (cparams.
+    // fused_gdn_ar/fused_gdn_ch are hardcoded true in this fork, so
+    // n_seq_tokens==1 && n_rs_seq==0 is sufficient to guarantee the fused
+    // K=1 kernel path is actually taken; build_delta_net/build_delta_net_fused
+    // carry a GGML_ASSERT that would catch it if that assumption ever broke).
+    const bool gdn_fused_l2norm = getenv("GGML_GDN_FUSED_L2NORM") != nullptr && n_seq_tokens == 1 && cparams.n_rs_seq == 0;
+
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
-    beta = ggml_sigmoid(ctx0, beta);
-    cb(beta, "beta_sigmoid", il);
-
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
-    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+    alpha = ggml_reshape_4d(ctx0, alpha, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
-    ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
-    ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
-    cb(alpha_softplus, "a_softplus", il);
+    ggml_tensor * gate;
+    if (gdn_fused_ba) {
+        // raw beta/alpha ride straight through to ggml_gated_delta_net; the
+        // kernel computes sigmoid(beta) / softplus(alpha+ssm_dt)*ssm_a itself.
+        gate = alpha;
+    } else {
+        beta = ggml_sigmoid(ctx0, beta);
+        cb(beta, "beta_sigmoid", il);
 
-    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
-    cb(gate, "gate", il);
+        ggml_tensor * alpha3 = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+        ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha3, model.layers[il].ssm_dt);
+        ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
+        cb(alpha_softplus, "a_softplus", il);
 
-    gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+        gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
+        cb(gate, "gate", il);
+
+        gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+    }
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
@@ -388,9 +422,43 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
+    // EXPERIMENT (env-gated GGML_GDN_STATE_INPLACE, ported from PrismML
+    // megakernel/rmsnorm-qmv-fuse commit 6d8333b3d): at plain batch=1 decode
+    // the per-layer state gather is an identity permutation -- read a direct
+    // view of the cache row instead. Requires n_rs_seq == 0 (rollback is a
+    // structurally separate code path, see the `keep` bool in
+    // build_recurrent_attn) and get_n_rs() == 1 (single occupied cache row --
+    // false the instant a second sequence's row exists, e.g. multi-slot
+    // serving).
+    //
+    // FOUND DURING PORTING (real bug, not shipped broken): build_rs does two
+    // things, not one -- gather AND a cache-hygiene zero-clear
+    // (ggml_scale_inplace(state_zero, 0)) that fires whenever get_rs_z() >= 0
+    // (a fresh/reset sequence slot -- true on the very first ubatch of a cold
+    // context, since GPU buffers are not zero-initialized on alloc). The
+    // direct-view path skips build_rs entirely, so it would also skip that
+    // clear and read uninitialized memory on a cold start. Measured: with
+    // only this rung enabled, greedy output diverged from baseline starting
+    // partway through generation (root-caused to this, not FP reordering).
+    // Extra gate: only take the fast path when there is no pending clear
+    // this call; every case that needs the clear falls back to build_rs.
+    const bool gdn_state_inplace =
+        getenv("GGML_GDN_STATE_INPLACE") != nullptr &&
+        cparams.n_rs_seq == 0 &&
+        n_seqs == 1 &&
+        inp->mctx->get_n_rs() == 1 &&
+        inp->mctx->get_rs_z() < 0;
+
+    ggml_tensor * state;
+    if (gdn_state_inplace) {
+        state = build_rs_state_view(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        cb(state, "state_inplace_view", il);
+    } else {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        cb(state, "state_predelta", il);
+    }
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
@@ -429,8 +497,14 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    // GGML_GDN_FUSED_L2NORM: skip both L2_NORM dispatches here, pass RAW
+    // q_conv/k_conv through -- the GDN kernel normalizes internally (see
+    // ggml_gated_delta_net's l2norm_qk doc comment / gated_delta_net_cuda's
+    // L2Norm template branch). When the flag is off, unchanged behavior.
+    if (!gdn_fused_l2norm) {
+        q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    }
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
@@ -448,7 +522,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il,
+            gdn_fused_ba ? model.layers[il].ssm_dt : nullptr,
+            gdn_fused_ba ? model.layers[il].ssm_a  : nullptr,
+            gdn_fused_l2norm,
+            eps_norm);
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

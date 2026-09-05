@@ -1290,6 +1290,29 @@ struct llm_graph_context {
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
 
+    // EXPERIMENT (env-gated GGML_GDN_STATE_INPLACE, ported from PrismML
+    // megakernel/rmsnorm-qmv-fuse commit 6d8333b3d, Metal orig -- read side
+    // only, see build_recurrent_attn in delta-net-base.cpp for the write
+    // side, which our tree does not need to touch: the CUDA backend already
+    // has an unconditional graph-fusion pass, ggml_cuda_try_gdn_cache_fusion,
+    // that folds the plain-decode snapshot cpy into the kernel).
+    //
+    // At batch=1 plain decode (single seq, single occupied cache row, no
+    // rollback support configured), the per-layer state gather below is an
+    // IDENTITY permutation. Returns a direct view of that one cache row
+    // instead of running get_rows over it.
+    //
+    // Caller MUST additionally check cparams.n_rs_seq == 0 (rollback is
+    // architecturally disjoint at n_rs_seq > 0 on this tree -- see the
+    // `keep` bool in llm_build_delta_net_base::build_recurrent_attn -- but
+    // gate here too, explicitly, rather than relying solely on n_rs==1
+    // happening to hold) before calling this.
+    ggml_tensor * build_rs_state_view(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+                int32_t   state_size,
+                int32_t   n_seqs) const;
+
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,
         const llama_ubatch & ubatch,

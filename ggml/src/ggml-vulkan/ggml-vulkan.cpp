@@ -19380,9 +19380,12 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_gated_linear_attn(ggml_ctx, src_clone[0], src_clone[1],
             src_clone[2], src_clone[3], src_clone[4], op_params[0]);
         } else if (tensor->op == GGML_OP_GATED_DELTA_NET) {
+            // NOTE: this debug-check clone path does not thread ssm_dt/ssm_a
+            // (GGML_GDN_FUSED_BA) or l2norm_qk/l2norm_eps (GGML_GDN_FUSED_L2NORM)
+            // -- not attempting to fix that scope in passing.
             tensor_clone = ggml_gated_delta_net(ggml_ctx, src_clone[0], src_clone[1],
             src_clone[2], src_clone[3], src_clone[4], src_clone[5],
-            ggml_get_op_params_i32(tensor, 0));
+            ggml_get_op_params_i32(tensor, 0), nullptr, nullptr, false, 0.0f);
         } else if (tensor->op == GGML_OP_OPT_STEP_ADAMW) {
             src_clone[0]->flags = tensor->src[0]->flags;
             tensor_clone = ggml_opt_step_adamw(ggml_ctx, src_clone[0], src_clone[1],
