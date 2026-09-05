@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "quantize.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -407,6 +408,95 @@ static void rms_norm_mul_f32_cuda(const float *  x,
     }
 }
 
+// GGML_CUDA_FUSE_NORM_QUANT (default: unset/OFF, T-fuse-norm-quant): batch=1
+// decode only, single row/channel/sample, no column broadcast on the norm
+// weight. Computes the RMS_NORM+MUL result exactly like rms_norm_f32<...,
+// true> above (same scale formula, same per-column store), but ALSO packs
+// the q8_1-quantized form of that same value into `y` in the same kernel
+// launch -- no second dispatch. `y` is meant to be the mmvq activation-quant
+// dedup cache buffer (mmvq.cu): the caller pre-populates
+// ctx.mmvq_quant_cache_* with this tensor/fn/size so every sibling
+// MUL_MAT_VEC_Q consumer of this row takes the cache-HIT path and
+// quantize_row_q8_1_cuda is never dispatched for it. The per-lane math below
+// (amax/sum over 32-lane groups, d = amax/127, round-to-int8) is copied from
+// quantize_q8_1 (quantize.cu) so the bytes this produces are exactly the
+// bytes that kernel would have produced reading back dst[col] -- required
+// for the dedup cache's bit-for-bit contract.
+template <int block_size>
+static __global__ void rms_norm_mul_quant_f32(
+        const float * __restrict__ x,
+        float       * __restrict__ dst,
+        block_q8_1  * __restrict__ y,
+        const int     ncols,
+        const int     ne0_padded,
+        const float   eps,
+        const float * __restrict__ mul) {
+    ggml_cuda_pdl_lc();
+    const int tid = threadIdx.x;
+
+    float tmp = 0.0f; // partial sum for thread in warp
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    // sum up partial sums
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    // Loop out to ne0_padded (not just ncols) so the tail quant blocks
+    // (MATRIX_ROW_PADDING beyond the real hidden size) get the same
+    // zero-fill quantize_q8_1 gives them; `dst` itself is only ncols wide,
+    // so the write to dst[col] stays gated on col < ncols.
+    for (int col = tid; col < ne0_padded; col += block_size) {
+        float val = 0.0f;
+        if (col < ncols) {
+            val = scale * x[col] * mul[col];
+            dst[col] = val;
+        }
+
+        float amax = fabsf(val);
+        float sum  = val;
+        amax = warp_reduce_max<QK8_1>(amax);
+        sum  = warp_reduce_sum<QK8_1>(sum);
+
+        const int ib  = col / QK8_1;
+        const int iqs = col % QK8_1;
+
+        const float  d = amax / 127.0f;
+        const int8_t q = amax == 0.0f ? 0 : roundf(val / d);
+        y[ib].qs[iqs] = q;
+
+        if (iqs == 0) {
+            y[ib].ds = make_half2(d, sum);
+        }
+    }
+}
+
+static void rms_norm_mul_quant_f32_cuda(
+        const float * x, float * dst, block_q8_1 * y,
+        const int ncols, const int ne0_padded, const float eps, const float * mul, cudaStream_t stream) {
+    if (ncols < 1024) {
+        const dim3 block_dims(256, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{dim3(1, 1, 1), block_dims, 32 * sizeof(float), stream};
+        ggml_cuda_kernel_launch(rms_norm_mul_quant_f32<256>, launch_params, x, dst, y, ncols, ne0_padded, eps, mul);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{dim3(1, 1, 1), block_dims, 32 * sizeof(float), stream};
+        ggml_cuda_kernel_launch(rms_norm_mul_quant_f32<1024>, launch_params, x, dst, y, ncols, ne0_padded, eps, mul);
+    }
+}
+
+static bool ggml_cuda_fuse_norm_quant_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_FUSE_NORM_QUANT") != nullptr;
+    return enabled;
+}
+
 static void rms_norm_back_f32_cuda(const float * grad, const float * xf, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
     if (ncols < 1024) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
@@ -548,6 +638,30 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int mul_nrows     = mul_src->ne[1];
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
+
+    // GGML_CUDA_FUSE_NORM_QUANT fast path: batch=1 decode only (single row/
+    // channel/sample on both the norm source and the mul output, no column
+    // broadcast on the norm weight -- mul_ncols == ne00 makes mul[col] a
+    // direct index, matching what the kernel above assumes). Declines to
+    // fuse (falls through to the normal call below) on anything else, same
+    // as every other opt-in fusion in this file -- never a best-effort path.
+    if (ggml_cuda_fuse_norm_quant_enabled() &&
+        ne01 == 1 && ne02 == 1 && ne03 == 1 &&
+        mul_nrows == 1 && mul_nchannels == 1 && mul_nsamples == 1 &&
+        mul_ncols == ne00) {
+
+        const int64_t ne0_padded  = GGML_PAD(ne00, MATRIX_ROW_PADDING);
+        const size_t  dedup_bytes = (size_t) (ne0_padded / QK8_1) * sizeof(block_q8_1);
+
+        ctx.mmvq_quant_cache_buf    = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), dedup_bytes);
+        ctx.mmvq_quant_cache_tensor = mul_tensor;
+        ctx.mmvq_quant_cache_fn     = (void *) quantize_row_q8_1_cuda;
+        ctx.mmvq_quant_cache_bytes  = dedup_bytes;
+
+        rms_norm_mul_quant_f32_cuda(src0_d, dst_d, (block_q8_1 *) ctx.mmvq_quant_cache_buf->get(),
+                                     (int) ne00, (int) ne0_padded, eps, mul_d, stream);
+        return;
+    }
 
     rms_norm_mul_f32_cuda(src0_d, mul_d, nullptr, dst_d,
                           ne00, ne01, ne02, ne03,
