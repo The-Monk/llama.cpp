@@ -546,6 +546,35 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         // nwarps=8 benefits types with simple vec_dot on RDNA4 (ncols_dst=1).
         // Types with complex vec_dot (Q3_K, IQ2_*, IQ3_*) regress due to register
         // pressure and lookup table contention at higher thread counts.
+        //
+        // CORRECTED 2026-09-05 (iq-tuning worktree, T-sweep) for the three
+        // types actually re-swept -- IQ2_XXS/IQ2_S/IQ3_S -- because the claim
+        // above was derived from a 1-vs-8 test only, the same shape of error
+        // that was wrong for Q1_0 (see its case below). Full sweep {2,3,4,6}
+        // vs the shipped nwarps=1, Qwen3.8-27B, tg128 r=3, interleaved,
+        // GPU0-idle-gated (amd-smi GFX_ACTIVITY<=3% + no llama-bench/quantize/
+        // rocprofv3/test-backend-op/llama-cli running), correctness-gated
+        // with test-backend-ops -o MUL_MAT (1217/1217, 0 FAIL) at every N:
+        //   type      nwarps=1(shipped)  2       3        4       6
+        //   IQ2_XXS   14.13              29.20   30.07    25.17   27.58
+        //     vs 1     --               +106.7% +112.8%  +78.2%  +95.2%
+        //   IQ2_S     29.66              29.94   29.84    29.78   29.60
+        //     vs 1     --                +0.9%   +0.6%    +0.4%   -0.2%
+        //   IQ3_S     28.73              27.01   27.93    23.69   25.69
+        //     vs 1     --                -6.0%   -2.8%   -17.5%  -10.6%
+        // IQ2_XXS: the "regress due to register pressure" claim was FALSE --
+        // nwarps=1 was leaving it catastrophically under-occupied (19.9% of
+        // the measured 636 GB/s roofline at nwarps=1 vs ~53% at nwarps=3).
+        // Peak at nwarps=3 (+112.8%); takes it below in its own case.
+        // IQ2_S: genuinely flat, all deltas inside the ~1% noise band --
+        // neither regresses nor improves. Stays at the RDNA4 default (1).
+        // IQ3_S: the claim HOLDS here -- every nwarps tested regresses,
+        // worst at nwarps=4 (an "occupancy pothole" also seen in IQ2_XXS's
+        // own dip at nwarps=4 above -- likely the same 128-thread/block
+        // wave-packing effect, not a fluke). Stays at the default (1).
+        // NOT re-swept: IQ2_XS/IQ2_M/IQ3_XXS/IQ3_XS/IQ3_M/Q3_K still rest on
+        // the original 1-vs-8 test only -- do not assume they follow either
+        // IQ2_XXS or IQ3_S until measured.
         if (ncols_dst == 1) {
             switch (type) {
                 case GGML_TYPE_Q4_0:
@@ -607,6 +636,13 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 // See the sweep table above.
                 case GGML_TYPE_Q1_0:
                     return 6;
+                // IQ2_XXS: swept 2/3/4/6 vs shipped nwarps=1, see the sweep
+                // table above. Peak at nwarps=3 (+112.8%, 14.13 -> 30.07
+                // t/s). IQ2_S and IQ3_S were swept the same way and do NOT
+                // get a case here -- IQ2_S was flat (no case = default 1),
+                // IQ3_S regressed at every value tested (no case = default 1).
+                case GGML_TYPE_IQ2_XXS:
+                    return 3;
                 default:
                     return 1;
             }
