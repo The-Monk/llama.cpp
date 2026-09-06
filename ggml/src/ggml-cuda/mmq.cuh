@@ -3,8 +3,10 @@
 #include "common.cuh"
 #include "vecdotq.cuh"
 #include "mma.cuh"
+#include "mmq-spill-table.h"
 
 #include <climits>
+#include <cstdlib>
 #include <cstdint>
 
 using namespace ggml_cuda_mma;
@@ -5005,11 +5007,61 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int mmq_x_max_eff = (args.ids_dst != nullptr && amd_wmma_available(cc) && mmq_x_max > 64)
         ? 64 : mmq_x_max;
 
+    // [TAG_MMQ_SPILL_TABLE] The loop below used to filter on shared memory ALONE,
+    // so it happily selected tiles that spill registers. Every entry in
+    // MMQ_SPILLS sits at vgpr_count=256 (the wave32 ceiling) -- the compiler has
+    // no registers left to give. Q2_K@80 (741 spills, ~7x prefill loss) and
+    // Q6_K@128 (18 spills, -39.6% prefill) were both found by benchmark, months
+    // apart, and patched by hand; this makes the constraint structural.
+    //
+    // THRESHOLD CALIBRATION -- corrected by measurement 2026-09-05, and the
+    // correction matters more than the original guess:
+    //
+    // The first cut used spill_max=16 on the theory that Q6_K@128 (18 spills)
+    // explained its -39.6% prefill. A forced-mmq_x sweep FALSIFIED that. Q6_K
+    // pp1024: auto 611.9 | x128 605.1 | x112 603.1 | x96 580.2 | x64 594.6 |
+    // x32 485.1 -- every alternative is WORSE, so the selector's existing choice
+    // is already optimal and Q6_K spills 18 VGPRs while still being the best
+    // available tile. A threshold of 16 would have skipped 128 for 112 and
+    // shipped a measured -1.4% regression justified by a spill count.
+    //
+    // So: spilling does NOT predict slowness at this magnitude, and this guard
+    // only earns its place against CATASTROPHIC spilling. The one such case on
+    // record is Q2_K@80 at 741 spills (~7x prefill loss). Default is therefore
+    // set well above every spill count that has been measured as harmless
+    // (max 48: Q5_1@128) and well below the one known disaster.
+    // NOTE: 256 is calibrated from a SINGLE catastrophic data point. Anything
+    // between ~50 and ~740 is unmeasured territory; a type landing there should
+    // be swept before trusting this guard to do the right thing.
+    // Default 256 = above every spill count measured harmless (max 48, Q5_1@128)
+    // and below the one known disaster (741, Q2_K@80). Negative disables the
+    // guard entirely. Static: read once, not on every mul_mat call.
+    static const int spill_max = [] {
+        const char * e = getenv("GGML_CUDA_MMQ_SPILL_MAX");
+        return e ? atoi(e) : 256;
+    }();
+
+    auto mmq_x_spills_too_much = [&](int cand) {
+        if (spill_max < 0) {
+            return false;
+        }
+        for (int i = 0; i < MMQ_SPILLS_N; ++i) {
+            if (MMQ_SPILLS[i].type == (int) type && MMQ_SPILLS[i].mmq_x == cand) {
+                return MMQ_SPILLS[i].spills > spill_max;
+            }
+        }
+        return false;
+    };
+
     for (int mmq_x = 8; mmq_x <= mmq_x_max_eff && ntiles_x_best > 1; mmq_x += 8) {
         const int granularity = mmq_get_granularity_host(mmq_x, cc);
 
         if (mmq_x % granularity != 0 ||
                 mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps, args.ids_dst != nullptr) > smpbo) {
+            continue;
+        }
+
+        if (mmq_x_spills_too_much(mmq_x)) {
             continue;
         }
 
