@@ -2222,7 +2222,37 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // decode (M<=threshold) falls through to the dedicated kernel. Opt-in
     // GGML_HIP_IU4_HIPBLASLT_PREFILL (+ _FP8); soft-fail -> the intercept below.
     {
-        static const bool iu4_hipblaslt_prefill_enabled = (getenv("GGML_HIP_IU4_HIPBLASLT_PREFILL") != nullptr);
+        // DEFAULT ON since 2026-09-06 (was opt-in). Without this route IU4
+        // prefill has no working GPU path at all -- it is FLAT across batch
+        // size, 343/342/343 t/s at pp128/512/1024 on Qwen3.8-27B IU4, i.e. an
+        // 8x batch increase buys nothing. With it: 589/1300/1444, so
+        // +71% / +280% / +321%. Decode is untouched (29.58 t/s both ways):
+        // M <= MTHRESH still falls through to the dedicated kernel below.
+        //
+        // MTHRESH stays at its default of 32 for IU4, deliberately, and that is
+        // the OPPOSITE of the right answer for Q8_0/MXFP6/MXFP8, where a low
+        // threshold collapses pp128 by 43-49% (it is why Q2_0 went 32 -> 384).
+        // The difference is what the route displaces: those formats have a good
+        // native prefill to lose to, IU4 does not, so IU4 wins at every batch
+        // size measured -- including pp128, +71%. Measured 32/128/384:
+        //   MTHRESH     32     128    384
+        //   pp128      589     338    329
+        //   pp512     1300    1303   1241
+        //   pp1024    1444    1447   1449
+        //
+        // Correctness gated before defaulting on, because this route CHANGES
+        // THE ARITHMETIC (dequant iu4 -> per-channel int8/fp8 -> Tensile GEMM),
+        // so a speed win alone is not sufficient evidence. wikitext-2, 24
+        // chunks, Qwen3.8-27B IU4: PPL 6.5777 +/- 0.207 off vs 6.4195 +/- 0.201
+        // on -- indistinguishable inside the error bars, and if anything
+        // slightly better, which is consistent with per-CHANNEL scales being
+        // finer than the per-block ones the native path uses.
+        //
+        // Set GGML_HIP_IU4_HIPBLASLT_PREFILL=0 to disable.
+        static const bool iu4_hipblaslt_prefill_enabled = [] {
+            const char * e = getenv("GGML_HIP_IU4_HIPBLASLT_PREFILL");
+            return !e || atoi(e) != 0;
+        }();
         if (iu4_hipblaslt_prefill_enabled && ggml_cuda_iu4_hipblaslt_prefill_supports(src0, src1, dst)) {
             if (ggml_cuda_op_mul_mat_iu4_hipblaslt(ctx, src0, src1, dst)) {
                 return;
