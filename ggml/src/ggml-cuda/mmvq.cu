@@ -645,6 +645,32 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 // IQ3_S regressed at every value tested (no case = default 1).
                 case GGML_TYPE_IQ2_XXS:
                     return 3;
+                // MXFP4: was absent from this whitelist entirely, so it ran at
+                // the RDNA4 default (1) -- never tuned, the same state IQ2_XXS
+                // was in. Full sweep on gfx1201, Qwen3.8-27B MXFP4 (13.88 GiB,
+                // 4.36 bpw), tg128 r=3, 3 interleaved rounds, quiet box
+                // (load ~4), every arm correctness-gated with test-backend-ops
+                // -o MUL_MAT (77 MXFP4 cases incl. n=1) BEFORE being timed:
+                //   nwarps   1      2      3      4      6      8
+                //   t/s     33.18  33.85  34.77  33.67  35.17  34.91
+                //   vs 1     --    +2.0%  +4.8%  +1.5%  +6.0%  +5.2%
+                //   %roof    88%    90%    93%    89%    94%    93%
+                // Peak at 6. Note the dip at 4 -- below both 3 and 6 -- which
+                // is the same "occupancy pothole" already recorded above for
+                // IQ2_XXS and IQ3_S, so it is a repeatable RDNA4 effect at
+                // nwarps=4 rather than noise in this sweep.
+                //
+                // HARNESS WARNING for whoever sweeps the next type: the first
+                // run of this sweep was INVALID and looked like a clean flat
+                // negative. It snapshotted only llama-bench per variant, but
+                // the kernels live in libggml-hip.so and llama-bench's RUNPATH
+                // is an ABSOLUTE path into the build tree -- so every arm
+                // loaded whichever library the last build had left there, and
+                // all six "variants" were the same binary. Snapshot the whole
+                // bin/ and force LD_LIBRARY_PATH (it beats RUNPATH), then
+                // assert via ldd that each arm loaded its OWN library.
+                case GGML_TYPE_MXFP4:
+                    return 6;
                 default:
                     return 1;
             }
