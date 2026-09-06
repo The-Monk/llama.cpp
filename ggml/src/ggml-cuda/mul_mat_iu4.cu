@@ -192,11 +192,24 @@ bool ggml_cuda_op_mul_mat_iu4(ggml_backend_cuda_context & ctx, const ggml_tensor
     GGML_ASSERT(src0->type == GGML_TYPE_IU4);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    // Weights are 2D and broadcast across every sequence; only src1/dst carry
+    // the batch dimensions.
     GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
-    GGML_ASSERT(src1->ne[2] == 1 && src1->ne[3] == 1);
     GGML_ASSERT(src0->ne[0] == src1->ne[0]);
     GGML_ASSERT(src0->ne[0] % QK_IU4 == 0);
+    GGML_ASSERT(dst->ne[2] == src1->ne[2] && dst->ne[3] == src1->ne[3]);
 
+    // [TAG_IU4_MULTISEQ] This used to assert src1->ne[2] == 1 && ne[3] == 1 and
+    // therefore ABORTED THE PROCESS on any multi-sequence batch -- llama-perplexity
+    // defaults to 4 parallel sequences and died immediately, as would a server run
+    // with --parallel > 1. IU4 is not wired into the generic mmq/mmvq dispatch (it
+    // has this dedicated kernel and the call site does GGML_ASSERT(ok)), so there
+    // was nothing to fall back TO: returning false would only have moved the abort.
+    //
+    // The kernel itself is a plain 2D GEMM, and a batched matmul here is just
+    // ne12*ne13 independent 2D GEMMs sharing one weight matrix -- so iterate the
+    // slices instead. Correct, and no slower for the ne[2]==1 case that was
+    // already working (single iteration, identical launches).
     const int64_t K = src0->ne[0];
     const int64_t N = src0->ne[1];
     const int64_t M = src1->ne[1];
@@ -206,21 +219,31 @@ bool ggml_cuda_op_mul_mat_iu4(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     ggml_cuda_pool_alloc<block_iu4> act_q(ctx.pool(), (size_t) (M * n_blocks_k));
 
-    {
-        const int64_t row_stride_floats = src1->nb[1] / (int64_t) sizeof(float);
-        const dim3 grid(n_blocks_k, M, 1);
-        const dim3 block(32, 1, 1);
-        k_quantize_act_iu4<<<grid, block, 0, stream>>>((const float *) src1->data, act_q.get(), n_blocks_k, row_stride_floats);
-    }
+    const int64_t src1_row_stride_floats = src1->nb[1] / (int64_t) sizeof(float);
+    const int64_t dst_row_stride_floats  = dst->nb[1]  / (int64_t) sizeof(float);
+    const int64_t nb01 = src0->nb[1];
 
-    {
-        const int64_t nb01 = src0->nb[1];
-        const int64_t dst_row_stride_floats = dst->nb[1] / (int64_t) sizeof(float);
-        const dim3 grid((N + 15) / 16, (M + 15) / 16, 1);
-        const dim3 block(32, 1, 1);
-        k_mul_mat_iu4<<<grid, block, 0, stream>>>(
-                (const char *) src0->data, act_q.get(), (float *) dst->data,
-                M, N, nb01, n_blocks_k, dst_row_stride_floats);
+    for (int64_t i13 = 0; i13 < src1->ne[3]; ++i13) {
+        for (int64_t i12 = 0; i12 < src1->ne[2]; ++i12) {
+            const float * src1_slice = (const float *)
+                ((const char *) src1->data + i12 * src1->nb[2] + i13 * src1->nb[3]);
+            float * dst_slice = (float *)
+                ((char *) dst->data + i12 * dst->nb[2] + i13 * dst->nb[3]);
+
+            {
+                const dim3 grid(n_blocks_k, M, 1);
+                const dim3 block(32, 1, 1);
+                k_quantize_act_iu4<<<grid, block, 0, stream>>>(
+                        src1_slice, act_q.get(), n_blocks_k, src1_row_stride_floats);
+            }
+            {
+                const dim3 grid((N + 15) / 16, (M + 15) / 16, 1);
+                const dim3 block(32, 1, 1);
+                k_mul_mat_iu4<<<grid, block, 0, stream>>>(
+                        (const char *) src0->data, act_q.get(), dst_slice,
+                        M, N, nb01, n_blocks_k, dst_row_stride_floats);
+            }
+        }
     }
 
     return true;
