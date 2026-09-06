@@ -487,6 +487,17 @@ typedef struct {
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
+// TQ2_0 MMVQ decode (CUDA/HIP): QI_TQ2_0 is the number of vec_dot positions
+// per 256-element block, chosen so each position covers exactly one
+// 32-element q8_1 activation block (256/32 = 8) -- same convention as
+// QI_TQ1_0 above, and for the same reason (the -1 offset is applied via the
+// q8_1 stored sum, one q8_1 block at a time). NOTE: sizeof(block_tq2_0) ==
+// 66 (2 mod 4), so blocks alternate 4-/2-aligned across a row, same
+// alignment hazard as block_tq1_0 (54 B) -- the vec_dot must read qs via a
+// 2-byte-aligned load (get_int_b2), not get_int_b4.
+#define QR_TQ2_0 1
+#define QI_TQ2_0 8
+
 //
 // Super-block quantization structures
 //

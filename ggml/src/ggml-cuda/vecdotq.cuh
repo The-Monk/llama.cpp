@@ -118,6 +118,7 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 #define VDR_Q2_0_Q8_1_MMQ  2  // 2 32-element chunks per MMQ tile step
 
 #define VDR_TQ1_0_Q8_1_MMVQ 1 // one 32-element chunk (= one q8_1 block) per vec_dot call
+#define VDR_TQ2_0_Q8_1_MMVQ 1 // one 32-element chunk (= one q8_1 block) per vec_dot call
 
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
@@ -1009,6 +1010,62 @@ static __device__ __forceinline__ float vec_dot_tq1_0_q8_1(
         }
     }
     const int sumi = sumi_a + sumi_b;
+
+    const float d  = bq->d;
+    const float d8 = __low2float(bq8->ds);
+    const float s8 = __high2float(bq8->ds); // = d8 * sum(u)
+    return d * (d8 * sumi - s8);
+}
+
+// TQ2_0 (upstream ternary, 2.0625 bpw): 256 elements/block, 2 bits per
+// element, 4 per byte (64 B qs). Unlike Q2_0, the 4 codes packed in one qs
+// byte are NOT 4 consecutive elements -- they are 4 elements 32 APART (see
+// ggml_vec_dot_tq2_0_q8_K_generic, ggml/src/ggml-cpu/quants.c, and
+// dequantize_row_tq2_0, ggml/src/ggml-quants.c, both authoritative and
+// identical in element order):
+//   for j in {0, 32}: for l in 0..3: for m in 0..31:
+//     element (j*4 + l*32 + m)  <-  qs[j+m], field l = (byte >> 2l) & 3
+// So for a FIXED (j, l) -- i.e. a fixed 32-element q8_1 chunk -- reading 4
+// CONSECUTIVE qs bytes (m, m+1, m+2, m+3) and extracting field l from all
+// four AT ONCE via `(w >> 2l) & 0x03030303` (no multiply-spread needed --
+// contrast vec_dot_q2_0_q8_1_core, where the spread exists because ONE byte
+// there covers 4 elements of the SAME 32-chunk) yields 4 codes for 4
+// CONSECUTIVE elements of that chunk: directly dp4a-able against
+// get_int_b4(bq8_1[c].qs, n).
+//
+// iqs (0..7, QI_TQ2_0 positions) = c, the q8_1 chunk index: j = (c>>2)*32,
+// l = c&3 (c<4 -> j=0, c>=4 -> j=32, matching the reference's outer j /
+// inner l order). Same -1 offset identity as Q2_0/TQ1_0: dot(code-1, u) =
+// dot(code, u) - sum(u), applied once via the q8_1 stored sum
+// s8 = d8*sum(u) rather than subtracting per-code.
+//
+// ALIGNMENT: sizeof(block_tq2_0) == 66 (2 mod 4), so blocks alternate
+// 4-/2-aligned across a row -- same hazard as block_tq1_0 (54 B). Use
+// get_int_b2 (2-byte-aligned read) for the weight bytes, NOT get_int_b4;
+// bq8_1 (36 B/block, always 4-aligned) keeps get_int_b4.
+//
+// TIER 0 (this function): portable ggml_cuda_dp4a, which already carries
+// the whole AMD ladder itself (CDNA/RDNA2/gfx906 -> sdot4, RDNA3/RDNA4 ->
+// sudot4, RDNA1/gfx900 -> emulated, else -> scalar) -- no arch-specific
+// code needed here for the baseline to cover the full family.
+static __device__ __forceinline__ float vec_dot_tq2_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_tq2_0 * bq = (const block_tq2_0 *) vbq + kbx;
+
+    const int c = iqs;           // 0..7, selects one q8_1 chunk
+    const int j = (c >> 2) * 32; // 0 or 32
+    const int l = c & 3;         // field within byte
+
+    const block_q8_1 * bq8 = bq8_1 + c;
+
+    int sumi = 0;
+#pragma unroll
+    for (int n = 0; n < 8; ++n) {
+        const int w     = get_int_b2(bq->qs, (j >> 2) + n); // 4 consecutive qs bytes
+        const int codes = (w >> (2*l)) & 0x03030303;        // field l of all 4 bytes
+        sumi = ggml_cuda_dp4a(codes, get_int_b4(bq8->qs, n), sumi);
+    }
 
     const float d  = bq->d;
     const float d8 = __low2float(bq8->ds);
