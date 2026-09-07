@@ -669,8 +669,25 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 // all six "variants" were the same binary. Snapshot the whole
                 // bin/ and force LD_LIBRARY_PATH (it beats RUNPATH), then
                 // assert via ldd that each arm loaded its OWN library.
-                case GGML_TYPE_MXFP4:
-                    return 6;
+                // MXFP4: NOT tuned here -- deliberately left at the RDNA4
+                // default of 1. nwarps=6 was measured at +6.0% on DENSE
+                // Qwen3.8-27B MXFP4 (33.18 -> 35.17 t/s, 88% -> 94% of
+                // roofline) and briefly landed on that basis, then REVERTED:
+                // the tuning is MODEL-DEPENDENT and MXFP4's dominant
+                // deployment is MoE. Measured on a quiet box, per-round
+                // paired, sign consistent in every round:
+                //   MXFP6 dense 27B   n3 +1.2%  n6 +1.5%  n8 +0.3%
+                //   MXFP8 dense 27B   n3 +0.9%  n6 +1.4%  n8 +1.3%
+                //   MXFP6 MoE   35B             n6 -4.7%  n8 -10.8%
+                // The MoE arm independently reproduces a3abbe56e2's -14.3%
+                // (different build, different model, same direction), so the
+                // MoE penalty is a property of the dispatch, not of one run.
+                // A dense-only +6% is not worth a likely -5% on the format's
+                // most common deployment, and MoE MXFP4 could not be measured
+                // here (no MoE MXFP4 gguf on the box; the only copy is HF
+                // safetensors). See the card on making nwarps MoE-aware --
+                // that would capture the dense wins for MXFP4/MXFP6/MXFP8 with
+                // no MoE risk, and is the right fix rather than this tradeoff.
                 default:
                     return 1;
             }
