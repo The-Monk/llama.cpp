@@ -592,7 +592,28 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                     case GGML_TYPE_MXFP8: return 6;   // 19.80 -> 20.22 (+2.1%), was the nwarps=1 default
                     case GGML_TYPE_MXFP6: return 6;   // 24.17 -> 24.66 (+2.0%), was the nwarps=1 default
                     case GGML_TYPE_Q3_K:  return 2;   // 31.72 -> 32.23 (+1.6%), was the nwarps=1 default
-                    case GGML_TYPE_Q5_K:  return 3;   // 25.68 -> 26.23 (+2.1%), WAS 8 -- the 1-vs-8 test missed a peak at 3
+                    // Q5_K, Q4_K and Q4_0 were the three types closest to the
+                    // roofline that had never had a 2-D sweep -- Q4_K and Q4_0
+                    // had never had rpb moved at all, and Q5_K only at rpb=2.
+                    // All three prefer nwarps=6, matching the MX family and Q6_K.
+                    case GGML_TYPE_Q5_K:  return 6;   // 25.61 -> 26.75 (+4.5%), WAS 8; nw6 is also the most stable column
+                    case GGML_TYPE_Q4_K:  return 6;   // 28.96 -> 29.76 (+2.8%), WAS 8
+                    // Q4_0 is NOT here on purpose. The grid suggested nw6 by
+                    // +1.6% and a profiled run put it at 95.6% vs 93.8% of
+                    // roofline, but a dedicated 4-round interleaved A/B at r=3
+                    // settles it as a null: nw6 32.18/32.21/32.39/32.48 (mean
+                    // 32.32) against nw8 32.37/32.35/32.24/32.34 (mean 32.33),
+                    // a 0.03% difference with each arm winning two rounds. Q4_0
+                    // keeps nwarps=8 from the whitelist below.
+                    // F8E4M3 sat at the nwarps=1 default only because it had
+                    // never been measured -- its structurally identical twin
+                    // F8E5M2 (same qk, block bytes, qi, vdr) has shipped at 8 all
+                    // along. Confirmed on TWO models before shipping, since the
+                    // first sweep was on a sparse model where F8E4M3 is only the
+                    // dense fallback: pure llama-3.1-8B-F8E4M3 gives 67.81 ->
+                    // 68.59 at nw6/rpb1 (+1.2%), sparse-llama gives 67.16 ->
+                    // 68.38 (+1.8%). Both peak at rpb=1 with nwarps >= 3.
+                    case GGML_TYPE_F8E4M3: return 6;   // 67.81 -> 68.59 (+1.2%)
                     case GGML_TYPE_Q6_K:  return 6;   // 23.68 -> 23.98 (+1.3%), WAS 8 -- likewise
                     // TQ2_0's kernel landed 2026-09-05 and inherited the RDNA4
                     // defaults untouched. Its shipped cell (nw1,rpb2)=43.23 sits
@@ -827,6 +848,13 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             }
             if (!is_moe && type == GGML_TYPE_IQ1_S) {
                 return 4;
+            }
+            // Q5_K is the second type after TQ1_0 to want a single row per block:
+            // at nwarps=6 the rpb column reads 26.75/26.74/26.56/26.34 for
+            // rpb=1/2/3/4. Q4_K keeps rpb=3 (its shipped value, and the grid
+            // optimum) and Q4_0 keeps rpb=2, so neither needs a case here.
+            if (!is_moe && (type == GGML_TYPE_Q5_K || type == GGML_TYPE_F8E4M3)) {
+                return 1;
             }
             if (type == GGML_TYPE_F8E4M3 || type == GGML_TYPE_F8E5M2 || (type == GGML_TYPE_Q2_0 && !q2_0_g64)) {
                 return 3;
