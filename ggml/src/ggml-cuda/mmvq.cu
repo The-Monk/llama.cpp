@@ -594,6 +594,28 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                     case GGML_TYPE_Q3_K:  return 2;   // 31.72 -> 32.23 (+1.6%), was the nwarps=1 default
                     case GGML_TYPE_Q5_K:  return 3;   // 25.68 -> 26.23 (+2.1%), WAS 8 -- the 1-vs-8 test missed a peak at 3
                     case GGML_TYPE_Q6_K:  return 6;   // 23.68 -> 23.98 (+1.3%), WAS 8 -- likewise
+                    // TQ2_0's kernel landed 2026-09-05 and inherited the RDNA4
+                    // defaults untouched. Its shipped cell (nw1,rpb2)=43.23 sits
+                    // in the worst nwarps column; 19 of the 24 grid cells beat
+                    // it. Best (nw6,rpb3)=50.86, +17.6% -- the largest geometry
+                    // win measured in this sweep.
+                    case GGML_TYPE_TQ2_0: return 6;   // 43.23 -> 50.86 (+17.6%)
+                    // IQ1_S is the one IQ type that WANTS more warps, and the
+                    // reason is visible in its register footprint: 40 VGPR = 12
+                    // waves/SIMD of headroom, against IQ3_S at 104 and IQ2_XS at
+                    // 96 (4-5 waves, already saturated -- both peak at nwarps=1
+                    // and lose 17-24% by nwarps=8). Register pressure decides
+                    // whether this lever is available at all.
+                    case GGML_TYPE_IQ1_S: return 6;   // 45.81 -> 51.02 (+11.4%)
+                    // IQ2_XXS's nwarps=3 case no longer earns its keep on this
+                    // tree. Isolated by kernel trace (not model t/s, which blends
+                    // the other tensor types): nw1/rpb2 gives 21.177 ms / 256.1
+                    // GB/s / 40.7% against nw3/rpb2 at 21.882 / 247.9 / 39.4%.
+                    // The +112.8% that motivated it was measured against a
+                    // nwarps=1 baseline of 14.13 t/s that does not reproduce here
+                    // -- nw1 now measures 30.1. Dense returns to 1; MoE keeps 3
+                    // below, since no MoE model was available to re-check.
+                    case GGML_TYPE_IQ2_XXS: return 1;
                     default: break;                   // Q4_0 re-checked: 8 is correct for it (93.8% vs 92.9% at 6)
                 }
             }
@@ -793,8 +815,18 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             // the shipped (1,2) at 31.72. Moving nwarps alone gets +1.6% and rpb
             // alone +0.3%; the pair is +2.3%. Every earlier sweep in this tree was
             // 1-D and so could not see it.
-            if (!is_moe && type == GGML_TYPE_Q3_K) {
+            if (!is_moe && (type == GGML_TYPE_Q3_K || type == GGML_TYPE_TQ2_0)) {
                 return 3;
+            }
+            // TQ1_0 is the one type that wants a single row per block. Its grid
+            // has a lone peak at (nwarps=1, rpb=1) = 39.68 t/s against 35.41 at
+            // the shipped (1,2); every other cell of the 6x4 sits at 27.9-36.8.
+            // nwarps stays at the RDNA4 default of 1 -- raising it costs 10-30%.
+            if (!is_moe && type == GGML_TYPE_TQ1_0) {
+                return 1;
+            }
+            if (!is_moe && type == GGML_TYPE_IQ1_S) {
+                return 4;
             }
             if (type == GGML_TYPE_F8E4M3 || type == GGML_TYPE_F8E5M2 || (type == GGML_TYPE_Q2_0 && !q2_0_g64)) {
                 return 3;
