@@ -513,7 +513,7 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
-static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool q2_0_g64 = false) {
+static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool q2_0_g64 = false, bool is_moe = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
@@ -578,6 +578,25 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         // the original 1-vs-8 test only -- do not assume they follow either
         // IQ2_XXS or IQ3_S until measured.
         if (ncols_dst == 1) {
+            // DENSE decode optima, measured 2026-09-08 on Qwen3.8-27B / gfx1201 /
+            // ROCm 10 with a full 6x4 (nwarps x rows_per_block) grid, one build dir
+            // per arm, interleaved rounds, idle-gated. Best-vs-shipped t/s below.
+            // MoE decode deliberately falls through to the older table: geometry
+            // does not transfer across model class (MXFP4 nwarps=6 is +5.5% dense
+            // and -4.7% MoE), and no MoE model was available to re-sweep.
+            // Note nwarps=4 is a reproducible pothole on RDNA4 (seen on Q3_K,
+            // IQ2_XXS and IQ3_S) and is never selected here.
+            if (!is_moe) {
+                switch (type) {
+                    case GGML_TYPE_MXFP4: return 6;   // 31.56 -> 33.31 (+5.5%), was the nwarps=1 default
+                    case GGML_TYPE_MXFP8: return 6;   // 19.80 -> 20.22 (+2.1%), was the nwarps=1 default
+                    case GGML_TYPE_MXFP6: return 6;   // 24.17 -> 24.66 (+2.0%), was the nwarps=1 default
+                    case GGML_TYPE_Q3_K:  return 2;   // 31.72 -> 32.23 (+1.6%), was the nwarps=1 default
+                    case GGML_TYPE_Q5_K:  return 3;   // 25.68 -> 26.23 (+2.1%), WAS 8 -- the 1-vs-8 test missed a peak at 3
+                    case GGML_TYPE_Q6_K:  return 6;   // 23.68 -> 23.98 (+1.3%), WAS 8 -- likewise
+                    default: break;                   // Q4_0 re-checked: 8 is correct for it (93.8% vs 92.9% at 6)
+                }
+            }
             switch (type) {
                 case GGML_TYPE_Q4_0:
                 case GGML_TYPE_Q4_1:
@@ -745,7 +764,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1, bool q2_0_g64 = false) {
+static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1, bool q2_0_g64 = false, bool is_moe = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
         switch (ncols_dst) {
             case 1:
@@ -770,6 +789,13 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             // A5: the Q2_0 rpb=3 bucket below is a g128 measurement
             // (PORT-MANIFEST.md A5.6); g64 is not yet swept and falls
             // through to the RDNA4 default (2) instead of inheriting it.
+            // Q3_K dense: the grid optimum is (nwarps=2, rpb=3) at 32.46 t/s vs
+            // the shipped (1,2) at 31.72. Moving nwarps alone gets +1.6% and rpb
+            // alone +0.3%; the pair is +2.3%. Every earlier sweep in this tree was
+            // 1-D and so could not see it.
+            if (!is_moe && type == GGML_TYPE_Q3_K) {
+                return 3;
+            }
             if (type == GGML_TYPE_F8E4M3 || type == GGML_TYPE_F8E5M2 || (type == GGML_TYPE_Q2_0 && !q2_0_g64)) {
                 return 3;
             }
@@ -794,8 +820,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool q2_0_g64 = false>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), q2_0_g64)*ggml_cuda_get_physical_warp_size(), 1)
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool q2_0_g64 = false, bool is_moe = false>
+__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), q2_0_g64, is_moe)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -812,8 +838,8 @@ static __global__ void mul_mat_vec_q(
     constexpr int qi  = mmvq_q2_0_qi<type, q2_0_g64>();
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
-    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, q2_0_g64);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps, q2_0_g64);
+    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, q2_0_g64, is_moe);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps, q2_0_g64, is_moe);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = mmvq_q2_0_vec_dot<type, q2_0_g64>();
@@ -1123,19 +1149,19 @@ static __global__ void mul_mat_vec_q_moe(
     }
 }
 
-template<ggml_type type, bool q2_0_g64 = false>
+template<ggml_type type, bool q2_0_g64 = false, bool is_moe = false>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false) {
-    const int nwarps = calc_nwarps(type, ncols_dst, table_id, q2_0_g64);
-    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps, q2_0_g64);
+    const int nwarps = calc_nwarps(type, ncols_dst, table_id, q2_0_g64, is_moe);
+    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps, q2_0_g64, is_moe);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
     return {block_nums, block_dims};
 }
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool q2_0_g64 = false>
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool q2_0_g64 = false, bool is_moe = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1152,7 +1178,7 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst <= 4) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, q2_0_g64>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, q2_0_g64, is_moe>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_dst);
@@ -1163,7 +1189,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, q2_0_g64>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, q2_0_g64, is_moe>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_dst);
@@ -1299,10 +1325,21 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride, (uint32_t) nrows_x,
                     stream);
-            } else {
-                std::pair<dim3, dim3> dims = calc_launch_params<type, q2_0_g64>(c_ncols_dst, nrows_x, nchannels_dst,
+            } else if (has_ids) {
+                // MoE decode (MUL_MAT_ID with one token): keep the pre-2026-09-08
+                // geometry. The dense optima below were measured on dense models
+                // only and are known not to transfer.
+                std::pair<dim3, dim3> dims = calc_launch_params<type, q2_0_g64, true>(c_ncols_dst, nrows_x, nchannels_dst,
                                                                         nsamples_dst, warp_size, table_id);
-                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, q2_0_g64>(
+                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, q2_0_g64, true>(
+                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                    channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                    stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride, (uint32_t) nrows_x,
+                    stream);
+            } else {
+                std::pair<dim3, dim3> dims = calc_launch_params<type, q2_0_g64, false>(c_ncols_dst, nrows_x, nchannels_dst,
+                                                                        nsamples_dst, warp_size, table_id);
+                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, q2_0_g64, false>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride, (uint32_t) nrows_x,
