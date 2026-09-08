@@ -1796,6 +1796,28 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
 }
 
+
+// Apply the per-byte sign mask to a codebook entry.
+//
+// `signs` is 0x00 or 0xFF per byte (from __vcmpne4), so this is a conditional
+// two's-complement negate. The obvious spelling is __vsub4(grid ^ signs,
+// signs), but __vsub4 is __vsubss4 -- a SATURATING byte subtract built on
+// __builtin_elementwise_sub_sat, and the saturation can never fire here:
+// every byte of every IQ codebook is a small positive value, so the negation
+// is always well inside int8 range.
+//
+// (g ^ s) - s per byte equals (g ^ s) + (s & 1) per byte. A carry could only
+// escape a byte if (g ^ s) were 0xFF, which needs a ZERO grid byte. There are
+// none: a byte census of all five affected tables gives 0 zero bytes out of
+// 17,408 -- iq2xxs_grid 0/2048, iq2xs_grid 0/4096, iq2s_grid 0/8192,
+// iq3xxs_grid 0/1024, iq3s_grid 0/2048. Results are bit-identical, which
+// test-backend-ops MUL_MAT (1240 cases) and MUL_MAT_ID both confirm.
+//
+// IF YOU ADD OR REGENERATE AN IQ CODEBOOK, re-run that census first.
+static __device__ __forceinline__ int iq_apply_signs(const int grid, const int signs) {
+    return (grid ^ signs) + (signs & 0x01010101);
+}
+
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2
 #define VDR_IQ2_XXS_Q8_1_MMQ  2
 
@@ -1815,12 +1837,12 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
 
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int grid0 = iq_apply_signs(grid_pos.x, signs0);
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, k0 + 0);
         sumi = ggml_cuda_dp4a(grid0, u0, sumi);
 
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid1 = iq_apply_signs(grid_pos.y, signs1);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
         sumi = ggml_cuda_dp4a(grid1, u1, sumi);
     }
@@ -1852,11 +1874,11 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
         const uint32_t signs = unpack_ksigns(q2[l0/2] >> 9);
 
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int grid_l = iq_apply_signs(grid_pos.x, signs0);
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
 
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid_h = iq_apply_signs(grid_pos.y, signs1);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
         if (l0 < 4) {
@@ -1939,12 +1961,12 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
         const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
 
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int grid_l = iq_apply_signs(grid_pos.x, signs0);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
 
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid_h = iq_apply_signs(grid_pos.y, signs1);
 
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
@@ -1985,8 +2007,8 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
         const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
         const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
 
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid_l = iq_apply_signs(grid_pos.x, signs0);
+        const int grid_h = iq_apply_signs(grid_pos.y, signs1);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
