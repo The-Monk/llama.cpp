@@ -1922,8 +1922,8 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
         const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
         const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
 
-        const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
-        const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
+        const int grid_l = iq_apply_signs(grid_pos[0], signs0);
+        const int grid_h = iq_apply_signs(grid_pos[1], signs1);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
