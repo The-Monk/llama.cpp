@@ -155,8 +155,18 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 // addresses. The risk is the mirror of what killed Q2_0 at vdr=4 -- a per-lane
 // stride-54 gather instead of a contiguous run -- so this is measured, not
 // assumed. Sweep {1,2,4,8}.
+// SHIPPED 2026-09-09: vdr=8, worth +27.1 roofline points.
+// Kernel-time roofline on Ternary-Bonsai-8B-TQ1_0, N=3 interleaved, idle-gated,
+// peak re-measured each round (639.6-639.7 GB/s):
+//     vdr=1  41.7 / 41.5 / 41.1   (5.49-5.57 ms/token, ~265 GB/s)
+//     vdr=8  68.4 / 68.6 / 68.7   (3.33-3.35 ms/token, ~438 GB/s)
+// The arms do not overlap. Full single-run curve: 1=41.7, 2=37.0, 4=42.5, 8=68.3
+// -- only vdr=8 helps, because QI_TQ1_0=8 means vdr=8 is the point where
+// qi/vdr becomes 1 and a lane stops sharing addresses with seven others and owns
+// a whole block.
+// Gates: test-backend-ops MUL_MAT tq1_0 0 FAIL at vdr 2/4/8, MUL_MAT_ID 2/2 OK.
 #ifndef GGML_HIP_TQ1_0_VDR
-#define GGML_HIP_TQ1_0_VDR 1
+#define GGML_HIP_TQ1_0_VDR 8
 #endif
 #define VDR_TQ1_0_Q8_1_MMVQ GGML_HIP_TQ1_0_VDR
 #define VDR_TQ2_0_Q8_1_MMVQ 1 // one 32-element chunk (= one q8_1 block) per vec_dot call
