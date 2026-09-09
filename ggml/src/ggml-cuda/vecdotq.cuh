@@ -506,7 +506,18 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
 
         const int vih = ((vh >> i) << 2) & 0x04040404;
 
-        const int vi = __vsubss4(vil, vih);
+        // vil - vih without the saturating byte subtract. vil is 2 bits per byte
+        // (0..3) and vih is 0 or 4, so the difference is -4..3 and saturation can
+        // never fire. When vih is 4 the result is vil-4, which for vil in 0..3 is
+        // exactly vil | 0xFC -- vil occupies bits 0..1 and 0xFC bits 2..7, so the
+        // OR is exact and no borrow can cross a byte. vih*0x3F maps 0->0 and
+        // 4->0xFC in one multiply, and 0xFC < 0x100 so it cannot carry either.
+        //
+        // Worth it because __vsubss4 is expensive: the HIP shim expands to a
+        // per-byte saturating subtract that gfx1201 has no instruction for.
+        // Measured on the emitted ISA, 8 calls: shim 115 VALU (32 v_sub_nc_u16 +
+        // 28 v_xor_b16 + shifts/masks) against 29 for this form.
+        const int vi = vil | (vih * 0x3F);
 
         sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
     }
