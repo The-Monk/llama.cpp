@@ -704,7 +704,23 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                     if (q2_0_g64) {
                         break;
                     }
-                    return 8;
+#ifdef GGML_HIP_Q2_0_NWARPS
+                    return GGML_HIP_Q2_0_NWARPS;
+#else
+                    // RE-SWEPT 2026-09-09 with the KERNEL-TIME roofline (the old
+                    // value came from a 1-vs-8 t/s comparison, the same error this
+                    // file documents as wrong for IQ2_XXS and Q1_0). Full curve,
+                    // Bonsai-27B-Q2_0, %% of a contemporaneous 639.6 GB/s peak:
+                    //   nwarps  3     4     5     6     7     8(was)
+                    //   %roof   84.6  82.5  85.6  86.2  86.2  83.2
+                    // Non-monotonic, and 8 sat in a local dip. N=3 interleaved,
+                    // idle-gated replication of 6 vs 8 with the peak re-measured
+                    // each round: 85.9/86.2/86.0 against 83.2/82.8/83.3 -- the two
+                    // arms do not overlap. +2.8 points. Gated on test-backend-ops
+                    // MUL_MAT 2/2 OK and MUL_MAT_ID 2/2 OK, which matters because
+                    // nwarps changes the cross-warp reduction tree.
+                    return 6;
+#endif
                 // F8E5M2: nwarps=8 19.87 +/- 0.08 vs nwarps=1 19.63 +/- 0.06
                 // (Qwen3.6-27B, tg128, r=5) = +1.2%. Small but outside noise.
                 case GGML_TYPE_F8E5M2:
