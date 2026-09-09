@@ -628,15 +628,20 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                     // and lose 17-24% by nwarps=8). Register pressure decides
                     // whether this lever is available at all.
                     case GGML_TYPE_IQ1_S: return 6;   // 45.81 -> 51.02 (+11.4%)
-                    // IQ2_XXS's nwarps=3 case no longer earns its keep on this
-                    // tree. Isolated by kernel trace (not model t/s, which blends
-                    // the other tensor types): nw1/rpb2 gives 21.177 ms / 256.1
-                    // GB/s / 40.7% against nw3/rpb2 at 21.882 / 247.9 / 39.4%.
-                    // The +112.8% that motivated it was measured against a
-                    // nwarps=1 baseline of 14.13 t/s that does not reproduce here
-                    // -- nw1 now measures 30.1. Dense returns to 1; MoE keeps 3
-                    // below, since no MoE model was available to re-check.
-                    case GGML_TYPE_IQ2_XXS: return 1;
+                    // IQ2_XXS and IQ2_XS both want nwarps=3 -- but only since the
+                    // sign-mask rewrite. This case was REMOVED earlier in the same
+                    // session because on the pre-rewrite kernel nw1 measured better
+                    // (21.177 ms / 40.7% against nw3 at 21.882 / 39.4%). Cutting
+                    // ~40% of the VALU work moved the optimum back:
+                    //          nw1    nw2    nw3    nw4    nw6    nw8
+                    //  IQ2_XXS 43.09  43.73  44.80  41.67  43.86  39.97
+                    //  IQ2_XS  40.66  42.28  43.09  39.74  41.58  38.06
+                    // +4.0% and +6.1% over nw1, both rounds. A launch-geometry
+                    // optimum is a property of the KERNEL, not of the type, so it
+                    // has to be re-swept whenever the kernel body changes.
+                    case GGML_TYPE_IQ2_XXS:
+                    case GGML_TYPE_IQ2_XS:
+                        return 3;
                     default: break;                   // Q4_0 re-checked: 8 is correct for it (93.8% vs 92.9% at 6)
                 }
             }
