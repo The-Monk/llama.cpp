@@ -642,6 +642,14 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                     case GGML_TYPE_IQ2_XXS:
                     case GGML_TYPE_IQ2_XS:
                         return 3;
+                    // IQ3_S moved the same way and further, to 6. Its in-tree
+                    // note said "every nwarps tested regresses, worst at 4" --
+                    // true of the kernel that was measured, false of this one:
+                    //   nw1    nw2    nw3    nw4    nw6    nw8
+                    //   33.98  35.02  35.48  34.47  35.86  34.45
+                    // +5.7% over nwarps=1, both rounds.
+                    case GGML_TYPE_IQ3_S:
+                        return 6;
                     default: break;                   // Q4_0 re-checked: 8 is correct for it (93.8% vs 92.9% at 6)
                 }
             }
