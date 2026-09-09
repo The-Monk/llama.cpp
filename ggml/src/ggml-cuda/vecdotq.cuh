@@ -94,6 +94,13 @@ static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4, con
 #endif
 }
 
+// The sign byte itself, before the 0x01010101 broadcast that the __vcmpne4 form
+// needs. iq_signs_from_nibble places bits into bytes on its own.
+static __device__ __forceinline__ uint32_t unpack_ksigns_raw(const uint8_t v) {
+    const uint32_t p = __popc(v) & 1;
+    return v ^ p << 7;
+}
+
 static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     // v is a 7 bit int, with the 8th sign being encodable as popcnt
     // with xor we can "correct" the bit instead of having to mask
@@ -1808,6 +1815,28 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 }
 
 
+
+// Per-byte sign mask from 4 packed sign bits, without __vcmpne4.
+//
+// (nib * 0x00204081) & 0x01010101 places bit j of the nibble at byte j: the
+// constant has bits at {0,7,14,21}, so bit j lands at j, j+7, j+14 and j+21,
+// and only j+7j == 8j survives the mask. A 4-bit input is required -- with a
+// wider one the copies overlap at bit 7 and the carry corrupts byte 1, which
+// is the same constraint Q1_0 documents for the identical constant.
+//
+// The 0x01 result is exactly the +1 of the conditional two's-complement negate,
+// so it is returned alongside the widened 0xFF mask rather than recomputed.
+// Measured over 8 applications on gfx1201: 185 VALU for the __vcmpne4 form
+// against 45 for this one.
+struct iq_signs { int m; int mask; };
+static __device__ __forceinline__ iq_signs iq_signs_from_nibble(const unsigned nib) {
+    const int m = (int)(((nib & 0x0F) * 0x00204081u) & 0x01010101u);
+    return { m, m * 0xFF };
+}
+static __device__ __forceinline__ int iq_apply_signs_m(const int grid, const iq_signs s) {
+    return (grid ^ s.mask) + s.m;
+}
+
 // Apply the per-byte sign mask to a codebook entry.
 //
 // `signs` is 0x00 or 0xFF per byte (from __vcmpne4), so this is a conditional
@@ -1845,15 +1874,15 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
         const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[k0/2]];
-        const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+        const uint32_t sb = unpack_ksigns_raw(aux32 >> (7 * k0 / 2));
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid0 = iq_apply_signs(grid_pos.x, signs0);
+        const iq_signs s0 = iq_signs_from_nibble(sb);
+        const int grid0 = iq_apply_signs_m(grid_pos.x, s0);
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, k0 + 0);
         sumi = ggml_cuda_dp4a(grid0, u0, sumi);
 
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid1 = iq_apply_signs(grid_pos.y, signs1);
+        const iq_signs s1 = iq_signs_from_nibble(sb >> 4);
+        const int grid1 = iq_apply_signs_m(grid_pos.y, s1);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
         sumi = ggml_cuda_dp4a(grid1, u1, sumi);
     }
@@ -1882,14 +1911,14 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const uint2 grid_pos = ((const uint2*)iq2xs_grid)[q2[l0/2] & 0x1FF];
-        const uint32_t signs = unpack_ksigns(q2[l0/2] >> 9);
+        const uint32_t sb = unpack_ksigns_raw(q2[l0/2] >> 9);
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = iq_apply_signs(grid_pos.x, signs0);
+        const iq_signs s0 = iq_signs_from_nibble(sb);
+        const int grid_l = iq_apply_signs_m(grid_pos.x, s0);
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
 
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = iq_apply_signs(grid_pos.y, signs1);
+        const iq_signs s1 = iq_signs_from_nibble(sb >> 4);
+        const int grid_h = iq_apply_signs_m(grid_pos.y, s1);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
         if (l0 < 4) {
@@ -1930,11 +1959,11 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int * grid_pos = (const int *)(iq2s_grid + (qs[l0/2] | ((qh << (8-l0)) & 0x300)));
 
-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+        const iq_signs s0 = iq_signs_from_nibble(signs_packed_8[l0/2]);
+        const iq_signs s1 = iq_signs_from_nibble(signs_packed_8[l0/2] >> 4);
 
-        const int grid_l = iq_apply_signs(grid_pos[0], signs0);
-        const int grid_h = iq_apply_signs(grid_pos[1], signs1);
+        const int grid_l = iq_apply_signs_m(grid_pos[0], s0);
+        const int grid_h = iq_apply_signs_m(grid_pos[1], s1);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
@@ -1969,15 +1998,15 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
-        const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
+        const uint32_t sb = unpack_ksigns_raw(aux32 >> (7*l0/2));
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = iq_apply_signs(grid_pos.x, signs0);
+        const iq_signs s0 = iq_signs_from_nibble(sb);
+        const int grid_l = iq_apply_signs_m(grid_pos.x, s0);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
 
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = iq_apply_signs(grid_pos.y, signs1);
+        const iq_signs s1 = iq_signs_from_nibble(sb >> 4);
+        const int grid_h = iq_apply_signs_m(grid_pos.y, s1);
 
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
@@ -2015,11 +2044,11 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
             iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
             iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
 
-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+        const iq_signs s0 = iq_signs_from_nibble(signs_packed_8[l0/2]);
+        const iq_signs s1 = iq_signs_from_nibble(signs_packed_8[l0/2] >> 4);
 
-        const int grid_l = iq_apply_signs(grid_pos.x, signs0);
-        const int grid_h = iq_apply_signs(grid_pos.y, signs1);
+        const int grid_l = iq_apply_signs_m(grid_pos.x, s0);
+        const int grid_h = iq_apply_signs_m(grid_pos.y, s1);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
