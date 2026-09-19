@@ -11,10 +11,27 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <unordered_map>
 
 struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
+
+// Maps a folded model weight to the activation-side transform applied
+// immediately before the matmul: optional sign flip, then the normalized
+// blockwise Hadamard rotation. Ported from PrismML-Eng/llama.cpp (prism.hadamard),
+// which is the only implementation of the Bonsai 2 activation transform.
+struct llama_hadamard_transform {
+    ggml_tensor * rot;
+    ggml_tensor * signs; // nullptr for identity sign mode
+    // when perm_rep > 1 the activation arrives with its feature axis in tiled
+    // head order [hd, nk, rep] and must be permuted to the grouped order
+    // [hd, rep, nk] the fold was computed in, before signs and rotation
+    int64_t perm_hd  = 0;
+    int64_t perm_nk  = 0;
+    int64_t perm_rep = 0;
+};
+using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_hadamard_transform>;
 
 struct llama_cparams;
 struct llama_layer;
@@ -780,6 +797,8 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+    const llama_hadamard_rotations * hadamard_rotations = nullptr;
+    const llama_hadamard_rotations * hadamard_inverses  = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -997,6 +1016,12 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_hadamard_rotations * hadamard_rotations = nullptr;
+    const llama_hadamard_rotations * hadamard_inverses  = nullptr;
+
+    // Transforms shared by folded weights on the same activation. Key is (input, rotation);
+    // both must match. Valid for one graph build only.
+    mutable std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hadamard_memo;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

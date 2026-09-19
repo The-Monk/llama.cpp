@@ -1,6 +1,9 @@
 #include "common.cuh"
 #include "fwht.cuh"
 
+#include <climits>
+#include <cstdlib>
+
 template <int N>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
 __global__ void fwht_cuda(const float * src, float * dst, const int64_t n_rows, const float scale) {
@@ -82,6 +85,16 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
 
     const float scale = 1 / sqrtf(n);
 
+    // A/B escape hatch: GGML_CUDA_FWHT_MAX_N caps the accepted transform width, so the
+    // dense NxN f16 GEMM fallback can be measured against this kernel without a rebuild.
+    static const int fwht_max_n = []() {
+        const char * e = getenv("GGML_CUDA_FWHT_MAX_N");
+        return e ? atoi(e) : INT_MAX;
+    }();
+    if (n > fwht_max_n) {
+        return false;
+    }
+
     switch (n) {
         case 64:
             ggml_cuda_kernel_launch(fwht_cuda<64>, launch_params, src_d, dst_d, rows, scale);
@@ -94,6 +107,16 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
             return true;
         case 512:
             ggml_cuda_kernel_launch(fwht_cuda<512>, launch_params, src_d, dst_d, rows, scale);
+            return true;
+        // N=1024/2048 keep the register path: el_w = N/warp_size is 32/64 floats per
+        // thread, still inside the 96-VGPR occupancy knee measured on gfx1201. Without
+        // these the whole transform falls back to a dense NxN f16 GEMM -- which is what
+        // block_size=1024 models (Ternary-Bonsai-2-27B) hit: 54.7 -> 33.9 t/s.
+        case 1024:
+            ggml_cuda_kernel_launch(fwht_cuda<1024>, launch_params, src_d, dst_d, rows, scale);
+            return true;
+        case 2048:
+            ggml_cuda_kernel_launch(fwht_cuda<2048>, launch_params, src_d, dst_d, rows, scale);
             return true;
         default:
             return false;
