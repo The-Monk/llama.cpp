@@ -5100,8 +5100,17 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     // and x16 (the true average per-expert width at pp512) is the WORST of the
     // four, below the 128 default. Keyed on ids_dst so dense MUL_MAT is untouched
     // (Q2_K in particular wants 128 -- see TAG_Q2_K_DM_HALF).
-    const int mmq_x_max_eff = (args.ids_dst != nullptr && amd_wmma_available(cc) && mmq_x_max > 64)
+    int mmq_x_max_eff = (args.ids_dst != nullptr && amd_wmma_available(cc) && mmq_x_max > 64)
         ? 64 : mmq_x_max;
+
+    // [TAG_MMQ_SCALE_HOIST] The hoisted Q1_0/Q2_0 kernel keeps C[ntx] + A[ntx][4]
+    // live and spills 39 VGPRs at mmq_x=128 (default kernel: 240 VGPRs, 0 spills),
+    // which cancels the epilogue saving there. Forced-mmq_x sweep (Bonsai-27B,
+    // pp512, hoist ON, 2 rounds): Q2_0 64 1303.8 | 80 1294.3 | 96 1324.6 |
+    // 112 1355.8 | 128 1240.1 vs OFF auto(128) 1259.5; Q1_0 112 1372.6 vs OFF 1268.3.
+    if (args.scale_hoist) {
+        mmq_x_max_eff = std::min(mmq_x_max_eff, 112);
+    }
 
     // [TAG_MMQ_SPILL_TABLE] The loop below used to filter on shared memory ALONE,
     // so it happily selected tiles that spill registers. Every entry in
