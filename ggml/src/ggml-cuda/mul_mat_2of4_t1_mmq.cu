@@ -296,7 +296,7 @@ bool ggml_cuda_op_mul_mat_2of4_t1_mmq(ggml_backend_cuda_context & ctx, const ggm
 
     cudaStream_t stream = ctx.stream();
 
-    // [TAG_2OF4_T1_SCALE_HOIST] GGML_HIP_2OF4_T1_SCALE_HOIST=1 (default OFF):
+    // [TAG_2OF4_T1_SCALE_HOIST] on by default, GGML_HIP_2OF4_T1_SCALE_HOIST=0 opts out:
     // 128-value activation scales + one rescale per chunk. Not bit-exact
     // (activation granularity per32 -> per128), PPL-gated. The scale buffer
     // is call-local and quantizer and kernel read the same flag below.
@@ -304,7 +304,7 @@ bool ggml_cuda_op_mul_mat_2of4_t1_mmq(ggml_backend_cuda_context & ctx, const ggm
 #ifndef GGML_CUDA_NO_2OF4_T1_SCALE_HOIST
     static const bool hoist = [] {
         const char * e = getenv("GGML_HIP_2OF4_T1_SCALE_HOIST");
-        return e != nullptr && strcmp(e, "0") != 0;
+        return e == nullptr || strcmp(e, "0") != 0;
     }();
 #else
     constexpr bool hoist = false;
