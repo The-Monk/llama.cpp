@@ -10780,6 +10780,11 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int64_t K = ggml_get_op_params_i32(dst, 0);
     GGML_ASSERT(K >= 1);
+    // This CPU path implements neither fused rung (op params 1 = fused_ba, 2 = l2norm_qk). With
+    // GGML_GDN_FUSED_BA / GGML_GDN_FUSED_L2NORM set and a GDN layer placed on CPU, it used to skip the
+    // activation / L2 norm silently. Abort instead of computing wrong output.
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 1) == 0 && "GDN fused beta/alpha is not implemented on CPU");
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 2) == 0 && "GDN fused L2 norm is not implemented on CPU");
     // per-seq stride in floats (seq s starts at state + s * seq_stride)
     const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
 
