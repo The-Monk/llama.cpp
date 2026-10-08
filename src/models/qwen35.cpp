@@ -5,6 +5,8 @@
 
 // GGML_GDN_STATE_INPLACE promoted to default-on (T360, 2026-10-07): unset = on, "0" = off. Exact on R9700
 // Bonsai-27B (greedy text and top-5 logprobs identical to the gather/write-back graph), Q1_0 +4.0%, Q2_0 +3.5%.
+// GGML_GDN_CONV_INPLACE default-on (T368, 2026-10-08), same convention: exact (12/12 logprob-identical, decode KL =
+// control), Q1_0 +5.0%, Q2_0 +4.2% tg128 (144 fewer dependent launches/token).
 // GGML_GDN_FUSED_BA and GGML_GDN_FUSED_L2NORM stay opt-in: both change numerics (decode KL ~4e-4, T361).
 static bool gdn_rung_default_on(const char * name) {
     const char * e = getenv(name);
@@ -430,15 +432,14 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
-    // EXPERIMENT (env-gated GGML_GDN_CONV_INPLACE=1, default off, card T368): single-token decode reads the
+    // EXPERIMENT (GGML_GDN_CONV_INPLACE, default-on: unset = on, "0" = off; card T368): single-token decode reads the
     // conv state straight from its cache row and updates it in place (vLLM causal_conv1d_update pattern) in
     // ONE kernel, replacing build_rs's get_rows gather + concat + ssm_conv/silu + the write-back cpy (3
     // dependent launches per GDN layer removed). Same arithmetic as the ssm_conv path. Gated exactly like
     // gdn_state_inplace below (same direct-view validity argument and the same cold-start rule: a pending
     // zero-clear, rs_z >= 0, falls back to build_rs), plus n_seq_tokens == 1 since the op is single-token.
-    const char * conv_inplace_env = getenv("GGML_GDN_CONV_INPLACE");
     const bool gdn_conv_inplace =
-        conv_inplace_env != nullptr && strcmp(conv_inplace_env, "0") != 0 &&
+        gdn_rung_default_on("GGML_GDN_CONV_INPLACE") &&
         n_seq_tokens == 1 &&
         cparams.n_rs_seq == 0 &&
         n_seqs == 1 &&
