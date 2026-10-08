@@ -20,6 +20,12 @@ static __device__ __forceinline__ int32_t pack4_t1(const uint8_t * p) {
 // int8 code array [M][K] plus a flat float scale array [M][K/32] instead of
 // an AoS block, so the GEMM kernel's LDS staging can copy plain aligned
 // 16-byte vectors.
+// [TAG_2OF4_T1_SCALE_HOIST] HOIST128: one scale per 128 values (= one
+// block_2of4_t1 chunk). A warp's 32 lanes are 4 consecutive 32-groups, i.e.
+// one aligned 128-value chunk (16 groups/block, K % 128 == 0), so the amax
+// reduction just spans the warp; the per-32 scale array is still written,
+// with the same d in all 4 slots, so the layout is unchanged.
+template <bool HOIST128>
 static __global__ void k_quantize_act_q8_t1(
         const float * __restrict__ x, int8_t * __restrict__ yq, float * __restrict__ yd,
         const int64_t n_groups_k, const int64_t row_stride_floats) {
@@ -37,7 +43,7 @@ static __global__ void k_quantize_act_q8_t1(
 
     float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
 #pragma unroll
-    for (int offset = 4; offset > 0; offset >>= 1) {
+    for (int offset = HOIST128 ? 16 : 4; offset > 0; offset >>= 1) {
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, offset, WARP_SIZE));
     }
 
@@ -55,7 +61,7 @@ static __global__ void k_quantize_act_q8_t1(
     *(char4 *) (yq + m * (n_groups_k * 32) + elem0) = q;
 }
 
-template <int BM, int BN, int NWARPS, bool need_check>
+template <int BM, int BN, int NWARPS, bool need_check, bool HOIST128>
 __launch_bounds__(NWARPS * 32, 1)
 static __global__ void k_mul_mat_2of4_t1_mmq(
         const char * __restrict__ vweight, const int8_t * __restrict__ actq,
@@ -203,6 +209,11 @@ static __global__ void k_mul_mat_2of4_t1_mmq(
             for (int l = 0; l < 8; ++l) {
                 dw_l[l] = sh_dw[ni * 16 + out_row_base + l];
             }
+            // [TAG_2OF4_T1_SCALE_HOIST] With 128-value activation scales both
+            // scales are constant over the chunk, so the int32 SWMMAC result is
+            // carried across the 4 windows (passed back as C) and rescaled
+            // once per chunk instead of once per window. |raw| <= 128*127.
+            v8i_t1 craw = {0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
             for (int w = 0; w < 4; ++w) {
                 // This lane's 16 idx bits = its k-half's 2 meta bytes,
@@ -211,13 +222,24 @@ static __global__ void k_mul_mat_2of4_t1_mmq(
                 const v2i_t1 a_arg = *(const v2i_t1 *) &sh_wcode[w_row][4 * w + 2 * k_half];
                 const v4i_t1 b_arg = *(const v4i_t1 *) &sh_actq[a_col][8 * w + 4 * k_half];
 
-                const v8i_t1 c0  = {0, 0, 0, 0, 0, 0, 0, 0};
-                const v8i_t1 raw = __builtin_amdgcn_swmmac_i32_16x16x32_iu8_w32(true, a_arg, true, b_arg, c0, idxv, false);
+                if constexpr (HOIST128) {
+                    craw = __builtin_amdgcn_swmmac_i32_16x16x32_iu8_w32(true, a_arg, true, b_arg, craw, idxv, false);
+                } else {
+                    const v8i_t1 c0  = {0, 0, 0, 0, 0, 0, 0, 0};
+                    const v8i_t1 raw = __builtin_amdgcn_swmmac_i32_16x16x32_iu8_w32(true, a_arg, true, b_arg, c0, idxv, false);
 
-                const float da = sh_da[a_col][w];
+                    const float da = sh_da[a_col][w];
+#pragma unroll
+                    for (int l = 0; l < 8; ++l) {
+                        acc[s][l] += (float) raw[l] * (dw_l[l] * da);
+                    }
+                }
+            }
+            if constexpr (HOIST128) {
+                const float da = sh_da[a_col][0]; // == sh_da[a_col][1..3]
 #pragma unroll
                 for (int l = 0; l < 8; ++l) {
-                    acc[s][l] += (float) raw[l] * (dw_l[l] * da);
+                    acc[s][l] += (float) craw[l] * (dw_l[l] * da);
                 }
             }
         }
@@ -274,14 +296,33 @@ bool ggml_cuda_op_mul_mat_2of4_t1_mmq(ggml_backend_cuda_context & ctx, const ggm
 
     cudaStream_t stream = ctx.stream();
 
+    // [TAG_2OF4_T1_SCALE_HOIST] GGML_HIP_2OF4_T1_SCALE_HOIST=1 (default OFF):
+    // 128-value activation scales + one rescale per chunk. Not bit-exact
+    // (activation granularity per32 -> per128), PPL-gated. The scale buffer
+    // is call-local and quantizer and kernel read the same flag below.
+    // Compile out with -DGGML_CUDA_NO_2OF4_T1_SCALE_HOIST.
+#ifndef GGML_CUDA_NO_2OF4_T1_SCALE_HOIST
+    static const bool hoist = [] {
+        const char * e = getenv("GGML_HIP_2OF4_T1_SCALE_HOIST");
+        return e != nullptr && strcmp(e, "0") != 0;
+    }();
+#else
+    constexpr bool hoist = false;
+#endif // GGML_CUDA_NO_2OF4_T1_SCALE_HOIST
+
     ggml_cuda_pool_alloc<int8_t> act_q(ctx.pool(), (size_t) (M * K));
     ggml_cuda_pool_alloc<float>  act_d(ctx.pool(), (size_t) (M * n_groups_k));
     {
         const int64_t row_stride_floats = src1->nb[1] / (int64_t) sizeof(float);
         const dim3 grid((n_groups_k + 15) / 16, M, 1);
         const dim3 block(128, 1, 1);
-        k_quantize_act_q8_t1<<<grid, block, 0, stream>>>(
-                (const float *) src1->data, act_q.get(), act_d.get(), n_groups_k, row_stride_floats);
+        if (hoist) {
+            k_quantize_act_q8_t1<true><<<grid, block, 0, stream>>>(
+                    (const float *) src1->data, act_q.get(), act_d.get(), n_groups_k, row_stride_floats);
+        } else {
+            k_quantize_act_q8_t1<false><<<grid, block, 0, stream>>>(
+                    (const float *) src1->data, act_q.get(), act_d.get(), n_groups_k, row_stride_floats);
+        }
     }
 
     const int64_t nb01 = src0->nb[1];
@@ -289,17 +330,26 @@ bool ggml_cuda_op_mul_mat_2of4_t1_mmq(ggml_backend_cuda_context & ctx, const ggm
     const char * d_w = (const char *) src0->data;
     float * d_dst = (float *) dst->data;
 
-#define LAUNCH_T1_MMQ(BM_, BN_, NWARPS_)                                                              \
+#define LAUNCH_T1_MMQ_H(BM_, BN_, NWARPS_, H_)                                                        \
     do {                                                                                              \
         const dim3 grid_((N + (BN_) - 1) / (BN_), (M + (BM_) - 1) / (BM_), 1);                        \
         const dim3 block_(32, (NWARPS_), 1);                                                          \
         const bool need_check = (M % (BM_) != 0) || (N % (BN_) != 0);                                 \
         if (need_check) {                                                                             \
-            k_mul_mat_2of4_t1_mmq<BM_, BN_, NWARPS_, true><<<grid_, block_, 0, stream>>>(             \
+            k_mul_mat_2of4_t1_mmq<BM_, BN_, NWARPS_, true, H_><<<grid_, block_, 0, stream>>>(         \
                     d_w, act_q.get(), act_d.get(), d_dst, M, N, nb01, n_blocks_k, dst_row_stride_floats); \
         } else {                                                                                      \
-            k_mul_mat_2of4_t1_mmq<BM_, BN_, NWARPS_, false><<<grid_, block_, 0, stream>>>(            \
+            k_mul_mat_2of4_t1_mmq<BM_, BN_, NWARPS_, false, H_><<<grid_, block_, 0, stream>>>(        \
                     d_w, act_q.get(), act_d.get(), d_dst, M, N, nb01, n_blocks_k, dst_row_stride_floats); \
+        }                                                                                             \
+    } while (0)
+
+#define LAUNCH_T1_MMQ(BM_, BN_, NWARPS_)                                                              \
+    do {                                                                                              \
+        if (hoist) {                                                                                  \
+            LAUNCH_T1_MMQ_H(BM_, BN_, NWARPS_, true);                                                 \
+        } else {                                                                                      \
+            LAUNCH_T1_MMQ_H(BM_, BN_, NWARPS_, false);                                                \
         }                                                                                             \
     } while (0)
 
@@ -321,6 +371,7 @@ bool ggml_cuda_op_mul_mat_2of4_t1_mmq(ggml_backend_cuda_context & ctx, const ggm
         LAUNCH_T1_MMQ(128, 128, 8);
     }
 #undef LAUNCH_T1_MMQ
+#undef LAUNCH_T1_MMQ_H
 
     return true;
 }
