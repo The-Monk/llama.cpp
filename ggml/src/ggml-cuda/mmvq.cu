@@ -719,6 +719,11 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_Q6_K:
                 case GGML_TYPE_IQ4_NL:
                 case GGML_TYPE_IQ4_XS:
+                    // These types stay at 8. The Q2_0 nwarps 8 -> 6 retune
+                    // (68cfeb7dda, from e3a4863661) edited the shared return of
+                    // this bucket, which silently moved every type above to 6
+                    // as well; on tb8-Q5_K that read -2.9% tg128 (enki jobs 73, 79).
+                    return 8;
                 // Q2_0 was in this list on roc8/roc9 and was dropped by the
                 // roc10 mmvq slim-to-upstream. Re-measured on gfx1201
                 // (Bonsai-27B Q2_0, tg128, r=5): nwarps=8 52.28 +/- 0.32 vs
