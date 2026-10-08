@@ -77,6 +77,20 @@ static bool ggml_cuda_q2_field_act_enabled() {
 #endif
 }
 
+// T362 GGML_Q1_FIELD_ACT=1 (default OFF): the same for Q1_0 MUL_MAT decode
+// (quantize_row_q8_1_q1_field_cuda + vec_dot_q1_0_q8_1_field).
+static bool ggml_cuda_q1_field_act_enabled() {
+#if GGML_CUDA_FIELD_ACT
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_Q1_FIELD_ACT");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
 static bool ggml_cuda_dedup_mmvq_quant_batch_enabled() {
     static const bool enabled = getenv("GGML_HIP_DEDUP_MMVQ_QUANT_BATCH") != nullptr;
     return enabled;
@@ -189,7 +203,11 @@ static constexpr __host__ __device__ int mmvq_q2_0_qi() {
 }
 template <ggml_type type, bool q2_0_g64, bool field_act = false>
 static constexpr __device__ vec_dot_q_cuda_t mmvq_q2_0_vec_dot() {
-    static_assert(!field_act || (type == GGML_TYPE_Q2_0 && !q2_0_g64), "T362 field_act: Q2_0 g128 only");
+    static_assert(!field_act || (type == GGML_TYPE_Q2_0 && !q2_0_g64) || type == GGML_TYPE_Q1_0,
+                  "T362 field_act: Q2_0 g128 and Q1_0 only");
+    if constexpr (type == GGML_TYPE_Q1_0 && field_act) {
+        return vec_dot_q1_0_q8_1_field;
+    }
     if constexpr (type == GGML_TYPE_Q2_0) {
         if constexpr (field_act) {
             return vec_dot_q2_0_q8_1_field;
@@ -1410,11 +1428,21 @@ static void mul_mat_vec_q_switch_type(
         // needs one, and this whole call chain below is tensor-less). Ignored
         // for every type other than GGML_TYPE_Q2_0.
         const bool q2_0_is_g64 = false,
-        // T362: vy was written by quantize_row_q8_1_q2_field_cuda (Q2_0 g128 only).
-        const bool q2_field_act = false) {
-    GGML_ASSERT(!q2_field_act || (type_x == GGML_TYPE_Q2_0 && !q2_0_is_g64));
+        // T362: vy was written by the field-order quantizer matching type_x
+        // (quantize_row_q8_1_q2_field_cuda for Q2_0 g128, _q1_ for Q1_0).
+        const bool field_act = false) {
+    GGML_ASSERT(!field_act || (type_x == GGML_TYPE_Q2_0 && !q2_0_is_g64) || type_x == GGML_TYPE_Q1_0);
     switch (type_x) {
         case GGML_TYPE_Q1_0:
+#if GGML_CUDA_FIELD_ACT
+            if (field_act) {
+                mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q1_0, false, true>
+                    (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                     nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                     nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                break;
+            }
+#endif // GGML_CUDA_FIELD_ACT
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q1_0>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -1427,7 +1455,7 @@ static void mul_mat_vec_q_switch_type(
                      nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                      nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
 #if GGML_CUDA_FIELD_ACT
-            } else if (q2_field_act) {
+            } else if (field_act) {
                 mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_0, false, true>
                     (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                      nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -1725,9 +1753,15 @@ void ggml_cuda_mul_mat_vec_q(
     // expecting the natural layout (or vice versa) can never hit this entry.
     const bool q2_field_act = !ids && src0->type == GGML_TYPE_Q2_0 && !ggml_cuda_q2_0_is_g64(src0) &&
                               ggml_cuda_q2_field_act_enabled();
-    const quantize_cuda_t quantize_src1 = q2_field_act ? quantize_row_q8_1_q2_field_cuda : quantize_row_q8_1_cuda;
+    const bool q1_field_act = !ids && src0->type == GGML_TYPE_Q1_0 && ggml_cuda_q1_field_act_enabled();
+    const quantize_cuda_t quantize_src1 = q2_field_act ? quantize_row_q8_1_q2_field_cuda :
+                                          q1_field_act ? quantize_row_q8_1_q1_field_cuda : quantize_row_q8_1_cuda;
     if (q2_field_act) {
         static const bool logged = (GGML_LOG_INFO("%s: T362 field-ordered Q2_0 activations active (GGML_Q2_FIELD_ACT)\n", __func__), true);
+        GGML_UNUSED(logged);
+    }
+    if (q1_field_act) {
+        static const bool logged = (GGML_LOG_INFO("%s: T362 field-ordered Q1_0 activations active (GGML_Q1_FIELD_ACT)\n", __func__), true);
         GGML_UNUSED(logged);
     }
     const size_t dedup_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
@@ -1792,7 +1826,7 @@ void ggml_cuda_mul_mat_vec_q(
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream,
-        ggml_cuda_q2_0_is_g64(src0), q2_field_act);
+        ggml_cuda_q2_0_is_g64(src0), q2_field_act || q1_field_act);
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

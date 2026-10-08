@@ -29,6 +29,12 @@ void quantize_row_q8_1_q2_field_cuda(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
+// T362: Q1_0 field order (see quantize.cu); consumed only by vec_dot_q1_0_q8_1_field.
+void quantize_row_q8_1_q1_field_cuda(
+        const float * x, const int32_t * ids, void * vy,
+        ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
 // T79: decode (mmvq) activation quantization to signed e4m3, written into a
 // block_q8_1-shaped buffer (see quantize.cu for the full rationale). Used
 // only for GGML_TYPE_F8E4M3 src0 on RDNA4, as a drop-in swap for

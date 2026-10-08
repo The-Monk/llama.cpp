@@ -773,6 +773,34 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     return d1 * (2.0f * d8 * (float) sumi - s8);
 }
 
+// T362 (R4a) for Q1_0: bq8_1 written by quantize_row_q8_1_q1_field_cuda, so
+// int f of qs = u[f], u[8+f], u[16+f], u[24+f] and each dp4a operand is one
+// (W >> f) & 0x01010101 of the natural weight dword. Same integer sumi as
+// vec_dot_q1_0_q8_1 (twin h_twin.py T362). Wrong on natural-order input.
+static __device__ __forceinline__ float vec_dot_q1_0_q8_1_field(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q1_0 * bq1_0 = (const block_q1_0 *) vbq + kbx;
+    const float d1 = bq1_0->d;
+    const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
+
+    const int offset = iqs * 4;
+    const int w = bq1_0->qs[offset + 0] | (bq1_0->qs[offset + 1] << 8) |
+                  (bq1_0->qs[offset + 2] << 16) | (bq1_0->qs[offset + 3] << 24);
+
+    int sumi_a = 0, sumi_b = 0;   // = dot(c, u), c in {0,1}
+#pragma unroll
+    for (int f = 0; f < 8; f += 2) {
+        sumi_a = ggml_cuda_dp4a((w >> f)       & 0x01010101, get_int_b4(bq8_1_chunk->qs, f),     sumi_a);
+        sumi_b = ggml_cuda_dp4a((w >> (f + 1)) & 0x01010101, get_int_b4(bq8_1_chunk->qs, f + 1), sumi_b);
+    }
+    const int sumi = sumi_a + sumi_b;
+
+    const float d8 = __low2float(bq8_1_chunk->ds);
+    const float s8 = __high2float(bq8_1_chunk->ds); // = d8 * sum(u), permutation-invariant
+    return d1 * (2.0f * d8 * (float) sumi - s8);
+}
+
 // A5 (PORT-MANIFEST.md section A5.5): the 2c-1 decode algorithm below is
 // QK2_0-agnostic -- proven on branch q2_0-g64-experiment (commit
 // 340afd96cd) by flipping QK2_0 128->64 globally and observing this
