@@ -25,6 +25,18 @@ static __device__ __forceinline__ float gdn_dpp_add(float x) {
 }
 #endif // GDN_DPP_REDUCE
 
+// FusedBA exactness (T361): ggml-hip builds with -funsafe-math-optimizations, so
+// without a barrier the compiler evaluates the uniform sigmoid/softplus glue on
+// the SALU, reassociates (t*beta)*k into (t*k)*beta and folds the rounding of
+// softplus*ssm_a into an fma. The empty asm makes each value opaque, as in the
+// unfused path where it arrives from memory: same pipe, same rounding points.
+static __device__ __forceinline__ float gdn_opaque(float x) {
+#if defined(GGML_USE_HIP)
+    asm volatile("" : "+v"(x));
+#endif
+    return x;
+}
+
 template <int width>
 static __device__ __forceinline__ float gdn_reduce_sum(float x) {
 #ifdef GDN_DPP_REDUCE
@@ -118,7 +130,7 @@ gated_delta_net_cuda(const float * q,
         // beta/alpha in this mode (see ggml_gated_delta_net doc comment).
         // Fold sigmoid(beta) and softplus(alpha+ssm_dt)*ssm_a in-kernel instead
         // of 4 separate upstream elementwise dispatches/layer.
-        const float beta_val = FusedBA ? (1.0f / (1.0f + expf(-(*beta_t)))) : *beta_t;
+        const float beta_val = FusedBA ? gdn_opaque(1.0f / (1.0f + expf(-gdn_opaque(*beta_t)))) : *beta_t;
 
         // Cache k and q in registers
         float k_reg[rows_per_lane];
@@ -171,11 +183,11 @@ gated_delta_net_cuda(const float * q,
         if constexpr (!KDA) {
             float g_val;
             if constexpr (FusedBA) {
-                const float alpha_biased = *g_t + ssm_dt[h_idx];
+                const float alpha_biased = gdn_opaque(*g_t + ssm_dt[h_idx]);
                 // matches ggml-cuda/unary.cu op_softplus bit-for-bit (not log1pf -- must be the
                 // exact same formula for the byte-identical correctness bar)
                 const float softplus_val = (alpha_biased > 20.0f) ? alpha_biased : logf(1.0f + expf(alpha_biased));
-                g_val = expf(softplus_val * ssm_a[h_idx]);
+                g_val = expf(gdn_opaque(gdn_opaque(softplus_val) * ssm_a[h_idx]));
             } else {
                 g_val = expf(*g_t);
             }
