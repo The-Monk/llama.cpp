@@ -26,6 +26,23 @@ static bool gdn_layer_on_cuda_like(const llama_model & model, int il) {
     return reg != nullptr && (strcmp(reg, "ROCm") == 0 || strcmp(reg, "CUDA") == 0);
 }
 
+// [TAG_MMVQ_MTAB] T395: by default (GGML_GEMV_FUSE=0 disables) the four GDN input projections (qkv, z,
+// beta, alpha: all read attn_norm; GGML_GEMV_FUSE_GROUPS bit 1) and q/k/v (bit 2) are
+// pinned next to each other in single-token graphs, so the CUDA backend can run each
+// set as ONE matrix-table GEMV. Execution order only; every op and value is unchanged.
+// GGML_GEMV_FUSE=0 = graph untouched. GROUPS defaults to 3 (both).
+static int qwen35_hfuse_mask() {
+    static const int m = [] {
+        const char * e = getenv("GGML_GEMV_FUSE");
+        if (e != nullptr && atoi(e) == 0) {
+            return 0;
+        }
+        const char * g = getenv("GGML_GEMV_FUSE_GROUPS");
+        return g ? atoi(g) : 3;
+    }();
+    return m;
+}
+
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -260,11 +277,18 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+    const bool hfuse_pin = (qwen35_hfuse_mask() & 1) && ubatch.n_tokens == 1;   // [TAG_MMVQ_MTAB]
+    if (hfuse_pin) {
+        ggml_build_forward_expand(gf, qkv_mixed);
+    }
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     cb(z, "z", il);
+    if (hfuse_pin) {
+        ggml_build_forward_expand(gf, z);
+    }
 
     return { qkv_mixed, z };
 }
@@ -294,6 +318,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
     cb(Qcur_full, "Qcur_full", il);
+    const bool hfuse_pin = (qwen35_hfuse_mask() & 2) && ubatch.n_tokens == 1;   // [TAG_MMVQ_MTAB]
+    if (hfuse_pin) {
+        ggml_build_forward_expand(gf, Qcur_full);
+    }
 
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
@@ -306,9 +334,15 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
 
     ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
     cb(Kcur, "Kcur", il);
+    if (hfuse_pin) {
+        ggml_build_forward_expand(gf, Kcur);
+    }
 
     ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
     cb(Vcur, "Vcur", il);
+    if (hfuse_pin) {
+        ggml_build_forward_expand(gf, Vcur);
+    }
 
     // Apply K normalization
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
@@ -411,10 +445,17 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
                                   n_seq_tokens == 1 && cparams.n_rs_seq == 0;
 
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    const bool hfuse_pin = (qwen35_hfuse_mask() & 1) && ubatch.n_tokens == 1;   // [TAG_MMVQ_MTAB]
+    if (hfuse_pin) {
+        ggml_build_forward_expand(gf, beta);
+    }
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+    if (hfuse_pin) {
+        ggml_build_forward_expand(gf, alpha);
+    }
     alpha = ggml_reshape_4d(ctx0, alpha, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 

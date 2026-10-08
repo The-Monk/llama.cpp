@@ -2,6 +2,19 @@
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
 
+// [TAG_MMVQ_MTAB] T395 horizontal GEMV fusion: up to MMVQ_MTAB_MAX single-token
+// MUL_MATs that read the SAME activation with the same weight type and K run as one
+// launch. The grid is the concatenation of each matrix's own row blocks, so the
+// workgroup count is the SUM (the row-concat axis of the per-dispatch law), and every
+// row is computed by the unchanged per-row dot code, so results are bit-identical.
+#define MMVQ_MTAB_MAX 4
+struct ggml_cuda_mmvq_mtab_host {
+    int                 n = 0;
+    const ggml_tensor * src0[MMVQ_MTAB_MAX] = {};
+    ggml_tensor       * dst[MMVQ_MTAB_MAX]  = {};
+};
+bool ggml_cuda_mmvq_mtab_supported(enum ggml_type type);
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
@@ -9,7 +22,8 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
-    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr,
+    const ggml_cuda_mmvq_mtab_host * mtab = nullptr);
 
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,

@@ -4102,6 +4102,79 @@ static int ggml_cuda_find_mmvq_pair(const ggml_cgraph * cgraph, int i, int cc) {
     return -1;
 }
 
+// [TAG_MMVQ_MTAB] T395 horizontal GEMV fusion, on by default (GGML_GEMV_FUSE=0 disables).
+// Collects a run of consecutive single-token MUL_MATs (views/no-ops may sit between
+// them) that read the SAME activation with the same weight type, K and row stride,
+// starting at node i, and returns its size (0 if < 2). Unlike MMVQ_PAIR (two weight
+// streams through one grid, has_fusion instantiation), the group launches the plain
+// kernel over the concatenated row blocks: workgroups add, bytes per workgroup do not
+// change. Consecutiveness is what makes it safe: nothing runs between the members, so
+// no buffer reuse can intervene. The qwen35 graph pins its same-input projections
+// next to each other under the same env flag (llama_model_qwen35 build_qkvz).
+static int ggml_cuda_find_mmvq_group(const ggml_cgraph * cgraph, int i, int cc, ggml_cuda_mmvq_mtab_host & g, int * idx) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_GEMV_FUSE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    static const bool trace = getenv("GGML_GEMV_FUSE_TRACE") != nullptr;
+    if (!enabled || !GGML_CUDA_CC_IS_RDNA(cc)) {
+        return 0;
+    }
+    const ggml_tensor * a = cgraph->nodes[i];
+    if (a->op != GGML_OP_MUL_MAT || a->src[2] != nullptr) {
+        return 0;
+    }
+    const ggml_tensor * wa  = a->src[0];
+    const ggml_tensor * act = a->src[1];
+    auto member_ok = [&](const ggml_tensor * n) {
+        const ggml_tensor * w = n->src[0];
+        return n->op == GGML_OP_MUL_MAT && n->src[2] == nullptr && n->src[1] == act &&
+               w->type == wa->type && w->ne[0] == wa->ne[0] && w->nb[1] == wa->nb[1] &&
+               w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) && w->buffer &&
+               ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+               n->type == GGML_TYPE_F32 && ggml_is_contiguous(n) &&
+               n->ne[1] == 1 && n->ne[2] == 1 && n->ne[3] == 1;
+    };
+    if (act->type != GGML_TYPE_F32 || act->ne[1] != 1 || act->ne[2] != 1 || act->ne[3] != 1) return 0;
+    if (!ggml_cuda_mmvq_mtab_supported(wa->type) || ggml_cuda_q2_0_is_g64(wa))  return 0;
+    if (!ggml_cuda_should_use_mmvq(wa->type, cc, act->ne[1]) || !member_ok(a)) return 0;
+
+    g.n = 1; g.src0[0] = wa; g.dst[0] = const_cast<ggml_tensor *>(a); idx[0] = i;
+    for (int j = i + 1; j < cgraph->n_nodes && g.n < MMVQ_MTAB_MAX; ++j) {
+        const ggml_tensor * b = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(b)) {
+            continue;
+        }
+        if ((b->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !member_ok(b)) {
+            break;
+        }
+        g.src0[g.n] = b->src[0]; g.dst[g.n] = const_cast<ggml_tensor *>(b); idx[g.n] = j; g.n++;
+    }
+    if (g.n < 2) {
+        return 0;
+    }
+    auto overlaps = [](const ggml_tensor * x, const ggml_tensor * y) {
+        if (!x || !y || !x->buffer || !y->buffer || !x->data || !y->data) return true;
+        const int64_t xs = (int64_t) x->data;
+        const int64_t xe = xs + ggml_backend_buft_get_alloc_size(x->buffer->buft, x);
+        const int64_t ys = (int64_t) y->data;
+        const int64_t ye = ys + ggml_backend_buft_get_alloc_size(y->buffer->buft, y);
+        return (ys <= xs && xs < ye) || (xs <= ys && ys < xe);
+    };
+    for (int k = 0; k < g.n; ++k) {
+        if (overlaps(g.dst[k], act)) return 0;
+        for (int l = 0; l < g.n; ++l) {
+            if (overlaps(g.dst[k], g.src0[l]) || (l != k && overlaps(g.dst[k], g.dst[l]))) return 0;
+        }
+    }
+    if (trace) {
+        fprintf(stderr, "HFUSE_FIRE n=%d", g.n);
+        for (int k = 0; k < g.n; ++k) fprintf(stderr, " %s[%lld]", g.src0[k]->name, (long long) g.src0[k]->ne[1]);
+        fprintf(stderr, "\n");
+    }
+    return g.n;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -5038,6 +5111,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #else
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
+
+                // [TAG_MMVQ_MTAB] T395: one launch for a run of same-input single-token matmuls
+                if (!is_concurrent_event_active) {
+                    ggml_cuda_mmvq_mtab_host grp;
+                    int gidx[MMVQ_MTAB_MAX];
+                    const int ng = ggml_cuda_find_mmvq_group(cgraph, i, ggml_cuda_info().devices[cuda_ctx->device].cc, grp, gidx);
+                    if (ng > 1) {
+                        ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, node, nullptr, &grp);
+                        for (int k = 1; k < ng; ++k) {
+                            mmvq_pair_done[gidx[k]] = true;
+                        }
+                        try_launch_concurrent_event(node);
+                        continue;
+                    }
+                }
 
                 // [TAG_MMVQ_PAIR] fold a shape-identical sibling matmul into this launch
                 {
