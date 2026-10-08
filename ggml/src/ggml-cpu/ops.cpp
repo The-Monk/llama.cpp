@@ -9647,6 +9647,7 @@ static void ggml_compute_forward_ssm_conv_update_f32(
 
     GGML_ASSERT(src0->ne[0] == nc - 1);
     GGML_ASSERT(dst->ne[0] == nr);
+    GGML_ASSERT(nc <= 16);
 
     const int dr  = (nr + nth - 1)/nth;
     const int ir0 = dr*ith;
@@ -9659,11 +9660,19 @@ static void ggml_compute_forward_ssm_conv_update_f32(
             const float   x = *(const float *) ((const char *) src2->data + i1*src2->nb[0] + i3*src2->nb[2]);
             float       * y = (float *) ((char *) dst->data + i1*dst->nb[0] + i3*dst->nb[2]);
 
-            float sumf = 0.0f;
+            // the window [s, x] in a contiguous buffer, then the SAME loop as ggml_compute_forward_ssm_conv_f32:
+            // GCC vectorizes that runtime-length loop (unfused products, in-order adds), so a split loop
+            // (fma chain + separate last term) is not bit-identical to the graph path
+            float win[16];
             for (int i0 = 0; i0 < nc - 1; ++i0) {
-                sumf += s[i0] * c[i0];
+                win[i0] = s[i0];
             }
-            sumf += x * c[nc - 1];
+            win[nc - 1] = x;
+
+            float sumf = 0.0f;
+            for (int i0 = 0; i0 < nc; ++i0) {
+                sumf += win[i0] * c[i0];
+            }
 
             for (int i0 = 0; i0 < nc - 2; ++i0) {
                 s[i0] = s[i0 + 1];
