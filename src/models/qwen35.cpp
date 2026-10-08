@@ -1,6 +1,16 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstring>
+
+// GGML_GDN_STATE_INPLACE promoted to default-on (T360, 2026-10-07): unset = on, "0" = off. Exact on R9700
+// Bonsai-27B (greedy text and top-5 logprobs identical to the gather/write-back graph), Q1_0 +4.0%, Q2_0 +3.5%.
+// GGML_GDN_FUSED_BA and GGML_GDN_FUSED_L2NORM stay opt-in: both change numerics (decode KL ~4e-4, T361).
+static bool gdn_rung_default_on(const char * name) {
+    const char * e = getenv(name);
+    return e == nullptr || strcmp(e, "0") != 0;
+}
+
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -443,7 +453,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // Extra gate: only take the fast path when there is no pending clear
     // this call; every case that needs the clear falls back to build_rs.
     const bool gdn_state_inplace =
-        getenv("GGML_GDN_STATE_INPLACE") != nullptr &&
+        gdn_rung_default_on("GGML_GDN_STATE_INPLACE") &&
         cparams.n_rs_seq == 0 &&
         n_seqs == 1 &&
         inp->mctx->get_n_rs() == 1 &&
