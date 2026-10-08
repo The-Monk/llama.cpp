@@ -55,7 +55,8 @@ static bool ggml_cuda_dedup_mmvq_quant_enabled() {
     static const bool enabled = getenv("GGML_HIP_DEDUP_MMVQ_QUANT_DISABLE") == nullptr;
     return enabled;
 }
-// T362 GGML_Q2_FIELD_ACT=1 (default: unset/OFF): field-ordered q8_1
+// T362 GGML_Q2_FIELD_ACT (default ON since 2026-10-08: unset = on, "0" = off,
+// same rule as the T360 GDN default in src/models/qwen35.cpp): field-ordered q8_1
 // activations for Q2_0 (g128) MUL_MAT decode. quantize_row_q8_1_q2_field_cuda
 // writes each block's qs in the weight bit-field order and the kernel uses
 // vec_dot_q2_0_q8_1_field (one shift+mask per dp4a operand instead of the
@@ -69,7 +70,7 @@ static bool ggml_cuda_q2_field_act_enabled() {
 #if GGML_CUDA_FIELD_ACT
     static const bool enabled = [] {
         const char * e = getenv("GGML_Q2_FIELD_ACT");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || strcmp(e, "0") != 0;
     }();
     return enabled;
 #else
