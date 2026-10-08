@@ -854,6 +854,34 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     return d1 * (2.0f * d8 * (float) sumi - s8);
 }
 
+// T362 (R4a) for Q1_0: bq8_1 written by quantize_row_q8_1_q1_field_cuda, so
+// int f of qs = u[f], u[8+f], u[16+f], u[24+f] and each dp4a operand is one
+// (W >> f) & 0x01010101 of the natural weight dword. Same integer sumi as
+// vec_dot_q1_0_q8_1 (twin h_twin.py T362). Wrong on natural-order input.
+static __device__ __forceinline__ float vec_dot_q1_0_q8_1_field(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q1_0 * bq1_0 = (const block_q1_0 *) vbq + kbx;
+    const float d1 = bq1_0->d;
+    const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
+
+    const int offset = iqs * 4;
+    const int w = bq1_0->qs[offset + 0] | (bq1_0->qs[offset + 1] << 8) |
+                  (bq1_0->qs[offset + 2] << 16) | (bq1_0->qs[offset + 3] << 24);
+
+    int sumi_a = 0, sumi_b = 0;   // = dot(c, u), c in {0,1}
+#pragma unroll
+    for (int f = 0; f < 8; f += 2) {
+        sumi_a = ggml_cuda_dp4a((w >> f)       & 0x01010101, get_int_b4(bq8_1_chunk->qs, f),     sumi_a);
+        sumi_b = ggml_cuda_dp4a((w >> (f + 1)) & 0x01010101, get_int_b4(bq8_1_chunk->qs, f + 1), sumi_b);
+    }
+    const int sumi = sumi_a + sumi_b;
+
+    const float d8 = __low2float(bq8_1_chunk->ds);
+    const float s8 = __high2float(bq8_1_chunk->ds); // = d8 * sum(u), permutation-invariant
+    return d1 * (2.0f * d8 * (float) sumi - s8);
+}
+
 // A5 (PORT-MANIFEST.md section A5.5): the 2c-1 decode algorithm below is
 // QK2_0-agnostic -- proven on branch q2_0-g64-experiment (commit
 // 340afd96cd) by flipping QK2_0 128->64 globally and observing this
@@ -936,6 +964,46 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
         sum += vec_dot_q2_0_q8_1_core(bq2_0->d, bq2_0->qs, bq8_1, iqs + i);
     }
     return sum;
+}
+
+// T362 (R4a, decode-research report H): field-ordered activations. Same
+// integer sumi = dot(c, u) as vec_dot_q2_0_q8_1_core, but bq8_1 must have
+// been written by quantize_row_q8_1_q2_field_cuda, which stores u in the
+// weight bit-field order: int 4h+f of qs = u[16h+f], u[16h+4+f], u[16h+8+f],
+// u[16h+12+f]. Each dp4a operand is then one (W >> 2f) & 0x03030303 -- no
+// per-byte spread. Same products, re-associated integer sum, so the result
+// is bit-identical (twin h_twin.py T362: 200k random + adversarial +
+// exhaustive-byte inputs). Feeding it NATURAL-order activations is silently
+// wrong -- mmvq.cu selects this only together with the field quantizer.
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1_field_core(
+        const float d2, const uint8_t * __restrict__ qs, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+    const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
+
+    const int offset = iqs * 8;
+    const int qs0 = qs[offset + 0] | (qs[offset + 1] << 8) |
+                    (qs[offset + 2] << 16) | (qs[offset + 3] << 24);
+    const int qs1 = qs[offset + 4] | (qs[offset + 5] << 8) |
+                    (qs[offset + 6] << 16) | (qs[offset + 7] << 24);
+
+    int sumi_a = 0, sumi_b = 0;   // = dot(c, u), c in {0,1,2,3}
+#pragma unroll
+    for (int f = 0; f < 4; ++f) {
+        sumi_a = ggml_cuda_dp4a((qs0 >> (2*f)) & 0x03030303, get_int_b4(bq8_1_chunk->qs, f),     sumi_a);
+        sumi_b = ggml_cuda_dp4a((qs1 >> (2*f)) & 0x03030303, get_int_b4(bq8_1_chunk->qs, 4 + f), sumi_b);
+    }
+    const int sumi = sumi_a + sumi_b;
+
+    const float d8 = __low2float(bq8_1_chunk->ds);
+    const float s8 = __high2float(bq8_1_chunk->ds); // = d8 * sum(u), permutation-invariant
+    return d2 * (d8 * sumi - s8);
+}
+
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1_field(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    // One chunk per call: the field path does not implement the T365 vdr loop.
+    static_assert(VDR_Q2_0_Q8_1_MMVQ == 1, "T362 field_act requires GGML_HIP_Q2_0_VDR == 1");
+    const block_q2_0 * bq2_0 = (const block_q2_0 *) vbq + kbx;
+    return vec_dot_q2_0_q8_1_field_core(bq2_0->d, bq2_0->qs, bq8_1, iqs);
 }
 
 // g64 (upstream's official layout, A5): same algorithm, block_q2_0_g64
