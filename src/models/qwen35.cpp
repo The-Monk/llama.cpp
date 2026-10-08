@@ -5,10 +5,23 @@
 
 // GGML_GDN_STATE_INPLACE promoted to default-on (T360, 2026-10-07): unset = on, "0" = off. Exact on R9700
 // Bonsai-27B (greedy text and top-5 logprobs identical to the gather/write-back graph), Q1_0 +4.0%, Q2_0 +3.5%.
-// GGML_GDN_FUSED_BA and GGML_GDN_FUSED_L2NORM stay opt-in: both change numerics (decode KL ~4e-4, T361).
+// GGML_GDN_FUSED_BA and GGML_GDN_FUSED_L2NORM default-on too (T361, 2026-10-08), same unset = on, "0" = off.
+// Bit-exact vs the unfused graph since the T361 kernel fixes (server text + top-5 logprobs identical, decode
+// KL equal to the off/off control); on top of INPLACE: Q1_0 +6.3%, Q2_0 +3.9%.
 static bool gdn_rung_default_on(const char * name) {
     const char * e = getenv(name);
     return e == nullptr || strcmp(e, "0") != 0;
+}
+
+// The fused BA and L2-norm paths exist only in the ROCm/CUDA gated_delta_net kernel; the CPU op asserts on
+// them, so a CPU-placed layer (partial offload) must take the unfused path.
+static bool gdn_layer_on_cuda_like(const llama_model & model, int il) {
+    ggml_backend_dev_t dev = model.dev_layer(il);
+    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return false;
+    }
+    const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+    return reg != nullptr && (strcmp(reg, "ROCm") == 0 || strcmp(reg, "CUDA") == 0);
 }
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
@@ -374,17 +387,16 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // softplus(alpha+ssm_dt)*ssm_a into the GDN kernel, skipping 4 separate
     // elementwise dispatches/layer. Fused K=1 decode path only.
     //
-    // KNOWN LIMITATION: only the CUDA/HIP kernel implements FusedBA
-    // (gated_delta_net.cu); ggml-cpu's reference kernel does not read
-    // op_params[1]/src[6]/src[7] and would silently treat beta/g as
-    // already-activated if this op ever ran on CPU with the flag set. Safe
-    // only under full GPU offload (-ngl 99).
+    // Only the CUDA/HIP kernel implements FusedBA (gated_delta_net.cu); the
+    // CPU op asserts on it, so gdn_layer_on_cuda_like keeps CPU-placed layers
+    // on the unfused path.
     //
     // Gate requires cparams.n_rs_seq == 0: build_recurrent_attn's keep==true
     // branch (rollback active) passes gate/beta straight into the base
     // ggml_gated_delta_net call with explicit nullptr,nullptr for ssm_dt/
     // ssm_a, so raw unactivated values must never reach that path.
-    const bool gdn_fused_ba = getenv("GGML_GDN_FUSED_BA") != nullptr && n_seq_tokens == 1 && cparams.n_rs_seq == 0;
+    const bool gdn_fused_ba = gdn_rung_default_on("GGML_GDN_FUSED_BA") && gdn_layer_on_cuda_like(model, il) &&
+                              n_seq_tokens == 1 && cparams.n_rs_seq == 0;
 
     // GGML_GDN_FUSED_L2NORM (T180 follow-on): fold the two upstream
     // GGML_OP_L2_NORM dispatches (q_conv, k_conv) into the GDN kernel,
@@ -393,7 +405,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // n_seq_tokens==1 && n_rs_seq==0 is sufficient to guarantee the fused
     // K=1 kernel path is actually taken; build_delta_net/build_delta_net_fused
     // carry a GGML_ASSERT that would catch it if that assumption ever broke).
-    const bool gdn_fused_l2norm = getenv("GGML_GDN_FUSED_L2NORM") != nullptr && n_seq_tokens == 1 && cparams.n_rs_seq == 0;
+    const bool gdn_fused_l2norm = gdn_rung_default_on("GGML_GDN_FUSED_L2NORM") && gdn_layer_on_cuda_like(model, il) &&
+                                  n_seq_tokens == 1 && cparams.n_rs_seq == 0;
 
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
