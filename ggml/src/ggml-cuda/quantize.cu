@@ -361,7 +361,11 @@ static __global__ void quantize_mmq_q8_1(
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int ne1, const int ne2) {
 
-    constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+    // [TAG_MMQ_SCALE_HOIST] D128: the 32 lanes of a warp own one aligned 128-value
+    // block_q8_1_mmq, so the amax reduction just spans the whole warp; the D4
+    // write-back below then stores the same d into all four d4 slots.
+    constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 :
+                                   ds_layout == MMQ_Q8_1_DS_LAYOUT_D128 ? 128 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
 
     const int64_t i0 = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
@@ -402,7 +406,7 @@ static __global__ void quantize_mmq_q8_1(
     }
 
     float sum;
-    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4 && ds_layout != MMQ_Q8_1_DS_LAYOUT_D128) {
         sum = xi.x + xi.y + xi.z + xi.w;
 
         // Calculate sums across vals_per_sum/4 threads.
@@ -499,6 +503,23 @@ void quantize_mmq_q8_1_cuda(
             GGML_ABORT("fatal error");
             break;
     }
+}
+
+// [TAG_MMQ_SCALE_HOIST] (T379) one activation scale per 128 values, for the
+// hoisted Q1_0/Q2_0 MMQ kernel only (mmq.cu decides; never mixed with D4 users).
+void quantize_mmq_q8_1_d128_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(type_src0 == GGML_TYPE_Q1_0 || type_src0 == GGML_TYPE_Q2_0);
+    GGML_ASSERT(ne00 % 4 == 0);
+    GGML_ASSERT(ne0 % (4*QK8_1) == 0);
+
+    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D128>
+        <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
 }
 
 // F8E4M3 (Path X, Phase 1b) online activation quantization. Structurally a
