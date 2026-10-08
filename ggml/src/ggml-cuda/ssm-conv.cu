@@ -57,6 +57,72 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
     }
 }
 
+// T368: single-token conv with the conv state updated in place (vLLM causal_conv1d_update pattern).
+// One thread per channel, exactly like ssm_conv_f32's i == 0 iteration: the window [state, x_new] is loaded
+// into registers, the tap sum uses the same products in the same order as the compiled ssm_conv_f32 (see the
+// d_conv == 4 note below), the same silu; then the thread writes the shifted window tail back over its own state row. Each
+// thread reads its row before writing it and no other thread touches that row, so there is no race.
+template <bool apply_silu, size_t split_d_inner, size_t d_conv>
+static __global__ void ssm_conv_update_f32(float * state_ptr, const float * x_ptr, const float * w_ptr,
+                                           const float * bias_ptr,
+                                           const int state_nb1, const int state_nb2, const int x_nb2, const int w_nb1,
+                                           float * dst_ptr, const int dst_nb2) {
+    ggml_cuda_pdl_lc();
+    const int tid  = threadIdx.x;
+    const int bidx = blockIdx.x;
+    const int bidy = blockIdx.y;
+
+    const int ch = bidy * split_d_inner + tid;
+
+    float *       s_row = (float *) ((char *) state_ptr + bidx * state_nb2 + ch * state_nb1);
+    const float * x_row = (const float *) ((const char *) x_ptr + bidx * x_nb2);
+    const float * w_row = (const float *) ((const char *) w_ptr + ch * w_nb1);
+    float *       y_row = (float *) ((char *) dst_ptr + bidx * dst_nb2);
+
+    float x[d_conv] = { 0.0f };
+    float w[d_conv] = { 0.0f };
+
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for (size_t j = 0; j < d_conv; j++) {
+        w[j] = w_row[j];
+    }
+
+    float b = bias_ptr != nullptr ? bias_ptr[ch] : 0.0f;
+
+#pragma unroll
+    for (size_t j = 0; j < d_conv - 1; j++) {
+        x[j] = s_row[j];
+    }
+    x[d_conv - 1] = x_row[ch];
+
+    float sumf;
+    if constexpr (d_conv == 4) {
+        // Bit-exactness with the graph path: ggml-hip builds with -funsafe-math-optimizations, and for
+        // ssm_conv_f32<*, 128, 4>'s i == 0 iteration (the only one a decode token runs) the compiler
+        // reassociates `0 + x0*w0 + x1*w1 + x2*w2 + x3*w3 + b` into fma(x3,w3,b) -> +x1*w1 -> +x2*w2 ->
+        // +x0*w0 (read off the gfx1201 ISA, T368). Explicit fmaf calls are not reassociated, so this pins
+        // the same order here. Re-check the ISA if the compiler changes.
+        sumf = fmaf(x[3], w[3], b);
+        sumf = fmaf(x[1], w[1], sumf);
+        sumf = fmaf(x[2], w[2], sumf);
+        sumf = fmaf(x[0], w[0], sumf);
+    } else {
+        sumf = 0.0f;
+#pragma unroll
+        for (size_t j = 0; j < d_conv; j++) {
+            sumf += x[j] * w[j];
+        }
+        sumf += b;
+    }
+    y_row[ch] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+
+#pragma unroll
+    for (size_t j = 0; j < d_conv - 1; j++) {
+        s_row[j] = x[j + 1];
+    }
+}
+
 template <bool apply_silu, size_t split_d_inner, size_t d_conv, int64_t split_n_t>
 static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, const float * __restrict__ src1,
                                                const float * __restrict__ bias,
@@ -202,5 +268,57 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     } else {
         ssm_conv_f32_cuda<false>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
                           out->nb[2], nc, nr, n_t, n_s, stream);
+    }
+}
+
+void ggml_cuda_op_ssm_conv_update(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_tensor *              state = dst->src[0];  // conv state view, updated in place
+    const struct ggml_tensor * w     = dst->src[1];  // conv1d.weight
+    const struct ggml_tensor * x     = dst->src[2];  // new token
+
+    const bool apply_silu = ggml_get_op_params_i32(dst, 0) != 0;
+
+    const int64_t nc  = w->ne[0];       // d_conv
+    const int64_t nr  = state->ne[1];   // d_inner
+    const int64_t n_s = state->ne[2];
+
+    GGML_ASSERT(state->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->ne[0] == nc - 1);
+    GGML_ASSERT(state->nb[0] == sizeof(float) && x->nb[0] == sizeof(float) && w->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->ne[0] == nr && dst->nb[0] == sizeof(float));
+
+    const int threads = 128;
+    GGML_ASSERT(nr % threads == 0);
+
+    float *       state_d = (float *) state->data;
+    const float * x_d     = (const float *) x->data;
+    const float * w_d     = (const float *) w->data;
+    float *       dst_d   = (float *) dst->data;
+    cudaStream_t  stream  = ctx.stream();
+
+    const dim3 blocks(n_s, nr / threads, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
+
+    auto launch_kernel = [&](auto NC) {
+        constexpr int kNC = decltype(NC)::value;
+        if (apply_silu) {
+            ggml_cuda_kernel_launch(ssm_conv_update_f32<true, threads, kNC>, launch_params, state_d, x_d, w_d,
+                                    (const float *) nullptr, (int) state->nb[1], (int) state->nb[2], (int) x->nb[2],
+                                    (int) w->nb[1], dst_d, (int) dst->nb[2]);
+        } else {
+            ggml_cuda_kernel_launch(ssm_conv_update_f32<false, threads, kNC>, launch_params, state_d, x_d, w_d,
+                                    (const float *) nullptr, (int) state->nb[1], (int) state->nb[2], (int) x->nb[2],
+                                    (int) w->nb[1], dst_d, (int) dst->nb[2]);
+        }
+    };
+
+    switch (nc) {
+        case 3:  launch_kernel(std::integral_constant<int, 3 >{}); break;
+        case 4:  launch_kernel(std::integral_constant<int, 4 >{}); break;
+        case 5:  launch_kernel(std::integral_constant<int, 5 >{}); break;
+        case 9:  launch_kernel(std::integral_constant<int, 9 >{}); break;
+        case 15: launch_kernel(std::integral_constant<int, 15>{}); break;
+        default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 9, 15 right now.");
     }
 }

@@ -9627,6 +9627,69 @@ void ggml_compute_forward_ssm_conv(
     }
 }
 
+// ggml_compute_forward_ssm_conv_update
+
+static void ggml_compute_forward_ssm_conv_update_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0]; // conv state {d_conv - 1, d_inner, n_s}, updated in place
+    const ggml_tensor * src1 = dst->src[1]; // conv1d.weight {d_conv, d_inner}
+    const ggml_tensor * src2 = dst->src[2]; // new token {d_inner, 1, n_s}
+
+    const bool apply_silu = ggml_get_op_params_i32(dst, 0) != 0;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc  = src1->ne[0]; // d_conv
+    const int nr  = src0->ne[1]; // d_inner
+    const int n_s = src0->ne[2];
+
+    GGML_ASSERT(src0->ne[0] == nc - 1);
+    GGML_ASSERT(dst->ne[0] == nr);
+
+    const int dr  = (nr + nth - 1)/nth;
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int i3 = 0; i3 < n_s; ++i3) {
+        for (int i1 = ir0; i1 < ir1; ++i1) {
+            float       * s = (float *) ((char *) src0->data + i1*src0->nb[1] + i3*src0->nb[2]);
+            const float * c = (const float *) ((const char *) src1->data + i1*src1->nb[1]);
+            const float   x = *(const float *) ((const char *) src2->data + i1*src2->nb[0] + i3*src2->nb[2]);
+            float       * y = (float *) ((char *) dst->data + i1*dst->nb[0] + i3*dst->nb[2]);
+
+            float sumf = 0.0f;
+            for (int i0 = 0; i0 < nc - 1; ++i0) {
+                sumf += s[i0] * c[i0];
+            }
+            sumf += x * c[nc - 1];
+
+            for (int i0 = 0; i0 < nc - 2; ++i0) {
+                s[i0] = s[i0 + 1];
+            }
+            s[nc - 2] = x;
+
+            *y = apply_silu ? ggml_silu_f32(sumf) : sumf;
+        }
+    }
+}
+
+void ggml_compute_forward_ssm_conv_update(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_ssm_conv_update_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_ssm_scan
 
 static void ggml_compute_forward_ssm_scan_f32(

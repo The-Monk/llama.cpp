@@ -3085,6 +3085,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SSM_CONV:
             ggml_cuda_op_ssm_conv(ctx, dst);
             break;
+        case GGML_OP_SSM_CONV_UPDATE:
+            ggml_cuda_op_ssm_conv_update(ctx, dst);
+            break;
         case GGML_OP_SSM_SCAN:
             ggml_cuda_op_ssm_scan(ctx, dst);
             break;
@@ -6148,6 +6151,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SSM_CONV: {
             // assumes d_inner % threads == 0
             return op->src[0]->ne[1] % 128 == 0;
+        }
+        case GGML_OP_SSM_CONV_UPDATE: {
+            const int64_t nc = op->src[1]->ne[0];
+            return op->src[0]->ne[1] % 128 == 0 && (nc == 3 || nc == 4 || nc == 5 || nc == 9 || nc == 15);
         }
         case GGML_OP_CONT:
             return true;
