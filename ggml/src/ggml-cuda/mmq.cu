@@ -176,6 +176,25 @@ void ggml_cuda_mul_mat_q(
     // src1 quantized to native e5m2, not int8 Q8_1.
     const bool use_native_f8e5m2 = src0->type == GGML_TYPE_F8E5M2 || use_mixed_bf8_act;
 
+    // [TAG_MMQ_SCALE_HOIST] (T379) on by default, GGML_MMQ_SCALE_HOIST=0 opts out: Q1_0/Q2_0
+    // dense MUL_MAT on AMD WMMA quantizes src1 with ONE scale per 128 values and
+    // runs the hoisted kernel (int32 accumulate per 128, one float epilogue per
+    // 128 instead of per 32). Changes activation quant granularity => not
+    // bit-exact, PPL-gated. The D128 buffer is the call-local src1_q8_1 below,
+    // consumed only by the launch right after it (launch_mul_mat_q asserts the
+    // layout/kernel pairing); MUL_MAT_ID and mmvq (decode) are untouched.
+    // Compile out with -DGGML_CUDA_NO_MMQ_SCALE_HOIST.
+#ifndef GGML_CUDA_NO_MMQ_SCALE_HOIST
+    static const bool g_mmq_scale_hoist = [] {
+        const char * e = getenv("GGML_MMQ_SCALE_HOIST");
+        return e == nullptr || std::string(e) != "0";
+    }();
+    const bool use_scale_hoist = g_mmq_scale_hoist && !ids && amd_wmma_available(cc) &&
+        (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_Q2_0);
+#else
+    const bool use_scale_hoist = false;
+#endif // GGML_CUDA_NO_MMQ_SCALE_HOIST
+
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
             get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
@@ -196,6 +215,9 @@ void ggml_cuda_mul_mat_q(
             } else if (use_native_f8e5m2) {
                 quantize_mmq_f8e5m2_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
+            } else if (use_scale_hoist) {
+                quantize_mmq_q8_1_d128_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                                       ne11, ne12, ne13, stream);
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
@@ -214,7 +236,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            use_stream_k, ne1, use_mixed_bf8_act};
+            use_stream_k, ne1, use_mixed_bf8_act, use_scale_hoist};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }

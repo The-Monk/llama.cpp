@@ -25,6 +25,11 @@ enum mmq_q8_1_ds_layout {
     MMQ_Q8_1_DS_LAYOUT_D4,
     MMQ_Q8_1_DS_LAYOUT_DS4,
     MMQ_Q8_1_DS_LAYOUT_D2S6,
+    // [TAG_MMQ_SCALE_HOIST] D4 container, but one scale per 128 values:
+    // d4[0..3] all hold the same d. Only ever produced by
+    // quantize_mmq_q8_1_d128_cuda and only ever consumed by the hoisted
+    // Q1_0/Q2_0 kernel (vec_dot_q8_0_q8_1_mma_hoist128), see mmq.cu.
+    MMQ_Q8_1_DS_LAYOUT_D128,
 };
 
 struct block_q8_1_mmq {
@@ -1721,6 +1726,82 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma(
         }
     }
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+}
+
+// [TAG_MMQ_SCALE_HOIST] (T379) Q1_0/Q2_0 only, AMD WMMA only, on by default
+// (GGML_MMQ_SCALE_HOIST=0 opts out). vec_dot_q8_0_q8_1_mma above converts the int32
+// accumulator to float and applies dA*dB after EVERY K32 step. For g128 weights
+// dA is constant over the 128 values one call covers (k00 is 128-aligned and
+// load_tiles_q{1,2}_0 replicate the block scale into all 4 K32 slots), so if
+// the activation scale is also constant over those 128 values (D128 layout,
+// quantize_mmq_q8_1_d128_cuda) the 4 WMMA steps can accumulate in int32 and
+// the epilogue runs once per 128 instead of 4x. |acc| <= 128*127, no overflow.
+// NOT bit-exact vs the default path: activations are quantized per 128, not per
+// 32 (PPL-gated). The weight-side math is exact.
+template <int mmq_x, int mmq_y>
+static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_hoist128(
+    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+#if defined(AMD_WMMA_AVAILABLE)
+    constexpr data_layout input_layout = get_input_data_layout();
+    typedef tile<16,  8, int, input_layout>        tile_A;
+    typedef tile<16,  8, int, input_layout>        tile_B;
+    typedef tile<16, 16, int, DATA_LAYOUT_J_MAJOR> tile_C;
+
+    constexpr int granularity = mmq_get_granularity_device(mmq_x);
+    constexpr int rows_per_warp = granularity;
+    constexpr int ntx = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+    constexpr int nk  = MMQ_TILE_NE_K/QI8_0;     // K32 steps per 128-value segment.
+
+    y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
+
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) x_qs + 2*MMQ_TILE_NE_K;
+    const int   * y_qs = (const int   *) y + 4;
+    const float * y_df = (const float *) y;
+
+    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+
+    tile_A A[ntx][nk];
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+        for (int kk = 0; kk < nk; ++kk) {
+            load_ldmatrix(A[n][kk], x_qs + (i0 + n*tile_A::I)*MMQ_MMA_TILE_X_K_Q8_0 + k00 + kk*QI8_0, MMQ_MMA_TILE_X_K_Q8_0);
+        }
+    }
+
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += ntx*tile_C::J) {
+        tile_C C[ntx];
+
+#pragma unroll
+        for (int kk = 0; kk < nk; ++kk) {
+            tile_B B;
+            load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + kk*QI8_0, MMQ_TILE_Y_K);
+
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                mma(C[n], A[n][kk], B);
+            }
+        }
+
+        const int j = j0 + tile_C::get_j(0);
+        const float dB = y_df[j*MMQ_TILE_Y_K]; // D128: d4[0] == d4[1] == d4[2] == d4[3]
+
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int i = i0 + n*tile_A::I + tile_C::get_i(l);
+                const float dA = x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + k00/QI8_0];
+                sum[(j0/tile_C::J + n)*tile_C::ne + l] += C[n].x[l]*dA*dB;
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(x, y, sum, k00);
+    NO_DEVICE_CODE;
+#endif // defined(AMD_WMMA_AVAILABLE)
 }
 
 // F8E4M3 (Path X, Phase 1b): native fp8 WMMA vec_dot, RDNA4/gfx1201 only.
@@ -4299,7 +4380,7 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_IQ4_XS> {
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
 };
 
-template <ggml_type type, int mmq_x, bool need_check, bool fixup>
+template <ggml_type type, int mmq_x, bool need_check, bool fixup, bool hoist = false>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -4319,7 +4400,9 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     int * tile_x = tile_y + GGML_PAD(mmq_x*MMQ_TILE_Y_K, nwarps*warp_size);
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-    constexpr vec_dot_mmq_t    vec_dot    = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_mma;
+    // [TAG_MMQ_SCALE_HOIST] hoist is only ever true for Q1_0/Q2_0 (launch_mul_mat_q).
+    constexpr vec_dot_mmq_t    vec_dot    = hoist ? vec_dot_q8_0_q8_1_mma_hoist128<mmq_x, mmq_y> :
+                                                    mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_mma;
     constexpr mmq_write_back_t write_back = mmq_write_back_mma<type, mmq_x, mmq_y, need_check>;
 #else
     constexpr vec_dot_mmq_t    vec_dot    = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_dp4a;
@@ -4427,7 +4510,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 // used by every mmq type and risk regressing the non-spilling common
 // shapes. Reported BLOCKED in card 137; see wiki/tech/rdna4-isa-
 // optimization-audit.md. MIN_BLOCKS left at the original 2 for every type.
-template <ggml_type type, int mmq_x, bool need_check>
+template <ggml_type type, int mmq_x, bool need_check, bool hoist = false>
 #if defined(GGML_USE_HIP)
 #if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
@@ -4533,7 +4616,7 @@ static __global__ void mul_mat_q(
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
         constexpr bool fixup = false;
-        mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, hoist>
             (x, offset_x, y + offset_y, use_ids ? ids_dst_shared : nullptr, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, use_mixed_bf8_act);
         return;
@@ -4613,7 +4696,7 @@ static __global__ void mul_mat_q(
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-        mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, hoist>
             (x, offset_x, y + offset_y, use_ids ? ids_dst_shared : nullptr, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, use_mixed_bf8_act);
 
@@ -4682,7 +4765,7 @@ static __global__ void mul_mat_q(
     const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
-    mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+    mul_mat_q_process_tile<type, mmq_x, need_check, fixup, hoist>
         (x, offset_x, y + offset_y, use_ids ? ids_dst_shared : nullptr, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, use_mixed_bf8_act);
 }
@@ -4837,6 +4920,9 @@ struct mmq_args {
     // Always false/unused for every type other than GGML_TYPE_F8E4M3 -- see
     // mul_mat_q_process_tile below for where it's actually consumed.
     bool use_mixed_bf8_act = false;
+    // [TAG_MMQ_SCALE_HOIST] y was quantized with quantize_mmq_q8_1_d128_cuda;
+    // only set by mmq.cu, only for Q1_0/Q2_0 on AMD WMMA.
+    bool scale_hoist = false;
 };
 
 template<ggml_type type>
@@ -4857,8 +4943,18 @@ static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int 
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
 }
 
-template <ggml_type type, int mmq_x>
+template <ggml_type type, int mmq_x, bool hoist = false>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+#ifndef GGML_CUDA_NO_MMQ_SCALE_HOIST
+    // [TAG_MMQ_SCALE_HOIST] separate instantiation, so the default kernels are untouched.
+    if constexpr (!hoist && (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q2_0)) {
+        if (args.scale_hoist) {
+            launch_mul_mat_q<type, mmq_x, true>(ctx, args, stream);
+            return;
+        }
+    }
+#endif // GGML_CUDA_NO_MMQ_SCALE_HOIST
+    GGML_ASSERT(hoist == args.scale_hoist);
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
@@ -4870,8 +4966,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     const int nbytes_shared = mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps, args.ids_dst != nullptr);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false, hoist>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true, hoist>), nbytes_shared);
 
     const int nty  = (args.nrows_x   + mmq_y - 1) / mmq_y;
     const int ntx  = (args.ncols_max + mmq_x - 1) / mmq_x;
@@ -4893,7 +4989,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     if (!args.use_stream_k) {
         if (args.nrows_x % mmq_y == 0) {
             constexpr bool need_check = false;
-            mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+            mul_mat_q<type, mmq_x, need_check, hoist><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
                 (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
@@ -4901,7 +4997,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  ntx_fd, args.use_mixed_bf8_act);
         } else {
             constexpr bool need_check = true;
-            mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+            mul_mat_q<type, mmq_x, need_check, hoist><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
                 (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
@@ -4933,7 +5029,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     if (args.nrows_x % mmq_y == 0) {
         constexpr bool need_check = false;
-        mul_mat_q<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+        mul_mat_q<type, mmq_x, need_check, hoist><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
@@ -4951,7 +5047,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              ntx_fd);
     } else {
         constexpr bool need_check = true;
-        mul_mat_q<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+        mul_mat_q<type, mmq_x, need_check, hoist><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
@@ -5004,8 +5100,17 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     // and x16 (the true average per-expert width at pp512) is the WORST of the
     // four, below the 128 default. Keyed on ids_dst so dense MUL_MAT is untouched
     // (Q2_K in particular wants 128 -- see TAG_Q2_K_DM_HALF).
-    const int mmq_x_max_eff = (args.ids_dst != nullptr && amd_wmma_available(cc) && mmq_x_max > 64)
+    int mmq_x_max_eff = (args.ids_dst != nullptr && amd_wmma_available(cc) && mmq_x_max > 64)
         ? 64 : mmq_x_max;
+
+    // [TAG_MMQ_SCALE_HOIST] The hoisted Q1_0/Q2_0 kernel keeps C[ntx] + A[ntx][4]
+    // live and spills 39 VGPRs at mmq_x=128 (default kernel: 240 VGPRs, 0 spills),
+    // which cancels the epilogue saving there. Forced-mmq_x sweep (Bonsai-27B,
+    // pp512, hoist ON, 2 rounds): Q2_0 64 1303.8 | 80 1294.3 | 96 1324.6 |
+    // 112 1355.8 | 128 1240.1 vs OFF auto(128) 1259.5; Q1_0 112 1372.6 vs OFF 1268.3.
+    if (args.scale_hoist) {
+        mmq_x_max_eff = std::min(mmq_x_max_eff, 112);
+    }
 
     // [TAG_MMQ_SPILL_TABLE] The loop below used to filter on shared memory ALONE,
     // so it happily selected tiles that spill registers. Every entry in
