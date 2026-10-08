@@ -9670,7 +9670,22 @@ static void ggml_compute_forward_ssm_conv_update_f32(
             }
             s[nc - 2] = x;
 
-            *y = apply_silu ? ggml_silu_f32(sumf) : sumf;
+            *y = sumf;
+        }
+    }
+
+    if (apply_silu) {
+        // Same silu the graph path runs (GGML_OP_UNARY SILU on the [d_inner, 1, n_s] conv output): whole rows
+        // through ggml_vec_silu_f32 with the same row split, so the SIMD/scalar-tail element mapping -- and
+        // therefore every output bit -- matches. A per-element ggml_silu_f32 here is NOT bit-identical.
+        ggml_barrier(params->threadpool);
+
+        const int dr_s = (n_s + nth - 1)/nth;
+        const int is0  = dr_s*ith;
+        const int is1  = MIN(is0 + dr_s, n_s);
+        for (int i3 = is0; i3 < is1; ++i3) {
+            float * y = (float *) ((char *) dst->data + i3*dst->nb[2]);
+            ggml_vec_silu_f32(nr, y, y);
         }
     }
 }
