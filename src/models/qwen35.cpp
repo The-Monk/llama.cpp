@@ -8,6 +8,8 @@
 // GGML_GDN_FUSED_BA and GGML_GDN_FUSED_L2NORM default-on too (T361, 2026-10-08), same unset = on, "0" = off.
 // Bit-exact vs the unfused graph since the T361 kernel fixes (server text + top-5 logprobs identical, decode
 // KL equal to the off/off control); on top of INPLACE: Q1_0 +6.3%, Q2_0 +3.9%.
+// GGML_GDN_CONV_INPLACE default-on (T368, 2026-10-08), same convention: exact (12/12 logprob-identical, decode KL =
+// control), Q1_0 +5.0%, Q2_0 +4.2% tg128 (144 fewer dependent launches/token).
 static bool gdn_rung_default_on(const char * name) {
     const char * e = getenv(name);
     return e == nullptr || strcmp(e, "0") != 0;
@@ -443,7 +445,32 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+    // EXPERIMENT (GGML_GDN_CONV_INPLACE, default-on: unset = on, "0" = off; card T368): single-token decode reads the
+    // conv state straight from its cache row and updates it in place (vLLM causal_conv1d_update pattern) in
+    // ONE kernel, replacing build_rs's get_rows gather + concat + ssm_conv/silu + the write-back cpy (3
+    // dependent launches per GDN layer removed). Same arithmetic as the ssm_conv path. Gated exactly like
+    // gdn_state_inplace below (same direct-view validity argument and the same cold-start rule: a pending
+    // zero-clear, rs_z >= 0, falls back to build_rs), plus n_seq_tokens == 1 since the op is single-token.
+    const bool gdn_conv_inplace =
+        gdn_rung_default_on("GGML_GDN_CONV_INPLACE") &&
+        n_seq_tokens == 1 &&
+        cparams.n_rs_seq == 0 &&
+        n_seqs == 1 &&
+        inp->mctx->get_n_rs() == 1 &&
+        inp->mctx->get_rs_z() < 0;
+
+    ggml_tensor * conv_input       = nullptr;
+    ggml_tensor * conv_output_silu = nullptr;
+    if (gdn_conv_inplace) {
+        ggml_tensor * conv_state = build_rs_state_view(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+        conv_state = ggml_reshape_3d(ctx0, conv_state, conv_kernel_size - 1, conv_channels, n_seqs);
+        cb(conv_state, "conv_state_inplace_view", il);
+
+        conv_output_silu = ggml_ssm_conv_update(ctx0, conv_state, qkv_mixed, conv_kernel, true);
+        cb(conv_output_silu, "conv_output_silu", il);
+    } else {
+        conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+    }
 
     // EXPERIMENT (env-gated GGML_GDN_STATE_INPLACE, ported from PrismML
     // megakernel/rmsnorm-qmv-fuse commit 6d8333b3d): at plain batch=1 decode
@@ -483,11 +510,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         cb(state, "state_predelta", il);
     }
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-    cb(conv_output_proper, "conv_output_raw", il);
+    if (!gdn_conv_inplace) {
+        ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
 
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
-    cb(conv_output_silu, "conv_output_silu", il);
+        conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+        cb(conv_output_silu, "conv_output_silu", il);
+    }
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
 

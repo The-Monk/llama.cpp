@@ -604,6 +604,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_SSM_CONV_UPDATE, // appended (T368): keeps every pre-existing enum value stable
+
         GGML_OP_COUNT,
     };
 
@@ -2501,6 +2503,20 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
+
+    // single-token causal conv update with the conv state updated IN PLACE (T368):
+    //   s: {d_conv - 1, d_inner, n_s} conv state (typically a view of the recurrent cache) -- overwritten
+    //      with the shifted window [s[1..], x]
+    //   x: {d_inner, 1, n_s} new token
+    //   c: {d_conv, d_inner} conv weights
+    // returns {d_inner, 1, n_s} = conv([s, x], c), passed through silu when apply_silu.
+    // Same values as ggml_ssm_conv(concat(s, x^T), c) (+ silu) followed by a copy of the window tail into s.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_update(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            bool                  apply_silu);
 
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
