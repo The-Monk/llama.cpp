@@ -94,6 +94,13 @@ static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4, con
 #endif
 }
 
+// The sign byte itself, before the 0x01010101 broadcast that the __vcmpne4 form
+// needs. iq_signs_from_nibble places bits into bytes on its own.
+static __device__ __forceinline__ uint32_t unpack_ksigns_raw(const uint8_t v) {
+    const uint32_t p = __popc(v) & 1;
+    return v ^ p << 7;
+}
+
 static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     // v is a 7 bit int, with the 8th sign being encodable as popcnt
     // with xor we can "correct" the bit instead of having to mask
@@ -114,10 +121,54 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 // warning on every TU that includes this header. Keeping the values that were
 // live (and are verified: test-backend-ops -o MUL_MAT passes for q2_0, all
 // shapes, 2/2 backends), so this is a no-op for codegen.
-#define VDR_Q2_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
+// Elements per thread per iteration. vdr=1 gives one 32-element chunk per thread,
+// which maximises thread count but also maximises the PER-ELEMENT skeleton cost
+// (loop trip, index math, reduction) -- and that skeleton is what caps Q2_0.
+// Measured: with unpack, activations and dp4a ALL removed, the mmvq skeleton
+// still only reaches 87.4% of roofline for Q2_0, while MXFP8 reaches 99% through
+// the same kernel. The difference is bits-per-weight: at 2.125 bpw a thread
+// covers 4x more elements per streamed byte than at 8.25 bpw, so it pays the
+// skeleton 4x as often. Raising vdr amortises that over more elements and widens
+// the weight load from 8 to 16/32 contiguous bytes, with every byte used (unlike
+// the field-major arm, which widened the load but wasted 3/4 of it).
+// Q4_0 and MXFP8 both ship vdr=2.
+#ifndef GGML_HIP_Q2_0_VDR
+#define GGML_HIP_Q2_0_VDR 1
+#endif
+#define VDR_Q2_0_Q8_1_MMVQ GGML_HIP_Q2_0_VDR
 #define VDR_Q2_0_Q8_1_MMQ  2  // 2 32-element chunks per MMQ tile step
 
-#define VDR_TQ1_0_Q8_1_MMVQ 1 // one 32-element chunk (= one q8_1 block) per vec_dot call
+// TQ1_0 is the table's one real outlier (41-47% roofline, ~30 points below its
+// bits-per-weight trend). Arithmetic is ruled out (stubbing the base-3 extract
+// out entirely makes it SLOWER) and so is geometry (nwarps 1/2/3/4/6 measured
+// 41.3/37.1/38.2/38.8/33.7, so the shipped 1 is genuinely the peak).
+//
+// What is left is load-instruction efficiency. QI_TQ1_0 = 8 puts EIGHT lanes on
+// one block, and five of them (iqs 0..4) read THE SAME 32 qs bytes -- one trit
+// each out of shared bytes. A warp load instruction therefore touches only ~4-8
+// distinct addresses, against Q2_0's 32 (QI2_0 = 4, four lanes each taking a
+// distinct 8-byte segment). Identical addresses coalesce, so this is not extra
+// DRAM traffic -- it is ~8x the load INSTRUCTIONS for the same bytes.
+//
+// vdr=8 makes qi/vdr = 1, so kbx0 = tid and each lane owns a WHOLE block: it
+// loads the 54 bytes once and extracts every trit, and lanes stop sharing
+// addresses. The risk is the mirror of what killed Q2_0 at vdr=4 -- a per-lane
+// stride-54 gather instead of a contiguous run -- so this is measured, not
+// assumed. Sweep {1,2,4,8}.
+// SHIPPED 2026-09-09: vdr=8, worth +27.1 roofline points.
+// Kernel-time roofline on Ternary-Bonsai-8B-TQ1_0, N=3 interleaved, idle-gated,
+// peak re-measured each round (639.6-639.7 GB/s):
+//     vdr=1  41.7 / 41.5 / 41.1   (5.49-5.57 ms/token, ~265 GB/s)
+//     vdr=8  68.4 / 68.6 / 68.7   (3.33-3.35 ms/token, ~438 GB/s)
+// The arms do not overlap. Full single-run curve: 1=41.7, 2=37.0, 4=42.5, 8=68.3
+// -- only vdr=8 helps, because QI_TQ1_0=8 means vdr=8 is the point where
+// qi/vdr becomes 1 and a lane stops sharing addresses with seven others and owns
+// a whole block.
+// Gates: test-backend-ops MUL_MAT tq1_0 0 FAIL at vdr 2/4/8, MUL_MAT_ID 2/2 OK.
+#ifndef GGML_HIP_TQ1_0_VDR
+#define GGML_HIP_TQ1_0_VDR 8
+#endif
+#define VDR_TQ1_0_Q8_1_MMVQ GGML_HIP_TQ1_0_VDR
 #define VDR_TQ2_0_Q8_1_MMVQ 1 // one 32-element chunk (= one q8_1 block) per vec_dot call
 
 #define VDR_Q4_0_Q8_1_MMVQ 2
@@ -506,7 +557,18 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
 
         const int vih = ((vh >> i) << 2) & 0x04040404;
 
-        const int vi = __vsubss4(vil, vih);
+        // vil - vih without the saturating byte subtract. vil is 2 bits per byte
+        // (0..3) and vih is 0 or 4, so the difference is -4..3 and saturation can
+        // never fire. When vih is 4 the result is vil-4, which for vil in 0..3 is
+        // exactly vil | 0xFC -- vil occupies bits 0..1 and 0xFC bits 2..7, so the
+        // OR is exact and no borrow can cross a byte. vih*0x3F maps 0->0 and
+        // 4->0xFC in one multiply, and 0xFC < 0x100 so it cannot carry either.
+        //
+        // Worth it because __vsubss4 is expensive: the HIP shim expands to a
+        // per-byte saturating subtract that gfx1201 has no instruction for.
+        // Measured on the emitted ISA, 8 calls: shim 115 VALU (32 v_sub_nc_u16 +
+        // 28 v_xor_b16 + shifts/masks) against 29 for this form.
+        const int vi = vil | (vih * 0x3F);
 
         sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
     }
@@ -655,7 +717,26 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
     return dm4f.x*sumf_d - dm4f.y*sumf_m;
 }
 
-#define VDR_Q6_K_Q8_1_MMVQ 1
+// Q6_K ships vdr=1. Unlike block_q2_0 (AoS: fp16 scale interleaved with the
+// quants, where raising vdr turned the warp's loads into a stride-34 gather and
+// cost 41%), block_q6_K keeps ql[128], qh[64] and scales[16] as SEPARATE
+// contiguous arrays, so a thread taking more consecutive ints still reads
+// contiguously and the warp stays coalesced. QI6_K = 32, so vdr=2 puts 16
+// threads on a block instead of 32, each reading 8 contiguous bytes.
+// Q6_K sits at 95.5% roofline, 1.5 points short of target.
+// SHIPPED 2026-09-09: vdr=2. Kernel-time roofline on q38-Q6_K against a
+// contemporaneous 639.6 GB/s peak: vdr=1 95.5% (610.6 GB/s, 34.994 ms/token),
+// vdr=2 96.0% (614.2 GB/s, 34.785 ms), vdr=4 95.9%. Shallow peak at 2.
+// Gated: test-backend-ops MUL_MAT q6_K 11 OK / 0 FAIL.
+// Q6_K tolerates this where Q2_0 does not because block_q6_K keeps ql[128],
+// qh[64] and scales[16] as SEPARATE contiguous arrays, so a thread taking more
+// consecutive ints still reads contiguously; block_q2_0 interleaves an fp16
+// scale with its 32 qs bytes and the same change turned the warp's loads into a
+// stride-34 gather (-41.6%).
+#ifndef GGML_HIP_Q6_K_VDR
+#define GGML_HIP_Q6_K_VDR 2
+#endif
+#define VDR_Q6_K_Q8_1_MMVQ GGML_HIP_Q6_K_VDR
 #define VDR_Q6_K_Q8_1_MMQ  8
 
 // contiguous v/x values
@@ -846,7 +927,15 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1_core(
 static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
         const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
     const block_q2_0 * bq2_0 = (const block_q2_0 *) vbq + kbx;
-    return vec_dot_q2_0_q8_1_core(bq2_0->d, bq2_0->qs, bq8_1, iqs);
+    // The caller hands us kqs = vdr*(tid % (qi/vdr)), so this thread owns the vdr
+    // CONSECUTIVE 32-element chunks starting at iqs. Each chunk keeps its own q8_1
+    // scale, so they are summed in float exactly as separate threads' partials were.
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < VDR_Q2_0_Q8_1_MMVQ; ++i) {
+        sum += vec_dot_q2_0_q8_1_core(bq2_0->d, bq2_0->qs, bq8_1, iqs + i);
+    }
+    return sum;
 }
 
 // g64 (upstream's official layout, A5): same algorithm, block_q2_0_g64
@@ -945,9 +1034,13 @@ static __device__ __forceinline__ int ggml_cuda_tq1_0_extract4(const int x, cons
 }
 
 static __device__ __forceinline__ float vec_dot_tq1_0_q8_1(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs0) {
 
     const block_tq1_0 * bq = (const block_tq1_0 *) vbq + kbx;
+    float vdr_sum = 0.0f;
+#pragma unroll
+    for (int vdr_i = 0; vdr_i < VDR_TQ1_0_Q8_1_MMVQ; ++vdr_i) {
+    const int iqs = iqs0 + vdr_i;
 
     // iqs in 0..7 (QI_TQ1_0 positions) selects one 32-element chunk, which is
     // exactly one q8_1 activation block -- required so the -sum(u) offset can
@@ -1014,7 +1107,9 @@ static __device__ __forceinline__ float vec_dot_tq1_0_q8_1(
     const float d  = bq->d;
     const float d8 = __low2float(bq8->ds);
     const float s8 = __high2float(bq8->ds); // = d8 * sum(u)
-    return d * (d8 * sumi - s8);
+    vdr_sum += d * (d8 * sumi - s8);
+    }
+    return vdr_sum;
 }
 
 // TQ2_0 (upstream ternary, 2.0625 bpw): 256 elements/block, 2 bits per
@@ -1771,29 +1866,84 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
 }
 
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs0) {
 
     const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
 
-    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
-    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
-    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+    // The caller hands us kqs = vdr*(tid % (qi/vdr)), so this thread owns the vdr
+    // CONSECUTIVE int positions starting at iqs0. Each carries its own scales and
+    // q8_1 scale, so the partials are summed in float exactly as separate threads'
+    // contributions were at vdr=1.
+    float sum = 0.0f;
+#pragma unroll
+    for (int ii = 0; ii < VDR_Q6_K_Q8_1_MMVQ; ++ii) {
+        const int iqs = iqs0 + ii;
 
-    const int vl = get_int_b2(bq6_K->ql, iqs);
-    const int vh = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+        const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+        const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+        const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
 
-    const int8_t * scales = bq6_K->scales + scale_offset;
+        const int vl = get_int_b2(bq6_K->ql, iqs);
+        const int vh = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
 
-    int    u[QR6_K];
-    float d8[QR6_K];
+        const int8_t * scales = bq6_K->scales + scale_offset;
+
+        int    u[QR6_K];
+        float d8[QR6_K];
 
 #pragma unroll
-    for (int i = 0; i < QR6_K; ++i) {
-        u[i]  = get_int_b4(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1);
-        d8[i] = __low2float(bq8_1[bq8_offset + 2*i].ds);
-    }
+        for (int i = 0; i < QR6_K; ++i) {
+            u[i]  = get_int_b4(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1);
+            d8[i] = __low2float(bq8_1[bq8_offset + 2*i].ds);
+        }
 
-    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+        sum += vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+    }
+    return sum;
+}
+
+
+
+// Per-byte sign mask from 4 packed sign bits, without __vcmpne4.
+//
+// (nib * 0x00204081) & 0x01010101 places bit j of the nibble at byte j: the
+// constant has bits at {0,7,14,21}, so bit j lands at j, j+7, j+14 and j+21,
+// and only j+7j == 8j survives the mask. A 4-bit input is required -- with a
+// wider one the copies overlap at bit 7 and the carry corrupts byte 1, which
+// is the same constraint Q1_0 documents for the identical constant.
+//
+// The 0x01 result is exactly the +1 of the conditional two's-complement negate,
+// so it is returned alongside the widened 0xFF mask rather than recomputed.
+// Measured over 8 applications on gfx1201: 185 VALU for the __vcmpne4 form
+// against 45 for this one.
+struct iq_signs { int m; int mask; };
+static __device__ __forceinline__ iq_signs iq_signs_from_nibble(const unsigned nib) {
+    const int m = (int)(((nib & 0x0F) * 0x00204081u) & 0x01010101u);
+    return { m, m * 0xFF };
+}
+static __device__ __forceinline__ int iq_apply_signs_m(const int grid, const iq_signs s) {
+    return (grid ^ s.mask) + s.m;
+}
+
+// Apply the per-byte sign mask to a codebook entry.
+//
+// `signs` is 0x00 or 0xFF per byte (from __vcmpne4), so this is a conditional
+// two's-complement negate. The obvious spelling is __vsub4(grid ^ signs,
+// signs), but __vsub4 is __vsubss4 -- a SATURATING byte subtract built on
+// __builtin_elementwise_sub_sat, and the saturation can never fire here:
+// every byte of every IQ codebook is a small positive value, so the negation
+// is always well inside int8 range.
+//
+// (g ^ s) - s per byte equals (g ^ s) + (s & 1) per byte. A carry could only
+// escape a byte if (g ^ s) were 0xFF, which needs a ZERO grid byte. There are
+// none: a byte census of all five affected tables gives 0 zero bytes out of
+// 17,408 -- iq2xxs_grid 0/2048, iq2xs_grid 0/4096, iq2s_grid 0/8192,
+// iq3xxs_grid 0/1024, iq3s_grid 0/2048. Results are bit-identical, which
+// test-backend-ops MUL_MAT (1240 cases) and MUL_MAT_ID both confirm.
+//
+// IF YOU ADD OR REGENERATE AN IQ CODEBOOK, re-run that census first.
+static __device__ __forceinline__ int iq_apply_signs(const int grid, const int signs) {
+    return (grid ^ signs) + (signs & 0x01010101);
 }
 
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2
@@ -1812,15 +1962,15 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
         const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[k0/2]];
-        const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+        const uint32_t sb = unpack_ksigns_raw(aux32 >> (7 * k0 / 2));
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
+        const iq_signs s0 = iq_signs_from_nibble(sb);
+        const int grid0 = iq_apply_signs_m(grid_pos.x, s0);
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, k0 + 0);
         sumi = ggml_cuda_dp4a(grid0, u0, sumi);
 
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
+        const iq_signs s1 = iq_signs_from_nibble(sb >> 4);
+        const int grid1 = iq_apply_signs_m(grid_pos.y, s1);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
         sumi = ggml_cuda_dp4a(grid1, u1, sumi);
     }
@@ -1849,14 +1999,14 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const uint2 grid_pos = ((const uint2*)iq2xs_grid)[q2[l0/2] & 0x1FF];
-        const uint32_t signs = unpack_ksigns(q2[l0/2] >> 9);
+        const uint32_t sb = unpack_ksigns_raw(q2[l0/2] >> 9);
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const iq_signs s0 = iq_signs_from_nibble(sb);
+        const int grid_l = iq_apply_signs_m(grid_pos.x, s0);
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
 
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const iq_signs s1 = iq_signs_from_nibble(sb >> 4);
+        const int grid_h = iq_apply_signs_m(grid_pos.y, s1);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
         if (l0 < 4) {
@@ -1897,11 +2047,11 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int * grid_pos = (const int *)(iq2s_grid + (qs[l0/2] | ((qh << (8-l0)) & 0x300)));
 
-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+        const iq_signs s0 = iq_signs_from_nibble(signs_packed_8[l0/2]);
+        const iq_signs s1 = iq_signs_from_nibble(signs_packed_8[l0/2] >> 4);
 
-        const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
-        const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
+        const int grid_l = iq_apply_signs_m(grid_pos[0], s0);
+        const int grid_h = iq_apply_signs_m(grid_pos[1], s1);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
@@ -1936,15 +2086,15 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
-        const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
+        const uint32_t sb = unpack_ksigns_raw(aux32 >> (7*l0/2));
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const iq_signs s0 = iq_signs_from_nibble(sb);
+        const int grid_l = iq_apply_signs_m(grid_pos.x, s0);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
 
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const iq_signs s1 = iq_signs_from_nibble(sb >> 4);
+        const int grid_h = iq_apply_signs_m(grid_pos.y, s1);
 
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
@@ -1982,11 +2132,11 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
             iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
             iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
 
-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+        const iq_signs s0 = iq_signs_from_nibble(signs_packed_8[l0/2]);
+        const iq_signs s1 = iq_signs_from_nibble(signs_packed_8[l0/2] >> 4);
 
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid_l = iq_apply_signs_m(grid_pos.x, s0);
+        const int grid_h = iq_apply_signs_m(grid_pos.y, s1);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);

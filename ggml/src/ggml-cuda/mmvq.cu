@@ -513,7 +513,7 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
-static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool q2_0_g64 = false) {
+static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool q2_0_g64 = false, bool is_moe = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
@@ -578,6 +578,81 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         // the original 1-vs-8 test only -- do not assume they follow either
         // IQ2_XXS or IQ3_S until measured.
         if (ncols_dst == 1) {
+            // DENSE decode optima, measured 2026-09-08 on Qwen3.8-27B / gfx1201 /
+            // ROCm 10 with a full 6x4 (nwarps x rows_per_block) grid, one build dir
+            // per arm, interleaved rounds, idle-gated. Best-vs-shipped t/s below.
+            // MoE decode deliberately falls through to the older table: geometry
+            // does not transfer across model class (MXFP4 nwarps=6 is +5.5% dense
+            // and -4.7% MoE), and no MoE model was available to re-sweep.
+            // Note nwarps=4 is a reproducible pothole on RDNA4 (seen on Q3_K,
+            // IQ2_XXS and IQ3_S) and is never selected here.
+            if (!is_moe) {
+                switch (type) {
+                    case GGML_TYPE_MXFP4: return 6;   // 31.56 -> 33.31 (+5.5%), was the nwarps=1 default
+                    case GGML_TYPE_MXFP8: return 6;   // 19.80 -> 20.22 (+2.1%), was the nwarps=1 default
+                    case GGML_TYPE_MXFP6: return 6;   // 24.17 -> 24.66 (+2.0%), was the nwarps=1 default
+                    case GGML_TYPE_Q3_K:  return 2;   // 31.72 -> 32.23 (+1.6%), was the nwarps=1 default
+                    // Q5_K, Q4_K and Q4_0 were the three types closest to the
+                    // roofline that had never had a 2-D sweep -- Q4_K and Q4_0
+                    // had never had rpb moved at all, and Q5_K only at rpb=2.
+                    // All three prefer nwarps=6, matching the MX family and Q6_K.
+                    case GGML_TYPE_Q5_K:  return 6;   // 25.61 -> 26.75 (+4.5%), WAS 8; nw6 is also the most stable column
+                    case GGML_TYPE_Q4_K:  return 6;   // 28.96 -> 29.76 (+2.8%), WAS 8
+                    // Q4_0 is NOT here on purpose. The grid suggested nw6 by
+                    // +1.6% and a profiled run put it at 95.6% vs 93.8% of
+                    // roofline, but a dedicated 4-round interleaved A/B at r=3
+                    // settles it as a null: nw6 32.18/32.21/32.39/32.48 (mean
+                    // 32.32) against nw8 32.37/32.35/32.24/32.34 (mean 32.33),
+                    // a 0.03% difference with each arm winning two rounds. Q4_0
+                    // keeps nwarps=8 from the whitelist below.
+                    // F8E4M3 sat at the nwarps=1 default only because it had
+                    // never been measured -- its structurally identical twin
+                    // F8E5M2 (same qk, block bytes, qi, vdr) has shipped at 8 all
+                    // along. Confirmed on TWO models before shipping, since the
+                    // first sweep was on a sparse model where F8E4M3 is only the
+                    // dense fallback: pure llama-3.1-8B-F8E4M3 gives 67.81 ->
+                    // 68.59 at nw6/rpb1 (+1.2%), sparse-llama gives 67.16 ->
+                    // 68.38 (+1.8%). Both peak at rpb=1 with nwarps >= 3.
+                    case GGML_TYPE_F8E4M3: return 6;   // 67.81 -> 68.59 (+1.2%)
+                    case GGML_TYPE_Q6_K:  return 6;   // 23.68 -> 23.98 (+1.3%), WAS 8 -- likewise
+                    // TQ2_0's kernel landed 2026-09-05 and inherited the RDNA4
+                    // defaults untouched. Its shipped cell (nw1,rpb2)=43.23 sits
+                    // in the worst nwarps column; 19 of the 24 grid cells beat
+                    // it. Best (nw6,rpb3)=50.86, +17.6% -- the largest geometry
+                    // win measured in this sweep.
+                    case GGML_TYPE_TQ2_0: return 6;   // 43.23 -> 50.86 (+17.6%)
+                    // IQ1_S is the one IQ type that WANTS more warps, and the
+                    // reason is visible in its register footprint: 40 VGPR = 12
+                    // waves/SIMD of headroom, against IQ3_S at 104 and IQ2_XS at
+                    // 96 (4-5 waves, already saturated -- both peak at nwarps=1
+                    // and lose 17-24% by nwarps=8). Register pressure decides
+                    // whether this lever is available at all.
+                    case GGML_TYPE_IQ1_S: return 6;   // 45.81 -> 51.02 (+11.4%)
+                    // IQ2_XXS and IQ2_XS both want nwarps=3 -- but only since the
+                    // sign-mask rewrite. This case was REMOVED earlier in the same
+                    // session because on the pre-rewrite kernel nw1 measured better
+                    // (21.177 ms / 40.7% against nw3 at 21.882 / 39.4%). Cutting
+                    // ~40% of the VALU work moved the optimum back:
+                    //          nw1    nw2    nw3    nw4    nw6    nw8
+                    //  IQ2_XXS 43.09  43.73  44.80  41.67  43.86  39.97
+                    //  IQ2_XS  40.66  42.28  43.09  39.74  41.58  38.06
+                    // +4.0% and +6.1% over nw1, both rounds. A launch-geometry
+                    // optimum is a property of the KERNEL, not of the type, so it
+                    // has to be re-swept whenever the kernel body changes.
+                    case GGML_TYPE_IQ2_XXS:
+                    case GGML_TYPE_IQ2_XS:
+                        return 3;
+                    // IQ3_S moved the same way and further, to 6. Its in-tree
+                    // note said "every nwarps tested regresses, worst at 4" --
+                    // true of the kernel that was measured, false of this one:
+                    //   nw1    nw2    nw3    nw4    nw6    nw8
+                    //   33.98  35.02  35.48  34.47  35.86  34.45
+                    // +5.7% over nwarps=1, both rounds.
+                    case GGML_TYPE_IQ3_S:
+                        return 6;
+                    default: break;                   // Q4_0 re-checked: 8 is correct for it (93.8% vs 92.9% at 6)
+                }
+            }
             switch (type) {
                 case GGML_TYPE_Q4_0:
                 case GGML_TYPE_Q4_1:
@@ -629,7 +704,23 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                     if (q2_0_g64) {
                         break;
                     }
-                    return 8;
+#ifdef GGML_HIP_Q2_0_NWARPS
+                    return GGML_HIP_Q2_0_NWARPS;
+#else
+                    // RE-SWEPT 2026-09-09 with the KERNEL-TIME roofline (the old
+                    // value came from a 1-vs-8 t/s comparison, the same error this
+                    // file documents as wrong for IQ2_XXS and Q1_0). Full curve,
+                    // Bonsai-27B-Q2_0, %% of a contemporaneous 639.6 GB/s peak:
+                    //   nwarps  3     4     5     6     7     8(was)
+                    //   %roof   84.6  82.5  85.6  86.2  86.2  83.2
+                    // Non-monotonic, and 8 sat in a local dip. N=3 interleaved,
+                    // idle-gated replication of 6 vs 8 with the peak re-measured
+                    // each round: 85.9/86.2/86.0 against 83.2/82.8/83.3 -- the two
+                    // arms do not overlap. +2.8 points. Gated on test-backend-ops
+                    // MUL_MAT 2/2 OK and MUL_MAT_ID 2/2 OK, which matters because
+                    // nwarps changes the cross-warp reduction tree.
+                    return 6;
+#endif
                 // F8E5M2: nwarps=8 19.87 +/- 0.08 vs nwarps=1 19.63 +/- 0.06
                 // (Qwen3.6-27B, tg128, r=5) = +1.2%. Small but outside noise.
                 case GGML_TYPE_F8E5M2:
@@ -745,7 +836,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1, bool q2_0_g64 = false) {
+static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1, bool q2_0_g64 = false, bool is_moe = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
         switch (ncols_dst) {
             case 1:
@@ -770,6 +861,30 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             // A5: the Q2_0 rpb=3 bucket below is a g128 measurement
             // (PORT-MANIFEST.md A5.6); g64 is not yet swept and falls
             // through to the RDNA4 default (2) instead of inheriting it.
+            // Q3_K dense: the grid optimum is (nwarps=2, rpb=3) at 32.46 t/s vs
+            // the shipped (1,2) at 31.72. Moving nwarps alone gets +1.6% and rpb
+            // alone +0.3%; the pair is +2.3%. Every earlier sweep in this tree was
+            // 1-D and so could not see it.
+            if (!is_moe && (type == GGML_TYPE_Q3_K || type == GGML_TYPE_TQ2_0)) {
+                return 3;
+            }
+            // TQ1_0 is the one type that wants a single row per block. Its grid
+            // has a lone peak at (nwarps=1, rpb=1) = 39.68 t/s against 35.41 at
+            // the shipped (1,2); every other cell of the 6x4 sits at 27.9-36.8.
+            // nwarps stays at the RDNA4 default of 1 -- raising it costs 10-30%.
+            if (!is_moe && type == GGML_TYPE_TQ1_0) {
+                return 1;
+            }
+            if (!is_moe && type == GGML_TYPE_IQ1_S) {
+                return 4;
+            }
+            // Q5_K is the second type after TQ1_0 to want a single row per block:
+            // at nwarps=6 the rpb column reads 26.75/26.74/26.56/26.34 for
+            // rpb=1/2/3/4. Q4_K keeps rpb=3 (its shipped value, and the grid
+            // optimum) and Q4_0 keeps rpb=2, so neither needs a case here.
+            if (!is_moe && (type == GGML_TYPE_Q5_K || type == GGML_TYPE_F8E4M3)) {
+                return 1;
+            }
             if (type == GGML_TYPE_F8E4M3 || type == GGML_TYPE_F8E5M2 || (type == GGML_TYPE_Q2_0 && !q2_0_g64)) {
                 return 3;
             }
@@ -794,8 +909,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool q2_0_g64 = false>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), q2_0_g64)*ggml_cuda_get_physical_warp_size(), 1)
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool q2_0_g64 = false, bool is_moe = false>
+__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), q2_0_g64, is_moe)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -812,8 +927,8 @@ static __global__ void mul_mat_vec_q(
     constexpr int qi  = mmvq_q2_0_qi<type, q2_0_g64>();
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
-    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, q2_0_g64);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps, q2_0_g64);
+    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, q2_0_g64, is_moe);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps, q2_0_g64, is_moe);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = mmvq_q2_0_vec_dot<type, q2_0_g64>();
@@ -1123,19 +1238,19 @@ static __global__ void mul_mat_vec_q_moe(
     }
 }
 
-template<ggml_type type, bool q2_0_g64 = false>
+template<ggml_type type, bool q2_0_g64 = false, bool is_moe = false>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false) {
-    const int nwarps = calc_nwarps(type, ncols_dst, table_id, q2_0_g64);
-    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps, q2_0_g64);
+    const int nwarps = calc_nwarps(type, ncols_dst, table_id, q2_0_g64, is_moe);
+    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps, q2_0_g64, is_moe);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
     return {block_nums, block_dims};
 }
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool q2_0_g64 = false>
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool q2_0_g64 = false, bool is_moe = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1152,7 +1267,7 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst <= 4) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, q2_0_g64>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, q2_0_g64, is_moe>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_dst);
@@ -1163,7 +1278,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, q2_0_g64>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, q2_0_g64, is_moe>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_dst);
@@ -1299,10 +1414,21 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride, (uint32_t) nrows_x,
                     stream);
-            } else {
-                std::pair<dim3, dim3> dims = calc_launch_params<type, q2_0_g64>(c_ncols_dst, nrows_x, nchannels_dst,
+            } else if (has_ids) {
+                // MoE decode (MUL_MAT_ID with one token): keep the pre-2026-09-08
+                // geometry. The dense optima below were measured on dense models
+                // only and are known not to transfer.
+                std::pair<dim3, dim3> dims = calc_launch_params<type, q2_0_g64, true>(c_ncols_dst, nrows_x, nchannels_dst,
                                                                         nsamples_dst, warp_size, table_id);
-                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, q2_0_g64>(
+                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, q2_0_g64, true>(
+                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                    channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                    stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride, (uint32_t) nrows_x,
+                    stream);
+            } else {
+                std::pair<dim3, dim3> dims = calc_launch_params<type, q2_0_g64, false>(c_ncols_dst, nrows_x, nchannels_dst,
+                                                                        nsamples_dst, warp_size, table_id);
+                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, q2_0_g64, false>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride, (uint32_t) nrows_x,
