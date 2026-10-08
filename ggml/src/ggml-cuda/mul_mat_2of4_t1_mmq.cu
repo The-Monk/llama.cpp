@@ -64,7 +64,7 @@ static __global__ void k_quantize_act_q8_t1(
     *(char4 *) (yq + m * (n_groups_k * 32) + elem0) = q;
 }
 
-// [TAG_2OF4_T1_KPIPE] PIPE (env GGML_HIP_2OF4_T1_KPIPE, default 0):
+// [TAG_2OF4_T1_KPIPE] PIPE (env GGML_HIP_2OF4_T1_KPIPE, default 2; 0 = shipped kernel):
 //   0: shipped single-buffer staging, two barriers per chunk.
 //   1: double-buffered LDS: chunk c+1 is staged into the other buffer, then
 //      chunk c is computed; one barrier per chunk.
@@ -1005,13 +1005,13 @@ bool ggml_cuda_op_mul_mat_2of4_t1_mmq(ggml_backend_cuda_context & ctx, const ggm
     const char * d_w = (const char *) src0->data;
     float * d_dst = (float *) dst->data;
 
-    // [TAG_2OF4_T1_KPIPE] K-pipeline arms, default 0 (shipped kernel). 1/2 need
+    // [TAG_2OF4_T1_KPIPE] K-pipeline arms, default 2 (=0 restores the shipped kernel). 1/2 need
     // the double LDS footprint and are wired for the two default geometries
     // only; 3-6 (pre-packed weights) also need the hoist. Anything else falls
     // back to PIPE 0.
     static const int kpipe = [] {
         const char * e = getenv("GGML_HIP_2OF4_T1_KPIPE");
-        return e == nullptr ? 0 : atoi(e);
+        return e == nullptr ? 2 : atoi(e);
     }();
     const char * geom = getenv("GGML_HIP_2OF4_T1_MMQ_GEOM");
     if (kpipe >= 1 && kpipe <= 6 && geom == nullptr && !(kpipe >= 3 && !hoist)) {
