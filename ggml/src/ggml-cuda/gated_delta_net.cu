@@ -164,10 +164,14 @@ gated_delta_net_cuda(const float * q,
         if constexpr (L2Norm) {
             float q_sumsq_local = 0.0f;
             float k_sumsq_local = 0.0f;
+            // gdn_opaque pins the accumulation order to r = 0, 1, 2, ... like norm.cu's
+            // strided loop. Without it -funsafe-math-optimizations lets the compiler start the
+            // chain at r = 1 (measured on gfx1201: fma(x0, x0, x1*x1) for q), which rounds
+            // differently from norm.cu's fma(x1, x1, x0*x0). T361.
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                q_sumsq_local += q_reg[r] * q_reg[r];
-                k_sumsq_local += k_reg[r] * k_reg[r];
+                q_sumsq_local = gdn_opaque(q_sumsq_local + q_reg[r] * q_reg[r]);
+                k_sumsq_local = gdn_opaque(k_sumsq_local + k_reg[r] * k_reg[r]);
             }
             const float q_sumsq = warp_reduce_sum<warp_size>(q_sumsq_local);
             const float k_sumsq = warp_reduce_sum<warp_size>(k_sumsq_local);
