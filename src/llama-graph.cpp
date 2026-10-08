@@ -1075,7 +1075,9 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // s_copy has no buffer when no node consumes it: qwen35 with GDN_STATE_INPLACE and GGML_GDN_CONV_INPLACE
+    // (T368) both on reads every recurrent state through direct views, so no build_rs gather is left in the graph.
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
