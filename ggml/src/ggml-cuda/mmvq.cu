@@ -639,8 +639,11 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                     // Q5_K, Q4_K and Q4_0 were the three types closest to the
                     // roofline that had never had a 2-D sweep -- Q4_K and Q4_0
                     // had never had rpb moved at all, and Q5_K only at rpb=2.
-                    // All three prefer nwarps=6, matching the MX family and Q6_K.
-                    case GGML_TYPE_Q5_K:  return 6;   // 25.61 -> 26.75 (+4.5%), WAS 8; nw6 is also the most stable column
+                    // All three preferred nwarps=6 on Qwen3.8-27B, matching the
+                    // MX family and Q6_K. Q5_K is NOT here (T365 integration,
+                    // 2026-10-08): its nw6/rpb1 cell measured -3.3% tg128 on the
+                    // tb8-Q5_K model (enki job 51), so it keeps the nw8/rpb2
+                    // whitelist geometry below. Model-dependent, like MXFP4.
                     case GGML_TYPE_Q4_K:  return 6;   // 28.96 -> 29.76 (+2.8%), WAS 8
                     // Q4_0 is NOT here on purpose. The grid suggested nw6 by
                     // +1.6% and a profiled run put it at 95.6% vs 93.8% of
@@ -922,11 +925,12 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             if (!is_moe && type == GGML_TYPE_IQ1_S) {
                 return 4;
             }
-            // Q5_K is the second type after TQ1_0 to want a single row per block:
-            // at nwarps=6 the rpb column reads 26.75/26.74/26.56/26.34 for
-            // rpb=1/2/3/4. Q4_K keeps rpb=3 (its shipped value, and the grid
-            // optimum) and Q4_0 keeps rpb=2, so neither needs a case here.
-            if (!is_moe && (type == GGML_TYPE_Q5_K || type == GGML_TYPE_F8E4M3)) {
+            // F8E4M3 wants a single row per block (Q5_K did too at nwarps=6 on
+            // Qwen3.8-27B, 26.75/26.74/26.56/26.34 for rpb=1/2/3/4, but its
+            // nw6/rpb1 geometry was dropped in the T365 integration: -3.3% on
+            // tb8-Q5_K, enki job 51). Q4_K keeps rpb=3 (its shipped value, and
+            // the grid optimum) and Q4_0 keeps rpb=2, so neither needs a case here.
+            if (!is_moe && type == GGML_TYPE_F8E4M3) {
                 return 1;
             }
             if (type == GGML_TYPE_F8E4M3 || type == GGML_TYPE_F8E5M2 || (type == GGML_TYPE_Q2_0 && !q2_0_g64)) {
