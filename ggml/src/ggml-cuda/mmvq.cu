@@ -963,7 +963,17 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool q2_0_g64 = false, bool is_moe = false, bool field_act = false>
+// [TAG_MMVQ_MTAB] per-launch matrix table; empty (no data) for every ordinary launch.
+template <bool enabled> struct mmvq_mtab_args {};
+template <> struct mmvq_mtab_args<true> {
+    const void * vx[MMVQ_MTAB_MAX];
+    float      * dst[MMVQ_MTAB_MAX];
+    uint32_t     nrows[MMVQ_MTAB_MAX];
+    uint32_t     blk0[MMVQ_MTAB_MAX];   // first blockIdx.x of each matrix (blk0[0] == 0, ascending)
+    uint32_t     n;
+};
+
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool q2_0_g64 = false, bool is_moe = false, bool field_act = false, bool mtab = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), q2_0_g64, is_moe)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -971,11 +981,29 @@ static __global__ void mul_mat_vec_q(
         const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
-        const uint32_t ids_stride, const uint32_t nrows_dst) {
-    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+        const uint32_t ids_stride, const uint32_t nrows_dst_arg, const mmvq_mtab_args<mtab> tab) {
+    const void * vx_sel    = vx_ptr;
+    float      * dst_sel   = dst_ptr;
+    uint32_t     nrows_dst = nrows_dst_arg;
+    uint32_t     blk       = blockIdx.x;
+    if constexpr (mtab) {   // [TAG_MMVQ_MTAB] pick this block's matrix (uniform per block)
+        static_assert(ncols_dst == 1 && !has_fusion && !is_moe, "mtab: single-token, unfused, dense only");
+#pragma unroll
+        for (int k = 1; k < MMVQ_MTAB_MAX; ++k) {
+            if (k < (int) tab.n && blockIdx.x >= tab.blk0[k]) {
+                vx_sel    = tab.vx[k];
+                dst_sel   = tab.dst[k];
+                nrows_dst = tab.nrows[k];
+                blk       = blockIdx.x - tab.blk0[k];
+            }
+        }
+    } else {
+        GGML_UNUSED(tab);
+    }
+    const void    * GGML_CUDA_RESTRICT vx  = vx_sel;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
-    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
+    float         * GGML_CUDA_RESTRICT dst = dst_sel;
 
     constexpr int qk  = mmvq_q2_0_qk<type, q2_0_g64>();
     constexpr int qi  = mmvq_q2_0_qi<type, q2_0_g64>();
@@ -988,7 +1016,7 @@ static __global__ void mul_mat_vec_q(
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = mmvq_q2_0_vec_dot<type, q2_0_g64, field_act>();
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
-    const     int row0 = rows_per_cuda_block*blockIdx.x;
+    const     int row0 = rows_per_cuda_block*blk;
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
@@ -1324,7 +1352,7 @@ static void mul_mat_vec_q_switch_fusion(
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, q2_0_g64, is_moe, field_act>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_dst);
+                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_dst, mmvq_mtab_args<false>{});
             return;
         }
     }
@@ -1335,7 +1363,7 @@ static void mul_mat_vec_q_switch_fusion(
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, q2_0_g64, is_moe, field_act>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_dst);
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_dst, mmvq_mtab_args<false>{});
 }
 
 template <ggml_type type>
@@ -1772,9 +1800,81 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// [TAG_MMVQ_MTAB] T395: instantiated for the low-bit decode types only (bounds compile time).
+bool ggml_cuda_mmvq_mtab_supported(enum ggml_type type) {
+    return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q2_0;
+}
+
+template <ggml_type type, bool field_act>
+static void mul_mat_vec_q_mtab_launch_t(
+        const mmvq_mtab_args<true> & tab, const uint32_t nblocks, const void * vy, const int ncols_x,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst, cudaStream_t stream) {
+    const int device    = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const mmvq_parameter_table_id table_id = get_device_table_id(ggml_cuda_info().devices[device].cc);
+    const int nwarps = calc_nwarps(type, 1, table_id, false, false);
+    const dim3 block_nums(nblocks, 1, 1);
+    const dim3 block_dims(warp_size, nwarps, 1);
+    // the same scalar arguments as the ordinary single-token, single-channel launch
+    const uint3 one_fd = init_fastdiv_values(1);
+    const ggml_cuda_mm_fusion_args_device no_fusion{};
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, 1, false, false, false, false, field_act, true>, launch_params,
+        tab.vx[0], vy, (const int32_t *) nullptr, no_fusion, tab.dst[0], (uint32_t) ncols_x, make_uint3(0, 0, 0),
+        (uint32_t) stride_row_x, (uint32_t) stride_col_y, (uint32_t) stride_col_dst, one_fd, 0u, 0u, 0u, one_fd, 0u, 0u, 0u,
+        0u, tab.nrows[0], tab);
+}
+
+static void mul_mat_vec_q_mtab_launch(
+        ggml_backend_cuda_context & ctx, const ggml_cuda_mmvq_mtab_host & mt, const void * vy, const bool field_act,
+        const int stride_col_y, cudaStream_t stream) {
+    const ggml_tensor * w0 = mt.src0[0];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const mmvq_parameter_table_id table_id = get_device_table_id(cc);
+    int rpb = 0;
+    switch (w0->type) {
+        case GGML_TYPE_Q1_0: rpb = calc_rows_per_block(GGML_TYPE_Q1_0, 1, table_id, false, calc_nwarps(GGML_TYPE_Q1_0, 1, table_id, false, false), false, false); break;
+        case GGML_TYPE_Q2_0: rpb = calc_rows_per_block(GGML_TYPE_Q2_0, 1, table_id, false, calc_nwarps(GGML_TYPE_Q2_0, 1, table_id, false, false), false, false); break;
+        default: GGML_ABORT("mtab: unsupported type %s", ggml_type_name(w0->type));
+    }
+    GGML_ASSERT(mt.n >= 2 && mt.n <= MMVQ_MTAB_MAX);
+    mmvq_mtab_args<true> tab{};
+    uint32_t nblocks = 0;
+    for (int k = 0; k < mt.n; ++k) {
+        const ggml_tensor * w = mt.src0[k];
+        GGML_ASSERT(w->type == w0->type && w->ne[0] == w0->ne[0] && w->nb[1] == w0->nb[1]);
+        GGML_ASSERT(mt.dst[k]->ne[0] == w->ne[1] && ggml_is_contiguous(mt.dst[k]));
+        tab.vx[k]    = w->data;
+        tab.dst[k]   = (float *) mt.dst[k]->data;
+        tab.nrows[k] = (uint32_t) w->ne[1];
+        tab.blk0[k]  = nblocks;
+        nblocks += (uint32_t) ((w->ne[1] + rpb - 1) / rpb);
+    }
+    tab.n = (uint32_t) mt.n;
+    const int ncols_x        = (int) w0->ne[0];
+    const int stride_row_x   = (int) (w0->nb[1] / ggml_cuda_q2_0_type_size(w0));
+    const int stride_col_dst = (int) (mt.dst[0]->nb[1] / sizeof(float));
+    switch (w0->type) {
+        case GGML_TYPE_Q1_0:
+#if GGML_CUDA_FIELD_ACT
+            if (field_act) { mul_mat_vec_q_mtab_launch_t<GGML_TYPE_Q1_0, true>(tab, nblocks, vy, ncols_x, stride_row_x, stride_col_y, stride_col_dst, stream); break; }
+#endif // GGML_CUDA_FIELD_ACT
+            mul_mat_vec_q_mtab_launch_t<GGML_TYPE_Q1_0, false>(tab, nblocks, vy, ncols_x, stride_row_x, stride_col_y, stride_col_dst, stream);
+            break;
+        case GGML_TYPE_Q2_0:
+#if GGML_CUDA_FIELD_ACT
+            if (field_act) { mul_mat_vec_q_mtab_launch_t<GGML_TYPE_Q2_0, true>(tab, nblocks, vy, ncols_x, stride_row_x, stride_col_y, stride_col_dst, stream); break; }
+#endif // GGML_CUDA_FIELD_ACT
+            mul_mat_vec_q_mtab_launch_t<GGML_TYPE_Q2_0, false>(tab, nblocks, vy, ncols_x, stride_row_x, stride_col_y, stride_col_dst, stream);
+            break;
+        default:
+            GGML_ABORT("mtab: unsupported type");
+    }
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion) {
+        const ggml_cuda_mm_fusion_args_host * fusion, const ggml_cuda_mmvq_mtab_host * mtab) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -1956,6 +2056,14 @@ void ggml_cuda_mul_mat_vec_q(
 
     const void * vy_ptr = dedup_quant ? (const void *) ctx.mmvq_quant_cache_buf->get()
                                       : (const void *) src1_q8_1.get();
+
+    if (mtab) {   // [TAG_MMVQ_MTAB] one launch for all matrices of the group (src0/dst are entry 0)
+        GGML_ASSERT(!ids && !fusion && mtab->src0[0] == src0 && mtab->dst[0] == dst);
+        GGML_ASSERT(ne11 == 1 && ne12 == 1 && ne13 == 1 && ne02 == 1 && ne03 == 1);
+        GGML_ASSERT(!ggml_cuda_q2_0_is_g64(src0));
+        mul_mat_vec_q_mtab_launch(ctx, *mtab, vy_ptr, q2_field_act || q1_field_act, (int) s11, stream);
+        return;
+    }
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, vy_ptr, ids_d, fusion_local, dst_d, ne00,
