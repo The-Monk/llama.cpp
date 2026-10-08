@@ -26,15 +26,15 @@ static bool gdn_layer_on_cuda_like(const llama_model & model, int il) {
     return reg != nullptr && (strcmp(reg, "ROCm") == 0 || strcmp(reg, "CUDA") == 0);
 }
 
-// [TAG_MMVQ_MTAB] T395: with GGML_GEMV_FUSE=1 the four GDN input projections (qkv, z,
+// [TAG_MMVQ_MTAB] T395: by default (GGML_GEMV_FUSE=0 disables) the four GDN input projections (qkv, z,
 // beta, alpha: all read attn_norm; GGML_GEMV_FUSE_GROUPS bit 1) and q/k/v (bit 2) are
 // pinned next to each other in single-token graphs, so the CUDA backend can run each
 // set as ONE matrix-table GEMV. Execution order only; every op and value is unchanged.
-// GGML_GEMV_FUSE unset/0 = graph untouched. GROUPS defaults to 3 (both).
+// GGML_GEMV_FUSE=0 = graph untouched. GROUPS defaults to 3 (both).
 static int qwen35_hfuse_mask() {
     static const int m = [] {
         const char * e = getenv("GGML_GEMV_FUSE");
-        if (e == nullptr || atoi(e) == 0) {
+        if (e != nullptr && atoi(e) == 0) {
             return 0;
         }
         const char * g = getenv("GGML_GEMV_FUSE_GROUPS");

@@ -4102,7 +4102,7 @@ static int ggml_cuda_find_mmvq_pair(const ggml_cgraph * cgraph, int i, int cc) {
     return -1;
 }
 
-// [TAG_MMVQ_MTAB] T395 horizontal GEMV fusion, env GGML_GEMV_FUSE=1 (default OFF).
+// [TAG_MMVQ_MTAB] T395 horizontal GEMV fusion, on by default (GGML_GEMV_FUSE=0 disables).
 // Collects a run of consecutive single-token MUL_MATs (views/no-ops may sit between
 // them) that read the SAME activation with the same weight type, K and row stride,
 // starting at node i, and returns its size (0 if < 2). Unlike MMVQ_PAIR (two weight
@@ -4114,7 +4114,7 @@ static int ggml_cuda_find_mmvq_pair(const ggml_cgraph * cgraph, int i, int cc) {
 static int ggml_cuda_find_mmvq_group(const ggml_cgraph * cgraph, int i, int cc, ggml_cuda_mmvq_mtab_host & g, int * idx) {
     static const bool enabled = [] {
         const char * e = getenv("GGML_GEMV_FUSE");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     static const bool trace = getenv("GGML_GEMV_FUSE_TRACE") != nullptr;
     if (!enabled || !GGML_CUDA_CC_IS_RDNA(cc)) {
