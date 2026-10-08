@@ -1728,8 +1728,8 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma(
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 }
 
-// [TAG_MMQ_SCALE_HOIST] (T379) Q1_0/Q2_0 only, AMD WMMA only, opt-in via
-// GGML_MMQ_SCALE_HOIST=1. vec_dot_q8_0_q8_1_mma above converts the int32
+// [TAG_MMQ_SCALE_HOIST] (T379) Q1_0/Q2_0 only, AMD WMMA only, on by default
+// (GGML_MMQ_SCALE_HOIST=0 opts out). vec_dot_q8_0_q8_1_mma above converts the int32
 // accumulator to float and applies dA*dB after EVERY K32 step. For g128 weights
 // dA is constant over the 128 values one call covers (k00 is 128-aligned and
 // load_tiles_q{1,2}_0 replicate the block scale into all 4 K32 slots), so if

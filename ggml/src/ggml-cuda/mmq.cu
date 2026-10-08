@@ -176,7 +176,7 @@ void ggml_cuda_mul_mat_q(
     // src1 quantized to native e5m2, not int8 Q8_1.
     const bool use_native_f8e5m2 = src0->type == GGML_TYPE_F8E5M2 || use_mixed_bf8_act;
 
-    // [TAG_MMQ_SCALE_HOIST] (T379) GGML_MMQ_SCALE_HOIST=1 (default OFF): Q1_0/Q2_0
+    // [TAG_MMQ_SCALE_HOIST] (T379) on by default, GGML_MMQ_SCALE_HOIST=0 opts out: Q1_0/Q2_0
     // dense MUL_MAT on AMD WMMA quantizes src1 with ONE scale per 128 values and
     // runs the hoisted kernel (int32 accumulate per 128, one float epilogue per
     // 128 instead of per 32). Changes activation quant granularity => not
@@ -187,7 +187,7 @@ void ggml_cuda_mul_mat_q(
 #ifndef GGML_CUDA_NO_MMQ_SCALE_HOIST
     static const bool g_mmq_scale_hoist = [] {
         const char * e = getenv("GGML_MMQ_SCALE_HOIST");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || std::string(e) != "0";
     }();
     const bool use_scale_hoist = g_mmq_scale_hoist && !ids && amd_wmma_available(cc) &&
         (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_Q2_0);
