@@ -4387,6 +4387,55 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// T362: several matmuls of MIXED weight types sharing ONE activation tensor,
+// computed as one graph so the backend's sibling activation-quant dedup cache
+// is live across them. Guards the invariant that an activation buffer
+// quantized in one layout (e.g. the field-ordered Q2_0 decode layout) is never
+// consumed by a kernel expecting another (natural q8_1), in either order.
+// Every product feeds the summed output, so one mis-read sibling fails it.
+struct test_mul_mat_siblings : public test_case {
+    const std::vector<ggml_type> types_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        std::string t;
+        for (ggml_type ta : types_a) {
+            t += (t.empty() ? "" : "+") + std::string(ggml_type_name(ta));
+        }
+        return "types_a=" + t + "," + VARS_TO_STR3(m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_siblings(std::vector<ggml_type> types_a, int64_t m, int64_t n, int64_t k)
+        : types_a(std::move(types_a)), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * out = nullptr;
+        for (size_t i = 0; i < types_a.size(); ++i) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, types_a[i], k, m);
+            ggml_set_name(a, ("a" + std::to_string(i)).c_str());
+            ggml_tensor * c = ggml_mul_mat(ctx, a, b);
+            out = out ? ggml_add(ctx, out, c) : c;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -8873,6 +8922,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 1));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 128, 4));
+
+    // T362: mixed-type siblings sharing one activation (dedup-cache layout keying)
+    for (int64_t n : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_siblings({GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0, GGML_TYPE_Q2_0,
+                                                           GGML_TYPE_Q8_0, GGML_TYPE_Q1_0, GGML_TYPE_Q2_0}, 64, n, 512));
+        test_cases.emplace_back(new test_mul_mat_siblings({GGML_TYPE_Q4_0, GGML_TYPE_Q2_0, GGML_TYPE_Q1_0, GGML_TYPE_Q2_0,
+                                                           GGML_TYPE_Q4_0}, 67, n, 1024));
+    }
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
