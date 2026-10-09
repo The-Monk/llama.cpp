@@ -5698,6 +5698,27 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    {
+        // T418 diagnostic: eager / capture / replay counts per graph compute (zero cost unless set)
+        static const bool graph_stats = getenv("GGML_HIP_GRAPH_STATS") != nullptr;
+        if (graph_stats) {
+            static long long n_eager = 0, n_capture = 0, n_replay = 0;
+            static std::map<const void *, int> keys;
+            keys[graph_key]++;
+            if (!use_cuda_graph) {
+                n_eager++;
+            } else if (cuda_graph_update_required) {
+                n_capture++;
+            } else {
+                n_replay++;
+            }
+            if ((n_eager + n_capture + n_replay) % 200 == 0) {
+                fprintf(stderr, "[GRAPH_STATS] computes=%lld eager=%lld capture=%lld replay=%lld keys=%zu last_nodes=%d\n",
+                        n_eager + n_capture + n_replay, n_eager, n_capture, n_replay, keys.size(), cgraph->n_nodes);
+            }
+        }
+    }
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -6728,6 +6749,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SUM:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_TOP_K:
+#if defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
+            return true; // T418: HIP radix-select path for rows wider than 1024 (top-k.cu)
+#else
+            return op->src[0]->ne[0] <= 1024;
+#endif // defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
         case GGML_OP_ARGSORT:
 #ifndef GGML_CUDA_USE_CUB
             return op->src[0]->ne[0] <= 1024;
