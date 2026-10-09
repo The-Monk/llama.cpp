@@ -2027,6 +2027,19 @@ struct ggml_backend_cuda_context {
     void * mmvq_quant_cache_fn = nullptr;
     size_t mmvq_quant_cache_bytes = 0;
 
+    // [TAG_ACT_FUSE] T407 (act-fuse.cuh): one MMQ activation buffer keyed on the
+    // src1 tensor + q8_1 layout + size. Reset every graph_compute and dropped
+    // whenever a node writes memory overlapping the key tensor (ggml-cuda.cu).
+    // act_pending: a GLU whose fp32 output was NOT written (its consumer must
+    // take the cache); materialized on demand if anything else needs it.
+    const ggml_tensor * act_cache_tensor = nullptr;
+    std::unique_ptr<ggml_cuda_pool_alloc<char>> act_cache_buf;
+    int    act_cache_layout = -1;
+    size_t act_cache_bytes  = 0;
+    const ggml_tensor * act_pending = nullptr;
+    int64_t act_stat_hit = 0, act_stat_miss = 0, act_stat_glu = 0, act_stat_norm = 0, act_stat_norm_add = 0;
+    int64_t act_stat_verify_bytes = 0, act_stat_verify_diff = 0;
+
     static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(int device, int stream_no);
 
     ggml_cuda_pool & pool(int device) {

@@ -2,6 +2,8 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "act-fuse.cuh"
+#include "mmvq.cuh"
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
@@ -87,6 +89,48 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             GGML_ABORT("fatal error");
             break;
     }
+}
+
+// [TAG_ACT_FUSE] T407: the q8_1 layout ggml_cuda_mul_mat_q (!ids) quantizes
+// src1 into for this src0, or -1 for the fp4/fp8 activation producers. Must
+// match the selection below (same env reads, same order).
+int ggml_cuda_mmq_act_layout(const ggml_tensor * src0, const int cc) {
+    if (!ggml_is_quantized(src0->type)) {
+        return -1;
+    }
+    if (blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4)) {
+        return -1;
+    }
+    if (src0->type == GGML_TYPE_F8E4M3 || src0->type == GGML_TYPE_MXFP8 || src0->type == GGML_TYPE_MXFP6 ||
+        src0->type == GGML_TYPE_F8E5M2) {
+        return -1;
+    }
+#ifndef GGML_CUDA_NO_MMQ_SCALE_HOIST
+    static const bool hoist = [] {
+        const char * e = getenv("GGML_MMQ_SCALE_HOIST");
+        return e == nullptr || std::string(e) != "0";
+    }();
+    if (hoist && amd_wmma_available(cc) && (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_Q2_0)) {
+        return (int) MMQ_Q8_1_DS_LAYOUT_D128;
+    }
+#endif // GGML_CUDA_NO_MMQ_SCALE_HOIST
+    switch (src0->type) {
+        case GGML_TYPE_Q1_0: case GGML_TYPE_Q2_0: case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1: case GGML_TYPE_Q8_0: case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4: case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ4_NL:
+            return (int) mmq_get_q8_1_ds_layout(src0->type);
+        default:
+            return -1;
+    }
+}
+
+size_t ggml_cuda_mmq_act_bytes(const ggml_tensor * src1, const int cc) {
+    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    return src1->ne[3]*src1->ne[2] * src1->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1 +
+        get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
 }
 
 void ggml_cuda_mul_mat_q(
@@ -198,28 +242,57 @@ void ggml_cuda_mul_mat_q(
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
             get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
 
-        {
+        // [TAG_ACT_FUSE] T407: the q8_1 producers (D4/DS4/D2S6/D128) go through
+        // the shared activation cache when act-fuse is on. A hit needs the same
+        // src1 tensor, layout and size, i.e. the bytes this call would write.
+        const int  act_layout = ggml_cuda_act_fuse_mask() && !use_native_fp4 && !use_native_f8e4m3 && !use_native_f8e5m2 ?
+            (use_scale_hoist ? (int) MMQ_Q8_1_DS_LAYOUT_D128 : (int) mmq_get_q8_1_ds_layout(src0->type)) : -1;
+        // Entries written by a fused producer (GLU / norm) are consumed even
+        // with the dedup bit off; only DEDUP makes a miss populate the cache.
+        const bool act_ok     = act_layout >= 0 && ne11 > MMVQ_MAX_BATCH_SIZE;
+        const bool act_hit    = act_ok && ctx.act_cache_tensor == src1 && ctx.act_cache_buf &&
+            ctx.act_cache_layout == act_layout && ctx.act_cache_bytes == nbytes_src1_q8_1;
+        const bool act_cache  = act_hit || (act_ok && (ggml_cuda_act_fuse_mask() & GGML_ACT_FUSE_DEDUP));
+        if (ctx.act_pending == src1) {
+            // A GLU skipped its fp32 store for this consumer: the cache must hit.
+            GGML_ASSERT(act_hit && "act-fuse: pending GLU consumer missed the cache");
+            ctx.act_pending = nullptr;
+        }
+        if (act_cache) {
+            act_hit ? ctx.act_stat_hit++ : ctx.act_stat_miss++;
+        }
+
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), act_cache ? 0 : nbytes_src1_q8_1);
+        if (act_cache && !act_hit) {
+            ctx.act_cache_buf.reset();
+            ctx.act_cache_buf    = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes_src1_q8_1);
+            ctx.act_cache_tensor = src1;
+            ctx.act_cache_layout = act_layout;
+            ctx.act_cache_bytes  = nbytes_src1_q8_1;
+        }
+        char * src1_q8_1_ptr = act_cache ? ctx.act_cache_buf->get() : src1_q8_1.get();
+
+        if (!act_hit) {
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
             if (use_native_fp4) {
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
             } else if (use_native_f8e4m3) {
-                quantize_mmq_f8e4m3_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_f8e4m3_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             } else if (use_native_f8e5m2) {
-                quantize_mmq_f8e5m2_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_f8e5m2_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             } else if (use_scale_hoist) {
-                quantize_mmq_q8_1_d128_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_d128_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
@@ -232,7 +305,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) src1_q8_1_ptr, nullptr, nullptr, dst_d,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
