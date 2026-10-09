@@ -368,6 +368,11 @@ bool convert(const ggml_tensor * src0, int mode, n1_w & c) {
 
 // T400 N4: native dual-blob weight (loader view over GGML_TYPE_NK_*_W2) -> W2 region + companion sw, in place
 bool nk_dual_weight(const ggml_tensor * src0, const void ** w, const void ** sw) {
+    if (src0->type == GGML_TYPE_NK_Q2_0_W2ONLY) {   // T399 single copy: W2 stream, then sw[K/128][F]
+        *w  = src0->data;
+        *sw = (const char *) src0->data + (size_t) src0->ne[1] * src0->ne[0] / 4;
+        return true;
+    }
     const ggml_tensor * d = src0->view_src;
     if (!d || src0->view_offs != 0 || (d->type != GGML_TYPE_NK_Q2_0_W2 && d->type != GGML_TYPE_NK_Q1_0_W2)) return false;
     const ggml_tensor * comp = (const ggml_tensor *) d->extra;
@@ -426,6 +431,9 @@ bool n1_shape_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_
 }
 
 bool n1_use_row(const ggml_tensor * src0) {
+    if (src0->type == GGML_TYPE_NK_Q2_0_W2ONLY) {
+        return false;   // T399: no compact blocks to fold from
+    }
     return env().row_all || (env().row_ffn && strstr(src0->name, "ffn_") != nullptr);
 }
 
@@ -447,12 +455,28 @@ void ggml_cuda_n1_count(const ggml_tensor * src0, const ggml_tensor * src1) {
     if (src1->ne[1] < env().min_n) return;
     const uint64_t fl = mm_flops(src0, src1);
     g_stats.mm_total++; g_stats.fl_total += fl;
-    if (src0->type == GGML_TYPE_Q2_0 || src0->type == GGML_TYPE_Q1_0) { g_stats.mm_q++; g_stats.fl_q += fl; }
+    if (src0->type == GGML_TYPE_Q2_0 || src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NK_Q2_0_W2ONLY) {
+        g_stats.mm_q++; g_stats.fl_q += fl;
+    }
 }
+
+static bool n1_mul_mat_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
 bool ggml_cuda_n1_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     if (src0->type != GGML_TYPE_Q2_0 && src0->type != GGML_TYPE_Q1_0) return false;
     if (src1->ne[1] < env().min_n) return false;
+    return n1_mul_mat_impl(ctx, src0, src1, dst);
+}
+
+// T399: single-copy weights have no other path; the caller (mul_mat_sc.cu) decides the batch threshold and N1 runs
+// regardless of GGML_N1_PREFILL / GGML_N1_MIN_N
+bool ggml_cuda_n1_mul_mat_w2only(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0->type == GGML_TYPE_NK_Q2_0_W2ONLY);
+    ggml_cuda_n1_count(src0, src1);
+    return n1_mul_mat_impl(ctx, src0, src1, dst);
+}
+
+static bool n1_mul_mat_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const uint64_t fl = mm_flops(src0, src1);
     if (!n1_shape_ok(src0, src1, dst)) {
         g_stats.fb_shape++; g_stats.fl_fb_shape += fl;
@@ -589,6 +613,7 @@ void ggml_cuda_n1_act_ref_quant(const float * x, int64_t s11, int64_t K, int64_t
 bool ggml_cuda_n1_enabled() { return false; }
 void ggml_cuda_n1_count(const ggml_tensor *, const ggml_tensor *) {}
 bool ggml_cuda_n1_mul_mat(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { return false; }
+bool ggml_cuda_n1_mul_mat_w2only(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { return false; }
 int ggml_cuda_n1_act_route(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return 0; }
 size_t ggml_cuda_n1_act_bytes(const ggml_tensor *) { return 0; }
 void ggml_cuda_n1_act_ref_quant(const float *, int64_t, int64_t, int64_t, void *, cudaStream_t) {}

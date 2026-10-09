@@ -481,6 +481,52 @@ void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+// T399 single-copy layout (GGML_TYPE_NK_Q2_0_W2ONLY): ENC_W2 stream (native-kernels dense_wmma/LAYOUT.md section 3)
+// then fp16 sw[K/128][F]. Weight (row, k): tile = row/128, r = row%128, d = (r/16)/2, r2 = (r/16)%2, l16 = r%16;
+// s = k/128, kb = (k%128)/32, h = (k%32)/16, e = k%16; t = l16 + 16h + 32kb + 128r2;
+// u32 word ((tile*S + s)*256 + t)*4 + d, code (0..3, value code-1) at bit 8*(e%4) + 2*(e/4).
+static inline size_t nk_w2_word(int64_t S, int64_t row, int64_t k, int * shift) {
+    const int64_t tile = row / 128, r = row % 128, d = (r / 16) / 2, r2 = (r / 16) % 2, l16 = r % 16;
+    const int64_t s = k / 128, kb = (k % 128) / 32, h = (k % 32) / 16, e = k % 16;
+    const int64_t t = l16 + 16 * h + 32 * kb + 128 * r2;
+    *shift = (int) (8 * (e % 4) + 2 * (e / 4));
+    return (size_t) (((tile * S + s) * 256 + t) * 4 + d);
+}
+
+void ggml_nk_w2only_from_q2_0(const void * src, void * dst, int64_t F, int64_t K) {
+    GGML_ASSERT(F % 128 == 0 && K % 128 == 0);
+    const int64_t S = K / 128;
+    const block_q2_0 * x = (const block_q2_0 *) src;
+    uint32_t * w  = (uint32_t *) dst;
+    ggml_half * sw = (ggml_half *) ((char *) dst + (size_t) F * K / 4);
+    memset(w, 0, (size_t) F * K / 4);
+    for (int64_t row = 0; row < F; ++row) {
+        for (int64_t s = 0; s < S; ++s) {
+            const block_q2_0 * b = x + row * S + s;
+            sw[s * F + row] = b->d;
+            for (int j = 0; j < 128; ++j) {
+                int sh;
+                const size_t wi = nk_w2_word(S, row, s * 128 + j, &sh);
+                w[wi] |= (uint32_t) ((b->qs[j / 4] >> (2 * (j % 4))) & 3) << sh;
+            }
+        }
+    }
+}
+
+void ggml_nk_w2only_dequant_row(const void * data, int64_t F, int64_t K, int64_t row, float * y) {
+    const int64_t S = K / 128;
+    const uint32_t * w  = (const uint32_t *) data;
+    const ggml_half * sw = (const ggml_half *) ((const char *) data + (size_t) F * K / 4);
+    for (int64_t s = 0; s < S; ++s) {
+        const float d = GGML_FP16_TO_FP32(sw[s * F + row]);
+        for (int j = 0; j < 128; ++j) {
+            int sh;
+            const size_t wi = nk_w2_word(S, row, s * 128 + j, &sh);
+            y[s * 128 + j] = ((int) ((w[wi] >> sh) & 3) - 1) * d;
+        }
+    }
+}
+
 void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_0;
 
@@ -6204,6 +6250,11 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 const size_t nbc = nb;
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q1_0, data, nbc);
+            } break;
+        case GGML_TYPE_NK_Q2_0_W2ONLY:
+            {
+                // T399: row data is not addressable (whole-tensor tile layout); the W2 stream has no invalid
+                // encodings and the fp16 scales are checked through the companion fingerprint at load
             } break;
         case GGML_TYPE_NVFP4:
             {

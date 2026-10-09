@@ -444,7 +444,12 @@ extern "C" {
         // compact region to the model as an ordinary Q2_0/Q1_0 view; only the N1 prefill path reads the W2 region.
         GGML_TYPE_NK_Q2_0_W2 = 52, // 34 + 32 = 66 B per 128 weights
         GGML_TYPE_NK_Q1_0_W2 = 53, // 18 + 32 = 50 B per 128 weights (N4 addition to CONTRACT v1 section 3.2)
-        GGML_TYPE_COUNT   = 54,
+        // T399 single-copy (CONTRACT section 3.2, v1.1): ONE region per tensor, no compact copy. Data = the ENC_W2 tile
+        // stream (F*K/4 bytes) followed by fp16 sw[K/128][F] (F*K/64 bytes) = 34 B per 128 weights = Q2_0's bytes.
+        // F % 128 == 0, K % 128 == 0. Rows are NOT individually addressable: only MUL_MAT reads it (ggml-cuda: decode
+        // GEMV / small-batch WMMA / N1 prefill in place; ggml-cpu: a reference path). Companion "<name>.nk" = header only.
+        GGML_TYPE_NK_Q2_0_W2ONLY = 54, // 32 + 2 = 34 B per 128 weights
+        GGML_TYPE_COUNT   = 55,
     };
 
     // precision
@@ -865,6 +870,11 @@ extern "C" {
     GGML_API size_t ggml_tensor_overhead(void);
 
     GGML_API bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbytes);
+
+    // T399 GGML_TYPE_NK_Q2_0_W2ONLY host helpers (whole tensor, F % 128 == 0, K % 128 == 0):
+    // compact g128 Q2_0 blocks [F][K/128] -> single-copy data (F*K/128*34 bytes), and one row back to fp32.
+    GGML_API void ggml_nk_w2only_from_q2_0(const void * src, void * dst, int64_t F, int64_t K);
+    GGML_API void ggml_nk_w2only_dequant_row(const void * data, int64_t F, int64_t K, int64_t row, float * y);
 
     // main
 

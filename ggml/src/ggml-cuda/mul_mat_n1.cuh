@@ -13,6 +13,10 @@ void ggml_cuda_n1_count(const ggml_tensor * src0, const ggml_tensor * src1);
 // Returns true if N1 computed dst; false = caller falls through to the default path (fallback is counted).
 bool ggml_cuda_n1_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
+// T399: N1 on a single-copy (GGML_TYPE_NK_Q2_0_W2ONLY) weight read in place, any batch; ignores GGML_N1_PREFILL and
+// GGML_N1_MIN_N (the weight has no other path). Returns false only for an unsupported shape.
+bool ggml_cuda_n1_mul_mat_w2only(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
 // [TAG_ACT_FUSE] T412: routing probe for the activation-fusion producers (act-fuse.cuh).
 //   0 = N1 does not take this MUL_MAT (the default route decides)
 //   1 = N1 takes it and reads the N1 activation layout from the act cache (GGML_CUDA_ACT_LAYOUT_N1)

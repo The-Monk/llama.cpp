@@ -2,6 +2,7 @@
 
 #include "act-fuse.cuh"
 #include "n1_act.cuh"
+#include "sc_act.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -161,6 +162,10 @@ void ggml_cuda_act_glu_quant(const float * gate, const float * up, int64_t nc, i
             GGML_ASSERT(nc % 128 == 0);
             act_glu_quant_launch(gate, up, nc, nrows, s_gate, s_up, ne0_padded, n1_act_store_make(y, nc, nrows), stream);
             break;
+        case GGML_CUDA_ACT_LAYOUT_SC:
+            GGML_ASSERT(nc % 128 == 0);
+            act_glu_quant_launch(gate, up, nc, nrows, s_gate, s_up, ne0_padded, sc_act_store_make(y, nc, nrows), stream);
+            break;
         default:
             GGML_ABORT("act-fuse: unsupported layout");
     }
@@ -271,6 +276,12 @@ bool ggml_cuda_act_norm_quant(const float * a, const float * add_b, float * dst_
                 return false;
             }
             act_norm_quant_launch(a, add_b, dst_add, dst_mul, w, ncols, nrows, s_a, s_b, eps, ne0_padded, n1_act_store_make(y, ncols, nrows), stream);
+            return true;
+        case GGML_CUDA_ACT_LAYOUT_SC:
+            if (ncols % 128 != 0) {
+                return false;
+            }
+            act_norm_quant_launch(a, add_b, dst_add, dst_mul, w, ncols, nrows, s_a, s_b, eps, ne0_padded, sc_act_store_make(y, ncols, nrows), stream);
             return true;
         default:
             return false;

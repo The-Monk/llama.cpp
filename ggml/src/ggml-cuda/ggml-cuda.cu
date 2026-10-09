@@ -92,6 +92,7 @@
 #include "ggml-cuda/mmvq_coop_q2_0.cuh"
 #include "ggml-cuda/mul_mat_q2_0_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_n1.cuh"
+#include "ggml-cuda/mul_mat_sc.cuh"
 #include "ggml-cuda/mul_mat_q1_0_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_q4_K_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_q2_K_hipblaslt.cuh"
@@ -1884,7 +1885,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     // (mul_mat_2of4_fp8.cu / mul_mat_iu4.cu) hooked only at the top of the
     // normal, unfused ggml_cuda_mul_mat(). Refuse fusion so those nodes take
     // that path.
-    if (src0->type == GGML_TYPE_2OF4_FP8 || src0->type == GGML_TYPE_2OF4_F16 || src0->type == GGML_TYPE_IU4) {
+    if (src0->type == GGML_TYPE_2OF4_FP8 || src0->type == GGML_TYPE_2OF4_F16 || src0->type == GGML_TYPE_IU4 ||
+        src0->type == GGML_TYPE_NK_Q2_0_W2ONLY) {
         return false;
     }
 
@@ -1921,6 +1923,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
+        return;
+    }
+    // T399 single-copy weights: everything runs in mul_mat_sc.cu (the graph evaluator groups same-input siblings)
+    if (src0->type == GGML_TYPE_NK_Q2_0_W2ONLY) {
+        ggml_cuda_sc_mul_mat(ctx, &dst, 1);
         return;
     }
     // N1 (T404, default on since T412; GGML_N1_PREFILL=0 disables): Q2_0/Q1_0 prefill MUL_MATs (batch >= 64) on the
@@ -4186,6 +4193,57 @@ static int ggml_cuda_find_mmvq_group(const ggml_cgraph * cgraph, int i, int cc, 
     return g.n;
 }
 
+// T399: run of consecutive MUL_MATs on single-copy (W2ONLY) weights that read the SAME activation with equal K,
+// starting at node i, up to SC_MAX_GROUP (views/no-ops may sit between them). Returns the run length (>= 1).
+// Same safety argument as T395: nothing runs between the members. Batches above the grouped kernels' range
+// (N1) are launched one matrix at a time inside ggml_cuda_sc_mul_mat.
+static int ggml_cuda_find_sc_group(const ggml_cgraph * cgraph, int i, ggml_tensor ** grp, int * idx) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_GEMV_FUSE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    static const bool trace = getenv("GGML_GEMV_FUSE_TRACE") != nullptr;
+    ggml_tensor * a = cgraph->nodes[i];
+    grp[0] = a; idx[0] = i;
+    const ggml_tensor * act = a->src[1];
+    if (!enabled || act->ne[1] * act->ne[2] * act->ne[3] > ggml_cuda_sc_group_max_n()) {
+        return 1;
+    }
+    int n = 1;
+    for (int j = i + 1; j < cgraph->n_nodes && n < SC_MAX_GROUP; ++j) {
+        ggml_tensor * b = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(b)) {
+            continue;
+        }
+        if ((b->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || b->op != GGML_OP_MUL_MAT || b->src[1] != act ||
+            b->src[2] != nullptr || b->src[0]->type != GGML_TYPE_NK_Q2_0_W2ONLY || b->src[0]->ne[0] != a->src[0]->ne[0]) {
+            break;
+        }
+        grp[n] = b; idx[n] = j; n++;
+    }
+    auto overlaps = [](const ggml_tensor * x, const ggml_tensor * y) {
+        if (!x || !y || !x->data || !y->data) return true;
+        const char * xs = (const char *) x->data;
+        const char * ys = (const char *) y->data;
+        return xs < ys + ggml_nbytes(y) && ys < xs + ggml_nbytes(x);
+    };
+    for (int k = 0; k < n; ++k) {
+        bool bad = overlaps(grp[k], act);
+        for (int l = 0; l < n && !bad; ++l) {
+            bad = overlaps(grp[k], grp[l]->src[0]) || (l != k && overlaps(grp[k], grp[l]));
+        }
+        if (bad) {
+            return 1;
+        }
+    }
+    if (trace && n > 1) {
+        fprintf(stderr, "SC_GROUP n=%d N=%lld", n, (long long) (act->ne[1] * act->ne[2] * act->ne[3]));
+        for (int k = 0; k < n; ++k) fprintf(stderr, " %s[%lld]", grp[k]->src[0]->name, (long long) grp[k]->src[0]->ne[1]);
+        fprintf(stderr, "\n");
+    }
+    return n;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4979,6 +5037,9 @@ static int ggml_cuda_act_consumer_layout(const ggml_tensor * mm, const int cc) {
     }
     const ggml_tensor * src0 = mm->src[0];
     const ggml_tensor * src1 = mm->src[1];
+    if (src0->type == GGML_TYPE_NK_Q2_0_W2ONLY) {
+        return ggml_cuda_sc_act_layout(mm);   // T399: SC layout below the N1 threshold, N1 layout above
+    }
     if (src0->type != GGML_TYPE_Q1_0 && src0->type != GGML_TYPE_Q2_0) {
         return -1;
     }
@@ -5039,7 +5100,8 @@ static void ggml_cuda_act_note_write(ggml_backend_cuda_context * ctx, const ggml
 }
 
 static void ggml_cuda_act_cache_set(ggml_backend_cuda_context * ctx, const ggml_tensor * t, int layout, int cc) {
-    const size_t bytes = layout == GGML_CUDA_ACT_LAYOUT_N1 ? ggml_cuda_n1_act_bytes(t) : ggml_cuda_mmq_act_bytes(t, cc);
+    const size_t bytes = layout == GGML_CUDA_ACT_LAYOUT_N1 ? ggml_cuda_n1_act_bytes(t) :
+                         layout == GGML_CUDA_ACT_LAYOUT_SC ? ggml_cuda_sc_act_bytes(t) : ggml_cuda_mmq_act_bytes(t, cc);
     ctx->act_cache_buf.reset();
     ctx->act_cache_buf    = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx->pool(), bytes);
     ctx->act_cache_tensor = t;
@@ -5053,6 +5115,10 @@ static void ggml_cuda_act_cache_set(ggml_backend_cuda_context * ctx, const ggml_
         CUDA_CHECK(cudaMemsetAsync(y + (size_t) (Npad - 128) * K, 0, (size_t) 128 * K, ctx->stream()));
         CUDA_CHECK(cudaMemsetAsync(y + (size_t) Npad * K, 0, bytes - (size_t) Npad * K, ctx->stream()));
     }
+    if (layout == GGML_CUDA_ACT_LAYOUT_SC && ggml_nrows(t) > 7 && ggml_nrows(t) % 16 != 0) {
+        // T399: the WMMA path reads padded tokens N..NP-1, which producers never write (k_sc_quant zeroes them)
+        CUDA_CHECK(cudaMemsetAsync(ctx->act_cache_buf->get(), 0, bytes, ctx->stream()));
+    }
 }
 
 // Reference q8_1 bytes for an fp32 activation (the unfused quantize launch).
@@ -5061,6 +5127,8 @@ static void ggml_cuda_act_ref_quant(const ggml_tensor * src0, const float * x, i
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     if (layout == GGML_CUDA_ACT_LAYOUT_N1) {
         ggml_cuda_n1_act_ref_quant(x, s11, ne10, ne11, y, stream);
+    } else if (layout == GGML_CUDA_ACT_LAYOUT_SC) {
+        ggml_cuda_sc_act_ref_quant(x, s11, ne10, ne11, y, stream);
     } else if (layout == (int) MMQ_Q8_1_DS_LAYOUT_D128) {
         quantize_mmq_q8_1_d128_cuda(x, nullptr, y, src0->type, ne10, s11, s11*ne11, s11*ne11, ne10_padded, ne11, 1, 1, stream);
     } else {
@@ -5076,7 +5144,7 @@ static void ggml_cuda_act_verify(ggml_backend_cuda_context * ctx, const ggml_ten
     CUDA_CHECK(cudaMemsetAsync(ref.get(), 0, bytes, ctx->stream()));
     // compare only the quantized activation, not the MMQ tile over-allocation tail
     // (N1 layout: the whole buffer, padded rows included, equals the unfused quantizer's)
-    const size_t act_bytes = layout == GGML_CUDA_ACT_LAYOUT_N1 ? bytes :
+    const size_t act_bytes = (layout == GGML_CUDA_ACT_LAYOUT_N1 || layout == GGML_CUDA_ACT_LAYOUT_SC) ? bytes :
         ne11*GGML_PAD(ne10, MATRIX_ROW_PADDING) * sizeof(block_q8_1)/QK8_1;
     ggml_cuda_act_ref_quant(consumer->src[0], x, ne10, s11, ne11, layout, ref.get(), ctx->stream());
     const int64_t diff = ggml_cuda_act_count_diff(ref.get(), ctx->act_cache_buf->get(), act_bytes, ctx->stream());
@@ -5084,14 +5152,16 @@ static void ggml_cuda_act_verify(ggml_backend_cuda_context * ctx, const ggml_ten
     ctx->act_stat_verify_bytes += act_bytes;
     // T412: process totals per layout class, printed at exit (the per-graph line only covers graphs with stats)
     struct totals {
-        int64_t n[2] = {0, 0}, d[2] = {0, 0}, b[2] = {0, 0};
+        int64_t n[3] = {0, 0, 0}, d[3] = {0, 0, 0}, b[3] = {0, 0, 0};
         ~totals() {
-            fprintf(stderr, "act-fuse: VERIFY totals: mmq %lld producers %lld/%lld bytes differ | n1 %lld producers %lld/%lld bytes differ\n",
-                (long long) n[0], (long long) d[0], (long long) b[0], (long long) n[1], (long long) d[1], (long long) b[1]);
+            fprintf(stderr, "act-fuse: VERIFY totals: mmq %lld producers %lld/%lld bytes differ | n1 %lld producers %lld/%lld bytes differ"
+                " | sc %lld producers %lld/%lld bytes differ\n",
+                (long long) n[0], (long long) d[0], (long long) b[0], (long long) n[1], (long long) d[1], (long long) b[1],
+                (long long) n[2], (long long) d[2], (long long) b[2]);
         }
     };
     static totals t;
-    const int c = layout == GGML_CUDA_ACT_LAYOUT_N1 ? 1 : 0;
+    const int c = layout == GGML_CUDA_ACT_LAYOUT_N1 ? 1 : layout == GGML_CUDA_ACT_LAYOUT_SC ? 2 : 0;
     t.n[c]++; t.d[c] += diff; t.b[c] += (int64_t) act_bytes;
 }
 
@@ -5179,7 +5249,30 @@ static int ggml_cuda_act_try_norm(ggml_backend_cuda_context * ctx, ggml_cgraph *
         s_b = add->src[1]->nb[1]/sizeof(float);
     }
     const ggml_tensor * mm = ggml_cuda_act_first_consumer(cgraph, k + 1, mul);
-    const int layout = mm ? ggml_cuda_act_consumer_layout(mm, cc) : -1;
+    int layout = mm ? ggml_cuda_act_consumer_layout(mm, cc) : -1;
+    if (layout < 0 && mm) {
+        // T399: the GDN attn-norm output feeds ssm_alpha/ssm_beta (plain Q2_0, F = 48, never fused) before the
+        // single-copy qkv/gate group; fuse for the first single-copy consumer instead. Safe: the norm still writes
+        // its fp32 output for the siblings that do not read the cache. The scan covers only the run of sibling
+        // MUL_MATs on `mul` that starts at the first consumer (views/no-ops skipped), so it stays O(siblings) on
+        // graphs without single-copy weights.
+        int j = k + 2;   // the first consumer sits after the MUL (same scan ggml_cuda_act_first_consumer did)
+        for (; j < cgraph->n_nodes && cgraph->nodes[j] != mm; ++j) {}
+        for (++j; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (ggml_cuda_is_view_or_noop(n)) {
+                continue;
+            }
+            if (n->op != GGML_OP_MUL_MAT || n->src[1] != mul) {
+                break;
+            }
+            if (n->src[0]->type == GGML_TYPE_NK_Q2_0_W2ONLY) {
+                layout = ggml_cuda_act_consumer_layout(n, cc);
+                mm = n;
+                break;
+            }
+        }
+    }
     if (layout < 0) {
         return 0;
     }
@@ -5383,6 +5476,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         i += act_n;
                         continue;
                     }
+                }
+
+                // T399: single-copy weights (one launch per same-input group; no other path exists for them)
+                if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_NK_Q2_0_W2ONLY) {
+                    ggml_tensor * sgrp[SC_MAX_GROUP];
+                    int sidx[SC_MAX_GROUP];
+                    const int ng = is_concurrent_event_active ? (sgrp[0] = node, sidx[0] = i, 1) :
+                                   ggml_cuda_find_sc_group(cgraph, i, sgrp, sidx);
+                    ggml_cuda_sc_mul_mat(*cuda_ctx, sgrp, ng);
+                    for (int k = 1; k < ng; ++k) {
+                        mmvq_pair_done[sidx[k]] = true;
+                    }
+                    if (!is_concurrent_event_active) {
+                        try_launch_concurrent_event(node);
+                    }
+                    continue;
                 }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
@@ -6190,6 +6299,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             if (buft_ctx->device != dev_ctx->device) {
                 return false;
             }
+        }
+    }
+
+    // T399: a single-copy weight is readable by MUL_MAT (src0) only, through mul_mat_sc.cu
+    if (op->type == GGML_TYPE_NK_Q2_0_W2ONLY) {
+        return op->op == GGML_OP_NONE || op->op == GGML_OP_VIEW || op->op == GGML_OP_RESHAPE;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] && op->src[i]->type == GGML_TYPE_NK_Q2_0_W2ONLY) {
+            return ggml_cuda_sc_supports_op(op);
         }
     }
 

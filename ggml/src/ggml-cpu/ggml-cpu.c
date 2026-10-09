@@ -1300,12 +1300,57 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+// T399: GGML_TYPE_NK_Q2_0_W2ONLY reference path. Its rows are not individually addressable (whole-tensor tile layout),
+// so each thread dequantizes its weight rows from the tensor base and dots them with the fp32 activations.
+static void ggml_compute_forward_mul_mat_nk_w2only(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && nb10 == sizeof(float));
+    GGML_ASSERT(ne02 == 1 && ne03 == 1 && ne00 % 128 == 0 && ne01 % 128 == 0);
+    GGML_ASSERT(nb0 == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t dr = (ne01 + nth - 1) / nth;
+    const int64_t r0 = dr * ith;
+    const int64_t r1 = MIN(r0 + dr, ne01);
+    if (r0 >= r1) {
+        return;
+    }
+    float * wrow = (float *) malloc(ne00 * sizeof(float));
+    GGML_ASSERT(wrow);
+    for (int64_t f = r0; f < r1; ++f) {
+        ggml_nk_w2only_dequant_row(src0->data, ne01, ne00, f, wrow);
+        for (int64_t i13 = 0; i13 < ne13; ++i13) {
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                    const float * y = (const float *) ((const char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
+                    float s = 0.0f;
+                    ggml_vec_dot_f32((int) ne00, &s, 0, wrow, 0, y, 0, 1);
+                    *(float *) ((char *) dst->data + f*nb0 + i11*nb1 + i12*nb2 + i13*nb3) = s;
+                }
+            }
+        }
+    }
+    free(wrow);
+}
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+
+    if (src0->type == GGML_TYPE_NK_Q2_0_W2ONLY) {
+        ggml_compute_forward_mul_mat_nk_w2only(params, dst);
+        return;
+    }
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {

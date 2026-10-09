@@ -5051,6 +5051,7 @@ class GGMLQuantizationType(IntEnum):
     MXFP6   = 49  # ROC8: OCP MX e3m2 (6-bit packed) + per-32-block e8m0 scale (T184)
     NK_Q2_0_W2 = 52  # T400 N4 dual blob: compact Q2_0 g128 + ENC_W2 prefill stream (native-kernels CONTRACT 3.2)
     NK_Q1_0_W2 = 53  # T400 N4 dual blob: compact Q1_0 + ENC_W2 prefill stream
+    NK_Q2_0_W2ONLY = 54  # T399 single copy: ENC_W2 stream + fp16 sw[K/128][F], no compact region
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -5255,6 +5256,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.MXFP6: (32, 1 + 32 * 6 // 8),  # block_mxfp6: e8m0 e + 24 packed 6-bit qs (T184)
     GGMLQuantizationType.NK_Q2_0_W2: (128, 34 + 32),  # T400: compact region then W2 region (per 128 weights)
     GGMLQuantizationType.NK_Q1_0_W2: (128, 18 + 32),
+    GGMLQuantizationType.NK_Q2_0_W2ONLY: (128, 32 + 2),  # T399: W2 region then sw region (per 128 weights)
 }
 
 

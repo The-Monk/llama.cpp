@@ -820,6 +820,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 50,
         .is_quantized             = true,
     },
+    [GGML_TYPE_NK_Q2_0_W2ONLY] = { // T399 single-copy: W2 stream + sw, whole-tensor layout (no row to_float)
+        .type_name                = "nk_q2_0_w2only",
+        .blck_size                = 128,
+        .type_size                = 34,
+        .is_quantized             = true,
+    },
     [GGML_TYPE_2OF4_FP8] = {
         .type_name                = "2of4_fp8",
         .blck_size                = QK_2OF4_FP8,

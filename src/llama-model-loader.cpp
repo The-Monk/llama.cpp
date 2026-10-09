@@ -1346,15 +1346,72 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
     }
 
+    const bool is_w2only = t_meta.type == GGML_TYPE_NK_Q2_0_W2ONLY;
+
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_sel);
     if (buft == nullptr) {
-        if (is_nk) {
+        if (is_nk || is_w2only) {
             n_created++;   // the companion is skipped with it
         }
         return nullptr;
     }
 
     ggml_context * ctx = ctx_for_buft(buft);
+
+    // T399 single copy: the tensor is used as is (W2 stream + sw, only MUL_MAT reads it); its companion "<name>.nk"
+    // is a 256-B header (CONTRACT 3.3, v1.1: compact_bytes 0, flags bit2 = scales inside the tensor) whose
+    // fingerprint covers the whole tensor. Refused without a matching companion, like the dual blob.
+    if (is_w2only) {
+        const std::string name  = tn.str();
+        const std::string cname = name + ".nk";
+        if (flags & TENSOR_DUPLICATED) {
+            throw std::runtime_error(format("NK single-copy tensor '%s' cannot be duplicated", name.c_str()));
+        }
+        const llama_tensor_weight * cw = get_weight(cname.c_str());
+        if (!cw) {
+            throw std::runtime_error(format("NK single-copy tensor '%s' has no companion '%s' -- refusing (CONTRACT 3.3)",
+                    name.c_str(), cname.c_str()));
+        }
+        uint8_t h[256];
+        if (ggml_nbytes(cw->tensor) != sizeof(h) || cw->tensor->type != GGML_TYPE_I8) {
+            throw std::runtime_error(format("NK companion '%s' is not a 256-B I8 header", cname.c_str()));
+        }
+        files.at(cw->idx)->seek(cw->offs, SEEK_SET);
+        files.at(cw->idx)->read_raw(h, sizeof(h));
+        const int64_t K = t_meta.ne[0], F = t_meta.ne[1], G = K / 128;
+        const size_t  w2 = (size_t) F * K / 4, scales = (size_t) G * F * 2;
+        std::string why;
+        if (memcmp(h, "NKB1", 4) != 0)                                   why = "magic";
+        else if (llama_nk_rd<uint16_t>(h, 4)  != 1)                      why = "NK_VERSION";
+        else if (llama_nk_rd<uint16_t>(h, 6)  != 256)                    why = "header bytes";
+        else if (llama_nk_rd<uint32_t>(h, 8)  != 2)                      why = "enc (ENC_W2 only)";
+        else if (llama_nk_rd<uint32_t>(h, 12) != 2)                      why = "mode (G128 exact only)";
+        else if (llama_nk_rd<uint32_t>(h, 16) != (uint32_t) GGML_TYPE_Q2_0) why = "src_type";
+        else if (llama_nk_rd<uint32_t>(h, 20) != (uint32_t) F)          why = "F";
+        else if (llama_nk_rd<uint32_t>(h, 24) != (uint32_t) K)          why = "K";
+        else if (llama_nk_rd<uint16_t>(h, 28) != 128 || llama_nk_rd<uint16_t>(h, 30) != 128) why = "BF/BK";
+        else if (llama_nk_rd<uint16_t>(h, 34) != 256)                    why = "NT";
+        else if ((llama_nk_rd<uint32_t>(h, 40) & 4) == 0)                why = "flags (scales-in-tensor bit)";
+        else if (llama_nk_rd<uint64_t>(h, 44) != 0)                      why = "compact_bytes (must be 0)";
+        else if (llama_nk_rd<uint64_t>(h, 52) != w2)                     why = "prefill_bytes";
+        else if (llama_nk_rd<uint32_t>(h, 76) != w2)                     why = "scales_offset (in tensor)";
+        else if (llama_nk_rd<uint32_t>(h, 80) != scales)                 why = "scales_bytes";
+        else if (llama_nk_rd<uint32_t>(h, 84) != 1)                      why = "scales_type";
+        else if (F % 128 != 0 || K % 128 != 0 || w2 + scales != ggml_nbytes(&t_meta)) why = "shape";
+        if (!why.empty()) {
+            throw std::runtime_error(format("NK companion '%s' does not match '%s' (%s) -- refusing",
+                    cname.c_str(), name.c_str(), why.c_str()));
+        }
+        nk_expect ex;
+        ex.compact_bytes = 0;
+        ex.fp_compact    = llama_nk_rd<uint64_t>(h, 60);
+        ex.fp_prefill    = llama_nk_rd<uint64_t>(h, 68);
+        nk_dual[name] = ex;
+
+        ggml_tensor * comp = ggml_dup_tensor(ctx, cw->tensor);   // loaded (256 B) so the tensor count matches
+        ggml_set_name(comp, cname.c_str());
+        n_created++;
+    }
 
     if (is_nk) {
         const std::string name  = tn.str();
