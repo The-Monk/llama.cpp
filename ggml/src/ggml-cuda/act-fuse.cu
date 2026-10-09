@@ -1,6 +1,7 @@
 // [TAG_ACT_FUSE] T407: see act-fuse.cuh.
 
 #include "act-fuse.cuh"
+#include "n1_act.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -143,7 +144,7 @@ static void act_glu_quant_launch(const float * gate, const float * up, int64_t n
 void ggml_cuda_act_glu_quant(const float * gate, const float * up, int64_t nc, int64_t nrows,
         int64_t s_gate, int64_t s_up, int64_t ne0_padded, int layout, void * y, cudaStream_t stream) {
     GGML_ASSERT(ne0_padded % (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ) == 0);
-    switch ((mmq_q8_1_ds_layout) layout) {
+    switch (layout) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             act_glu_quant_launch(gate, up, nc, nrows, s_gate, s_up, ne0_padded, mmq_q8_1_store<MMQ_Q8_1_DS_LAYOUT_D4>{y, nrows}, stream);
             break;
@@ -155,6 +156,10 @@ void ggml_cuda_act_glu_quant(const float * gate, const float * up, int64_t nc, i
             break;
         case MMQ_Q8_1_DS_LAYOUT_D128:
             act_glu_quant_launch(gate, up, nc, nrows, s_gate, s_up, ne0_padded, mmq_q8_1_store<MMQ_Q8_1_DS_LAYOUT_D128>{y, nrows}, stream);
+            break;
+        case GGML_CUDA_ACT_LAYOUT_N1:
+            GGML_ASSERT(nc % 128 == 0);
+            act_glu_quant_launch(gate, up, nc, nrows, s_gate, s_up, ne0_padded, n1_act_store_make(y, nc, nrows), stream);
             break;
         default:
             GGML_ABORT("act-fuse: unsupported layout");
@@ -248,7 +253,7 @@ bool ggml_cuda_act_norm_quant(const float * a, const float * add_b, float * dst_
     if (ncols < 1024 || ncols > ACT_NORM_MAX_NCOLS || ne0_padded % (4*WARP_SIZE) != 0) {
         return false;
     }
-    switch ((mmq_q8_1_ds_layout) layout) {
+    switch (layout) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             act_norm_quant_launch(a, add_b, dst_add, dst_mul, w, ncols, nrows, s_a, s_b, eps, ne0_padded, mmq_q8_1_store<MMQ_Q8_1_DS_LAYOUT_D4>{y, nrows}, stream);
             return true;
@@ -260,6 +265,12 @@ bool ggml_cuda_act_norm_quant(const float * a, const float * add_b, float * dst_
             return true;
         case MMQ_Q8_1_DS_LAYOUT_D128:
             act_norm_quant_launch(a, add_b, dst_add, dst_mul, w, ncols, nrows, s_a, s_b, eps, ne0_padded, mmq_q8_1_store<MMQ_Q8_1_DS_LAYOUT_D128>{y, nrows}, stream);
+            return true;
+        case GGML_CUDA_ACT_LAYOUT_N1:
+            if (ncols % 128 != 0) {
+                return false;
+            }
+            act_norm_quant_launch(a, add_b, dst_add, dst_mul, w, ncols, nrows, s_a, s_b, eps, ne0_padded, n1_act_store_make(y, ncols, nrows), stream);
             return true;
         default:
             return false;

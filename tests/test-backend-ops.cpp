@@ -9044,6 +9044,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 14336, 1, 4096, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IU4, GGML_TYPE_F32, 4096,  2, 4096, {1, 1}, {1, 1}));
 
+    // T404 N1 harness: Q2_0/Q1_0 prefill shapes that GGML_N1_PREFILL=1 routes to the native int8 WMMA GEMM
+    // (F % 128 == 0, K % 128 == 0, N >= 64; N not a multiple of 128 exercises the padded token tile).
+    for (ggml_type t : {GGML_TYPE_Q2_0, GGML_TYPE_Q1_0}) {
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  256,  64,  1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  256, 100,  1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  384, 513,  2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 1024, 512,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 1024, 512,  6144, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  512, 256, 17408, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  256, 128,  1024, {1, 1}, {4, 1}));   // src1 ne2 = 4 (collapse)
+    }
+
     // TQ1_0 (upstream ternary, 1.6875 bpw): CPU-only upstream (excluded from
     // all_types with a "TODO: implement for all backends" note); the fork adds
     // a CUDA/HIP MMVQ decode (vec_dot_tq1_0_q8_1) + dequant fallback, so give
