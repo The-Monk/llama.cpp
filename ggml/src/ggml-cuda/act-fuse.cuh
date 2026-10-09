@@ -33,6 +33,11 @@ enum ggml_cuda_act_fuse_bit {
     GGML_ACT_FUSE_NORM  = 4,
 };
 
+// T412: activation layout id of the N1 int8 WMMA GEMM (n1_act.cuh: int8 X tiles + fp32 sx[K/128][Npad]).
+// Outside the mmq_q8_1_ds_layout values, so an MMQ consumer can never hit an N1 entry (and vice versa).
+// Producers need ncols % 128 == 0 for it; y must hold ggml_cuda_n1_act_bytes(dst) bytes.
+#define GGML_CUDA_ACT_LAYOUT_N1 100
+
 int  ggml_cuda_act_fuse_mask();
 bool ggml_cuda_act_fuse_verify();
 

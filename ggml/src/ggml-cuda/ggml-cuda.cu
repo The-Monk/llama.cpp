@@ -91,6 +91,7 @@
 #include "ggml-cuda/mul_mat_q2_0_wmma.cuh"
 #include "ggml-cuda/mmvq_coop_q2_0.cuh"
 #include "ggml-cuda/mul_mat_q2_0_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_n1.cuh"
 #include "ggml-cuda/mul_mat_q1_0_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_q4_K_hipblaslt.cuh"
 #include "ggml-cuda/mul_mat_q2_K_hipblaslt.cuh"
@@ -1921,6 +1922,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
+    }
+    // N1 (T404, default on since T412; GGML_N1_PREFILL=0 disables): Q2_0/Q1_0 prefill MUL_MATs (batch >= 64) on the
+    // native int8 WMMA GEMM (mul_mat_n1.cu). Unsupported cases fall through to the unchanged path and are counted.
+    // ggml_cuda_act_consumer_layout mirrors this ordering (N1 before MMQ).
+    if (ggml_cuda_n1_enabled()) {
+        ggml_cuda_n1_count(src0, src1);
+        if (ggml_cuda_n1_mul_mat(ctx, src0, src1, dst)) {
+            return;
+        }
     }
     // RDNA4 2:4-structured-sparse fp8 SWMMAC driver-completeness run:
     // GGML_TYPE_2OF4_FP8 is NOT wired into the generic mmq/mmvq dispatch
@@ -4978,6 +4988,16 @@ static int ggml_cuda_act_consumer_layout(const ggml_tensor * mm, const int cc) {
     if (ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD || ggml_cuda_act_alt_route_env()) {
         return -1;
     }
+    // T412: N1 intercepts before MMQ in ggml_cuda_mul_mat; it reads the N1 layout (route 1) or nothing fused (route 2)
+    if (ggml_cuda_n1_enabled()) {
+        const int r = ggml_cuda_n1_act_route(src0, src1, mm);
+        if (r == 1) {
+            return GGML_CUDA_ACT_LAYOUT_N1;
+        }
+        if (r == 2) {
+            return -1;
+        }
+    }
     if (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE || src1->ne[2] != 1 || src1->ne[3] != 1 || src0->ne[2] != 1 || src0->ne[3] != 1) {
         return -1;
     }
@@ -5018,19 +5038,30 @@ static void ggml_cuda_act_note_write(ggml_backend_cuda_context * ctx, const ggml
     }
 }
 
-static void ggml_cuda_act_cache_set(ggml_backend_cuda_context * ctx, const ggml_tensor * t, int layout, size_t bytes) {
+static void ggml_cuda_act_cache_set(ggml_backend_cuda_context * ctx, const ggml_tensor * t, int layout, int cc) {
+    const size_t bytes = layout == GGML_CUDA_ACT_LAYOUT_N1 ? ggml_cuda_n1_act_bytes(t) : ggml_cuda_mmq_act_bytes(t, cc);
     ctx->act_cache_buf.reset();
     ctx->act_cache_buf    = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx->pool(), bytes);
     ctx->act_cache_tensor = t;
     ctx->act_cache_layout = layout;
     ctx->act_cache_bytes  = bytes;
+    if (layout == GGML_CUDA_ACT_LAYOUT_N1) {
+        // producers write rows < N only: zero the last (padded) token tile of X and all of sx, as the N1
+        // quantizer does (padded rows never reach dst, this keeps the buffer equal to the unfused one)
+        const int64_t K = t->ne[0], N = ggml_nrows(t), Npad = (N + 127) / 128 * 128;
+        char * y = ctx->act_cache_buf->get();
+        CUDA_CHECK(cudaMemsetAsync(y + (size_t) (Npad - 128) * K, 0, (size_t) 128 * K, ctx->stream()));
+        CUDA_CHECK(cudaMemsetAsync(y + (size_t) Npad * K, 0, bytes - (size_t) Npad * K, ctx->stream()));
+    }
 }
 
 // Reference q8_1 bytes for an fp32 activation (the unfused quantize launch).
 static void ggml_cuda_act_ref_quant(const ggml_tensor * src0, const float * x, int64_t ne10, int64_t s11, int64_t ne11,
         int layout, void * y, cudaStream_t stream) {
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    if (layout == (int) MMQ_Q8_1_DS_LAYOUT_D128) {
+    if (layout == GGML_CUDA_ACT_LAYOUT_N1) {
+        ggml_cuda_n1_act_ref_quant(x, s11, ne10, ne11, y, stream);
+    } else if (layout == (int) MMQ_Q8_1_DS_LAYOUT_D128) {
         quantize_mmq_q8_1_d128_cuda(x, nullptr, y, src0->type, ne10, s11, s11*ne11, s11*ne11, ne10_padded, ne11, 1, 1, stream);
     } else {
         quantize_mmq_q8_1_cuda(x, nullptr, y, src0->type, ne10, s11, s11*ne11, s11*ne11, ne10_padded, ne11, 1, 1, stream);
@@ -5044,10 +5075,24 @@ static void ggml_cuda_act_verify(ggml_backend_cuda_context * ctx, const ggml_ten
     ggml_cuda_pool_alloc<char> ref(ctx->pool(), bytes);
     CUDA_CHECK(cudaMemsetAsync(ref.get(), 0, bytes, ctx->stream()));
     // compare only the quantized activation, not the MMQ tile over-allocation tail
-    const size_t act_bytes = ne11*GGML_PAD(ne10, MATRIX_ROW_PADDING) * sizeof(block_q8_1)/QK8_1;
+    // (N1 layout: the whole buffer, padded rows included, equals the unfused quantizer's)
+    const size_t act_bytes = layout == GGML_CUDA_ACT_LAYOUT_N1 ? bytes :
+        ne11*GGML_PAD(ne10, MATRIX_ROW_PADDING) * sizeof(block_q8_1)/QK8_1;
     ggml_cuda_act_ref_quant(consumer->src[0], x, ne10, s11, ne11, layout, ref.get(), ctx->stream());
-    ctx->act_stat_verify_diff  += ggml_cuda_act_count_diff(ref.get(), ctx->act_cache_buf->get(), act_bytes, ctx->stream());
+    const int64_t diff = ggml_cuda_act_count_diff(ref.get(), ctx->act_cache_buf->get(), act_bytes, ctx->stream());
+    ctx->act_stat_verify_diff  += diff;
     ctx->act_stat_verify_bytes += act_bytes;
+    // T412: process totals per layout class, printed at exit (the per-graph line only covers graphs with stats)
+    struct totals {
+        int64_t n[2] = {0, 0}, d[2] = {0, 0}, b[2] = {0, 0};
+        ~totals() {
+            fprintf(stderr, "act-fuse: VERIFY totals: mmq %lld producers %lld/%lld bytes differ | n1 %lld producers %lld/%lld bytes differ\n",
+                (long long) n[0], (long long) d[0], (long long) b[0], (long long) n[1], (long long) d[1], (long long) b[1]);
+        }
+    };
+    static totals t;
+    const int c = layout == GGML_CUDA_ACT_LAYOUT_N1 ? 1 : 0;
+    t.n[c]++; t.d[c] += diff; t.b[c] += (int64_t) act_bytes;
 }
 
 // GLU (swiglu_split, fp32) whose only consumer is the next node, a MUL_MAT
@@ -5074,7 +5119,7 @@ static bool ggml_cuda_act_try_glu(ggml_backend_cuda_context * ctx, ggml_cgraph *
     }
     const int64_t nc = glu->ne[0], nrows = glu->ne[1];
     const int64_t ne0_padded = GGML_PAD(nc, MATRIX_ROW_PADDING);
-    ggml_cuda_act_cache_set(ctx, glu, layout, ggml_cuda_mmq_act_bytes(glu, cc));
+    ggml_cuda_act_cache_set(ctx, glu, layout, cc);
     ggml_cuda_act_glu_quant((const float *) gate->data, (const float *) up->data, nc, nrows,
         gate->nb[1]/sizeof(float), up->nb[1]/sizeof(float), ne0_padded, layout, ctx->act_cache_buf->get(), ctx->stream());
     CUDA_CHECK(cudaGetLastError());
@@ -5143,7 +5188,7 @@ static int ggml_cuda_act_try_norm(ggml_backend_cuda_context * ctx, ggml_cgraph *
     const int64_t ncols = x->ne[0], nrows = x->ne[1];
     const int64_t ne0_padded = GGML_PAD(ncols, MATRIX_ROW_PADDING);
 
-    ggml_cuda_act_cache_set(ctx, mul, layout, ggml_cuda_mmq_act_bytes(mul, cc));
+    ggml_cuda_act_cache_set(ctx, mul, layout, cc);
     if (!ggml_cuda_act_norm_quant(a, b, add ? (float *) add->data : nullptr, (float *) mul->data, (const float *) w->data,
             ncols, nrows, s_a, s_b, eps, ne0_padded, layout, ctx->act_cache_buf->get(), ctx->stream())) {
         ctx->act_cache_tensor = nullptr;
