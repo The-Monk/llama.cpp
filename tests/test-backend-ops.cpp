@@ -10019,6 +10019,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // T400 N4 single-copy study: Bonsai-27B weight shapes (F x K) on the Q2_0/Q1_0 path, batch 1 (decode mmvq)
+    // and batch 512 (prefill; with GGML_N1_PREFILL=1 [GGML_N1_TRANSIENT=1] this is N1 [with per-call W2 re-pack])
+    for (ggml_type t : {GGML_TYPE_Q2_0, GGML_TYPE_Q1_0}) {
+        for (auto fk : std::vector<std::array<int64_t, 2>>{{6144, 5120}, {10240, 5120}, {12288, 5120}, {17408, 5120},
+                                                            {5120, 17408}, {5120, 6144}, {1024, 5120}, {248320, 5120}}) {
+            for (int64_t n : {1, 512}) {
+                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, fk[0], n, fk[1], {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
     uint32_t                        kwh_idx  = 1;

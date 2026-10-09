@@ -89,6 +89,16 @@ struct llama_model_loader {
     llama_mmaps mappings;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
+
+    // T400 N4: expected region fingerprints of dual-blob tensors, keyed by the internal "<name>#nkdual" name
+    struct nk_expect {
+        size_t   compact_bytes = 0;
+        uint64_t fp_compact    = 0;
+        uint64_t fp_prefill    = 0;
+        bool     verified      = false;
+    };
+    std::map<std::string, nk_expect> nk_dual;
+    void nk_check(const std::string & name, uint64_t fp_c, uint64_t fp_p);
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 

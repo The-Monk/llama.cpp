@@ -796,6 +796,30 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_mxfp6,
         .from_float_ref           = (ggml_from_float_t) quantize_row_mxfp6_ref,
     },
+    [50] = { // reserved (IU4P in rock10 trees)
+        .type_name                = "DEPRECATED",
+        .blck_size                = 0,
+        .type_size                = 0,
+        .is_quantized             = false,
+    },
+    [51] = { // reserved
+        .type_name                = "DEPRECATED",
+        .blck_size                = 0,
+        .type_size                = 0,
+        .is_quantized             = false,
+    },
+    [GGML_TYPE_NK_Q2_0_W2] = {
+        .type_name                = "nk_q2_0_w2",
+        .blck_size                = 128,
+        .type_size                = 66,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_NK_Q1_0_W2] = {
+        .type_name                = "nk_q1_0_w2",
+        .blck_size                = 128,
+        .type_size                = 50,
+        .is_quantized             = true,
+    },
     [GGML_TYPE_2OF4_FP8] = {
         .type_name                = "2of4_fp8",
         .blck_size                = QK_2OF4_FP8,

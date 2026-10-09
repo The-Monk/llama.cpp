@@ -6194,6 +6194,17 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 // E3M2 at all -- every one of the 64 codes is finite).
                 VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp6, data, nb);
             } break;
+        case GGML_TYPE_NK_Q2_0_W2:
+            {
+                // T400 dual blob: the first nb*34 bytes are g128 Q2_0 blocks (the W2 stream has no invalid encodings)
+                const size_t nbc = nb;
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_q2_0, data, nbc);
+            } break;
+        case GGML_TYPE_NK_Q1_0_W2:
+            {
+                const size_t nbc = nb;
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_q1_0, data, nbc);
+            } break;
         case GGML_TYPE_NVFP4:
             {
                 // UE4M3 scales are uint8_t — all byte values are valid

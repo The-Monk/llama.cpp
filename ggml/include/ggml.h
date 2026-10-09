@@ -437,7 +437,14 @@ extern "C" {
         GGML_TYPE_IU4     = 47, // signed int4 x int4 W4A4, native RDNA4 WMMA -- EXPERIMENTAL, model-blocked (see comment at IU4 kernel registration)
         GGML_TYPE_2OF4_F16 = 48, // RDNA4 2:4-structured-sparse fp16 (card 141, native SWMMAC f16 A/B, fp32 accumulate)
         GGML_TYPE_MXFP6   = 49, // MXFP6 (OCP MX): e3m2 weights (6-bit packed) + per-32-block e8m0 shared scale, rides the e4m3 fp8 compute path (mx.quantize)
-        GGML_TYPE_COUNT   = 50,
+        // 50, 51: reserved (IU4P = 50 in the rock10 t370/t372 trees; keep the ids disjoint across forks)
+        // T400 N4 native dual-blob tensors (native-kernels/docs/CONTRACT.md section 3.2): the tensor data is the
+        // compact Q2_0 (g128) / Q1_0 blocks verbatim, followed by the ENC_W2 prefill stream (32 B per 128 weights).
+        // Every dual tensor has a companion "<name>.nk" (I8, header + fp16 sw[K/128][F]). The loader exposes the
+        // compact region to the model as an ordinary Q2_0/Q1_0 view; only the N1 prefill path reads the W2 region.
+        GGML_TYPE_NK_Q2_0_W2 = 52, // 34 + 32 = 66 B per 128 weights
+        GGML_TYPE_NK_Q1_0_W2 = 53, // 18 + 32 = 50 B per 128 weights (N4 addition to CONTRACT v1 section 3.2)
+        GGML_TYPE_COUNT   = 54,
     };
 
     // precision

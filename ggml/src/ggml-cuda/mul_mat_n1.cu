@@ -15,6 +15,12 @@
 //   GGML_N1_ROW=ffn        ARM B: ffn_* tensors use ROW mode (M0 weight fold, int8 copy, rs0 kernel, per-token act);
 //                          all other tensors stay on the g128 arm. Int8 copies are VRAM-guarded per tensor.
 //   GGML_N1_MIN_N=<n>      minimum src1 batch (default 64)
+//   GGML_N1_DUMP=<dir>     T400 gate: write every runtime-converted g128 weight (W2 stream, fp16 sw) to <dir>
+//   GGML_N1_TRANSIENT=1    T400 single-copy study: re-pack W2 + sw into pool scratch on every call (no cache)
+//
+// T400 N4: weights loaded from a native dual-blob GGUF (llama-model-loader, GGML_TYPE_NK_*_W2) arrive as a compact
+// Q2_0/Q1_0 view whose view_src is the dual tensor; its W2 region and its companion's sw are used in place (no
+// conversion, no cache copy).
 //
 // Weights (g128 arm): 2-bit packed stream (LAYOUT.md section 3, pack_tiles_w2 with NT=256) + fp16 sw[K/128][F]; config
 // t128_f128_w4x2_rs1_mb1_w2 (verified bit-exact in job 235). Converted once on a side stream and cached per tensor.
@@ -47,7 +53,12 @@ struct n1_env {
     bool    act_tok = false;
     bool    row_ffn = false, row_all = false;
     int64_t min_n   = 64;
+    const char * dump = nullptr;
+    bool    transient = false;
     n1_env() {
+        dump = getenv("GGML_N1_DUMP");
+        const char * tr = getenv("GGML_N1_TRANSIENT");
+        transient = tr && strcmp(tr, "1") == 0;
         const char * e = getenv("GGML_N1_PREFILL");
         on = !(e && strcmp(e, "0") == 0);
         if (on) {
@@ -64,8 +75,8 @@ struct n1_env {
         const char * m = getenv("GGML_N1_MIN_N");
         if (m) min_n = atoll(m);
         if (on) {
-            fprintf(stderr, "[N1] Q2_0/Q1_0 prefill on native int8 WMMA (GGML_N1_PREFILL=0 disables): act=%s row=%s min_n=%lld\n", act_tok ? "token" : "g128",
-                    row_all ? "all" : row_ffn ? "ffn" : "none", (long long) min_n);
+            fprintf(stderr, "[N1] Q2_0/Q1_0 prefill on native int8 WMMA (GGML_N1_PREFILL=0 disables): act=%s row=%s min_n=%lld dump=%s transient=%d\n",
+                    act_tok ? "token" : "g128", row_all ? "all" : row_ffn ? "ffn" : "none", (long long) min_n, dump ? dump : "-", (int) transient);
         }
     }
 };
@@ -83,11 +94,14 @@ struct n1_stats {
     std::atomic<uint64_t> bytes_w2{0}, bytes_row{0};
     std::atomic<uint64_t> act_hit{0}, act_miss{0};          // N1 activation from the act-fuse cache (hit) / quantized here
     std::atomic<uint64_t> act_glu{0}, act_norm{0};          // ... hits written by the GLU / norm producers
+    std::atomic<uint64_t> mm_nk{0}, mm_transient{0}, dumped{0};
     ~n1_stats() {
         if (!env().on || !env().stats) return;
         fprintf(stderr, "[N1] stats: activation cache hit %llu (from glu producer %llu, norm producer %llu) miss %llu\n",
                 (unsigned long long) act_hit.load(), (unsigned long long) act_glu.load(),
                 (unsigned long long) act_norm.load(), (unsigned long long) act_miss.load());
+        fprintf(stderr, "[N1] stats: native in-place weight calls %llu, transient re-pack calls %llu, dumped tensors %llu\n",
+                (unsigned long long) mm_nk.load(), (unsigned long long) mm_transient.load(), (unsigned long long) dumped.load());
         auto pct = [](uint64_t a, uint64_t b) { return b ? 100.0 * (double) a / (double) b : 0.0; };
         fprintf(stderr,
                 "[N1] stats: prefill MUL_MAT (N>=%lld) total %llu ops / %.3f TFLOP; Q2_0/Q1_0 %llu ops / %.3f TFLOP\n"
@@ -332,6 +346,36 @@ bool convert(const ggml_tensor * src0, int mode, n1_w & c) {
     }
     CUDA_CHECK(hipGetLastError());
     CUDA_CHECK(hipStreamSynchronize(st));
+    if (env().dump && mode == 1) {   // T400 gate (a): the runtime cache, byte for byte
+        const size_t wb = (size_t) F * K / 4, sb = (size_t) S * F * sizeof(__half);
+        std::string buf(wb > sb ? wb : sb, '\0');
+        const char * part[2] = {".w2", ".sw"};
+        const void * dev[2]  = {c.w, c.sw};
+        const size_t len[2]  = {wb, sb};
+        for (int i = 0; i < 2; ++i) {
+            CUDA_CHECK(hipMemcpy(buf.data(), dev[i], len[i], hipMemcpyDeviceToHost));
+            const std::string path = std::string(env().dump) + "/" + src0->name + part[i];
+            FILE * f = fopen(path.c_str(), "wb");
+            if (!f || fwrite(buf.data(), 1, len[i], f) != len[i]) {
+                fprintf(stderr, "[N1] dump FAILED: %s\n", path.c_str());
+            }
+            if (f) fclose(f);
+        }
+        g_stats.dumped++;
+    }
+    return true;
+}
+
+// T400 N4: native dual-blob weight (loader view over GGML_TYPE_NK_*_W2) -> W2 region + companion sw, in place
+bool nk_dual_weight(const ggml_tensor * src0, const void ** w, const void ** sw) {
+    const ggml_tensor * d = src0->view_src;
+    if (!d || src0->view_offs != 0 || (d->type != GGML_TYPE_NK_Q2_0_W2 && d->type != GGML_TYPE_NK_Q1_0_W2)) return false;
+    const ggml_tensor * comp = (const ggml_tensor *) d->extra;
+    GGML_ASSERT(comp != nullptr && "NK dual tensor without companion (the loader refuses these)");
+    const size_t cb = d->type == GGML_TYPE_NK_Q2_0_W2 ? 34 : 18;
+    const size_t compact = (size_t) d->ne[1] * (d->ne[0] / 128) * cb;
+    *w  = (const char *) d->data + compact;
+    *sw = (const char *) comp->data + 256;   // scales_offset, enforced == 256 by the loader
     return true;
 }
 
@@ -387,6 +431,8 @@ bool n1_use_row(const ggml_tensor * src0) {
 
 // 1 = converted for `mode`, 0 = not seen yet, -1 = refused or converted for another mode
 int n1_weight_state(const ggml_tensor * src0, int mode) {
+    const void * w = nullptr, * sw = nullptr;
+    if (mode == 1 && nk_dual_weight(src0, &w, &sw)) return 1;   // T400: native weight, used in place
     std::lock_guard<std::mutex> lk(g_mtx);
     auto it = g_cache.find(src0->data);
     if (it != g_cache.end()) return it->second.mode == mode ? 1 : -1;
@@ -421,18 +467,40 @@ bool ggml_cuda_n1_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     }
 
     const bool row = n1_use_row(src0);
-    const n1_w * cw = get_weight(src0, row ? 2 : 1);
-    if (!cw) {
-        g_stats.fb_mem++; g_stats.fl_fb_mem += fl;
-        // a producer only fuses for this consumer once the weight is converted (ggml_cuda_n1_act_route), so a
-        // pending GLU can never be left for the default route here
-        GGML_ASSERT(ctx.act_pending != src1 && "N1: pending GLU consumer fell back");
-        return false;
-    }
-
     const int F = (int) src0->ne[1], K = (int) src0->ne[0], N = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]), S = K / 128;
     const int Npad = (N + N1_BT - 1) / N1_BT * N1_BT;
     hipStream_t st = ctx.stream();
+
+    const void * Wp  = nullptr;
+    const void * SWp = nullptr;
+    ggml_cuda_pool_alloc<uint32_t> tw(ctx.pool());
+    ggml_cuda_pool_alloc<__half>   tsw(ctx.pool());
+    if (!row && nk_dual_weight(src0, &Wp, &SWp)) {
+        g_stats.mm_nk++;
+    } else if (!row && env().transient) {
+        const size_t nw = (size_t) (F / N1_BF) * S * 1024;
+        tw.alloc(nw);
+        tsw.alloc((size_t) S * F);
+        if (src0->type == GGML_TYPE_Q2_0) {
+            k_n1_pack_w2<GGML_TYPE_Q2_0><<<(unsigned) ((nw + 255) / 256), 256, 0, st>>>((const char *) src0->data, src0->nb[1], F, K, tw.get());
+            k_n1_pack_sw<GGML_TYPE_Q2_0><<<(unsigned) (((size_t) S * F + 255) / 256), 256, 0, st>>>((const char *) src0->data, src0->nb[1], F, K, tsw.get());
+        } else {
+            k_n1_pack_w2<GGML_TYPE_Q1_0><<<(unsigned) ((nw + 255) / 256), 256, 0, st>>>((const char *) src0->data, src0->nb[1], F, K, tw.get());
+            k_n1_pack_sw<GGML_TYPE_Q1_0><<<(unsigned) (((size_t) S * F + 255) / 256), 256, 0, st>>>((const char *) src0->data, src0->nb[1], F, K, tsw.get());
+        }
+        Wp = tw.get(); SWp = tsw.get();
+        g_stats.mm_transient++;
+    } else {
+        const n1_w * cw = get_weight(src0, row ? 2 : 1);
+        if (!cw) {
+            g_stats.fb_mem++; g_stats.fl_fb_mem += fl;
+            // a producer only fuses for this consumer once the weight is converted (ggml_cuda_n1_act_route), so a
+            // pending GLU can never be left for the default route here
+            GGML_ASSERT(ctx.act_pending != src1 && "N1: pending GLU consumer fell back");
+            return false;
+        }
+        Wp = cw->w; SWp = cw->sw;
+    }
 
     const bool per_token = row || env().act_tok;
     float * Y = (float *) dst->data;
@@ -472,7 +540,7 @@ bool ggml_cuda_n1_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         if (!act_hit) {
             k_n1_quant_act<<<dim3(S, Npad), 32, 0, st>>>((const char *) src1->data, src1->nb[1], N, K, 128, Npad, X, sx);
         }
-        launch<1, 9>(X, cw->w, cw->sw, sx, Y, N, Npad, F, K, ldy, st);
+        launch<1, 9>(X, Wp, SWp, sx, Y, N, Npad, F, K, ldy, st);
         g_stats.mm_n1++; g_stats.fl_n1 += fl;
         CUDA_CHECK(hipGetLastError());
         return true;
@@ -483,10 +551,10 @@ bool ggml_cuda_n1_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     ggml_cuda_pool_alloc<float>  sx(ctx.pool(), (size_t) Npad);
     k_n1_quant_act<<<dim3(1, Npad), 256, 0, st>>>((const char *) src1->data, src1->nb[1], N, K, K, Npad, X.get(), sx.get());
     if (row) {
-        launch<0, 0>(X.get(), cw->w, cw->sw, sx.get(), Y, N, Npad, F, K, ldy, st);
+        launch<0, 0>(X.get(), Wp, SWp, sx.get(), Y, N, Npad, F, K, ldy, st);
         g_stats.mm_row++; g_stats.fl_row += fl;
     } else {
-        launch<1, 1>(X.get(), cw->w, cw->sw, sx.get(), Y, N, Npad, F, K, ldy, st);
+        launch<1, 1>(X.get(), Wp, SWp, sx.get(), Y, N, Npad, F, K, ldy, st);
         g_stats.mm_n1++; g_stats.fl_n1 += fl;
     }
     CUDA_CHECK(hipGetLastError());
