@@ -1,6 +1,7 @@
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
@@ -13,10 +14,35 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <tuple>
+
+#define XXH_INLINE_ALL
+#include "../examples/gguf-hash/deps/xxhash/xxhash.h"
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+
+// ---------------- T400 N4: native dual-blob tensors (native-kernels/docs/CONTRACT.md section 3) ----------------
+// A dual tensor <name> (GGML_TYPE_NK_*_W2) is created under the internal name "<name>#nkdual" (so it loads from the
+// file as one blob) together with its companion "<name>.nk" (I8: 256-B header + fp16 sw[K/128][F]). The model gets
+// "<name>" = an ordinary Q2_0/Q1_0 tensor viewing the compact region at offset 0 (view_src = the dual tensor), so
+// every decode/MMQ/fusion path sees an unchanged compact weight. The dual tensor's `extra` points at the companion;
+// the N1 prefill path (ggml-cuda/mul_mat_n1.cu) reads the W2 region and the companion scales from there.
+// The loader refuses a dual tensor without a companion, with a header that does not match, or (GGML_NK_VERIFY != 0,
+// the default) whose region xxh64 fingerprints do not match the header.
+static bool llama_nk_is_dual(ggml_type t) {
+    return t == GGML_TYPE_NK_Q2_0_W2 || t == GGML_TYPE_NK_Q1_0_W2;
+}
+
+static const char * LLAMA_NK_DUAL_SUFFIX = "#nkdual";
+
+static bool llama_nk_verify_enabled() {
+    const char * e = getenv("GGML_NK_VERIFY");
+    return !(e && strcmp(e, "0") == 0);
+}
+
+template <typename T> static T llama_nk_rd(const uint8_t * p, size_t off) { T v; memcpy(&v, p + off, sizeof(v)); return v; }
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -1080,6 +1106,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             int max_n_tensors = n_tensors;
             max_n_tensors += 1;                   // duplicated output tensor
             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
+            for (const auto & w : weights_map) {   // T400 N4: one compact view per dual-blob tensor
+                if (llama_nk_is_dual(w.second.tensor->type)) {
+                    max_n_tensors += 1;
+                }
+            }
             if (files.empty()) {
                 max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
             }
@@ -1303,12 +1334,157 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
 
-    ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+    // T400 N4: a dual-blob tensor selects its buffer type as the compact type it exposes to the model
+    const bool is_nk = llama_nk_is_dual(t_meta.type);
+    ggml_tensor t_sel = t_meta;
+    if (is_nk) {
+        t_sel.type  = t_meta.type == GGML_TYPE_NK_Q2_0_W2 ? GGML_TYPE_Q2_0 : GGML_TYPE_Q1_0;
+        t_sel.nb[0] = ggml_type_size(t_sel.type);
+        t_sel.nb[1] = ggml_row_size(t_sel.type, t_sel.ne[0]);
+        for (int dim = 2; dim < GGML_MAX_DIMS; dim++) {
+            t_sel.nb[dim] = t_sel.nb[dim-1]*t_sel.ne[dim-1];
+        }
+    }
+
+    const bool is_w2only = t_meta.type == GGML_TYPE_NK_Q2_0_W2ONLY;
+
+    ggml_backend_buffer_type_t buft = buft_for_tensor(&t_sel);
     if (buft == nullptr) {
+        if (is_nk || is_w2only) {
+            n_created++;   // the companion is skipped with it
+        }
         return nullptr;
     }
 
     ggml_context * ctx = ctx_for_buft(buft);
+
+    // T399 single copy: the tensor is used as is (W2 stream + sw, only MUL_MAT reads it); its companion "<name>.nk"
+    // is a 256-B header (CONTRACT 3.3, v1.1: compact_bytes 0, flags bit2 = scales inside the tensor) whose
+    // fingerprint covers the whole tensor. Refused without a matching companion, like the dual blob.
+    if (is_w2only) {
+        const std::string name  = tn.str();
+        const std::string cname = name + ".nk";
+        if (flags & TENSOR_DUPLICATED) {
+            throw std::runtime_error(format("NK single-copy tensor '%s' cannot be duplicated", name.c_str()));
+        }
+        const llama_tensor_weight * cw = get_weight(cname.c_str());
+        if (!cw) {
+            throw std::runtime_error(format("NK single-copy tensor '%s' has no companion '%s' -- refusing (CONTRACT 3.3)",
+                    name.c_str(), cname.c_str()));
+        }
+        uint8_t h[256];
+        if (ggml_nbytes(cw->tensor) != sizeof(h) || cw->tensor->type != GGML_TYPE_I8) {
+            throw std::runtime_error(format("NK companion '%s' is not a 256-B I8 header", cname.c_str()));
+        }
+        files.at(cw->idx)->seek(cw->offs, SEEK_SET);
+        files.at(cw->idx)->read_raw(h, sizeof(h));
+        const int64_t K = t_meta.ne[0], F = t_meta.ne[1], G = K / 128;
+        const size_t  w2 = (size_t) F * K / 4, scales = (size_t) G * F * 2;
+        std::string why;
+        if (memcmp(h, "NKB1", 4) != 0)                                   why = "magic";
+        else if (llama_nk_rd<uint16_t>(h, 4)  != 1)                      why = "NK_VERSION";
+        else if (llama_nk_rd<uint16_t>(h, 6)  != 256)                    why = "header bytes";
+        else if (llama_nk_rd<uint32_t>(h, 8)  != 2)                      why = "enc (ENC_W2 only)";
+        else if (llama_nk_rd<uint32_t>(h, 12) != 2)                      why = "mode (G128 exact only)";
+        else if (llama_nk_rd<uint32_t>(h, 16) != (uint32_t) GGML_TYPE_Q2_0) why = "src_type";
+        else if (llama_nk_rd<uint32_t>(h, 20) != (uint32_t) F)          why = "F";
+        else if (llama_nk_rd<uint32_t>(h, 24) != (uint32_t) K)          why = "K";
+        else if (llama_nk_rd<uint16_t>(h, 28) != 128 || llama_nk_rd<uint16_t>(h, 30) != 128) why = "BF/BK";
+        else if (llama_nk_rd<uint16_t>(h, 34) != 256)                    why = "NT";
+        else if ((llama_nk_rd<uint32_t>(h, 40) & 4) == 0)                why = "flags (scales-in-tensor bit)";
+        else if (llama_nk_rd<uint64_t>(h, 44) != 0)                      why = "compact_bytes (must be 0)";
+        else if (llama_nk_rd<uint64_t>(h, 52) != w2)                     why = "prefill_bytes";
+        else if (llama_nk_rd<uint32_t>(h, 76) != w2)                     why = "scales_offset (in tensor)";
+        else if (llama_nk_rd<uint32_t>(h, 80) != scales)                 why = "scales_bytes";
+        else if (llama_nk_rd<uint32_t>(h, 84) != 1)                      why = "scales_type";
+        else if (F % 128 != 0 || K % 128 != 0 || w2 + scales != ggml_nbytes(&t_meta)) why = "shape";
+        if (!why.empty()) {
+            throw std::runtime_error(format("NK companion '%s' does not match '%s' (%s) -- refusing",
+                    cname.c_str(), name.c_str(), why.c_str()));
+        }
+        nk_expect ex;
+        ex.compact_bytes = 0;
+        ex.fp_compact    = llama_nk_rd<uint64_t>(h, 60);
+        ex.fp_prefill    = llama_nk_rd<uint64_t>(h, 68);
+        nk_dual[name] = ex;
+
+        ggml_tensor * comp = ggml_dup_tensor(ctx, cw->tensor);   // loaded (256 B) so the tensor count matches
+        ggml_set_name(comp, cname.c_str());
+        n_created++;
+    }
+
+    if (is_nk) {
+        const std::string name  = tn.str();
+        const std::string cname = name + ".nk";
+        if (flags & TENSOR_DUPLICATED) {
+            throw std::runtime_error(format("NK dual tensor '%s' cannot be duplicated", name.c_str()));
+        }
+        const llama_tensor_weight * cw = get_weight(cname.c_str());
+        if (!cw) {
+            throw std::runtime_error(format("NK dual tensor '%s' has no companion '%s' -- refusing (CONTRACT 3.3)",
+                    name.c_str(), cname.c_str()));
+        }
+        // header check (structural); fingerprints are checked when the data is loaded
+        uint8_t h[256];
+        if (ggml_nbytes(cw->tensor) < sizeof(h) || cw->tensor->type != GGML_TYPE_I8) {
+            throw std::runtime_error(format("NK companion '%s' too small or not I8", cname.c_str()));
+        }
+        files.at(cw->idx)->seek(cw->offs, SEEK_SET);
+        files.at(cw->idx)->read_raw(h, sizeof(h));
+        const int64_t K = t_meta.ne[0], F = t_meta.ne[1], G = K / 128;
+        const size_t  cb = t_sel.type == GGML_TYPE_Q2_0 ? 34 : 18;
+        const size_t  compact = (size_t) F * G * cb, prefill = (size_t) F * K / 4, scales = (size_t) G * F * 2;
+        std::string why;
+        if (memcmp(h, "NKB1", 4) != 0)                                   why = "magic";
+        else if (llama_nk_rd<uint16_t>(h, 4)  != 1)                      why = "NK_VERSION";
+        else if (llama_nk_rd<uint16_t>(h, 6)  != 256)                    why = "header bytes";
+        else if (llama_nk_rd<uint32_t>(h, 8)  != 2)                      why = "enc (loader supports ENC_W2 only)";
+        else if (llama_nk_rd<uint32_t>(h, 12) != 2)                      why = "mode (loader supports G128 exact only)";
+        else if (llama_nk_rd<uint32_t>(h, 16) != (uint32_t) t_sel.type) why = "src_type";
+        else if (llama_nk_rd<uint32_t>(h, 20) != (uint32_t) F)          why = "F";
+        else if (llama_nk_rd<uint32_t>(h, 24) != (uint32_t) K)          why = "K";
+        else if (llama_nk_rd<uint16_t>(h, 28) != 128 || llama_nk_rd<uint16_t>(h, 30) != 128) why = "BF/BK";
+        else if (llama_nk_rd<uint16_t>(h, 34) != 256)                    why = "NT";
+        else if (llama_nk_rd<uint64_t>(h, 44) != compact)                why = "compact_bytes";
+        else if (llama_nk_rd<uint64_t>(h, 52) != prefill)                why = "prefill_bytes";
+        else if (llama_nk_rd<uint32_t>(h, 76) != 256)                    why = "scales_offset";
+        else if (llama_nk_rd<uint32_t>(h, 80) != scales)                 why = "scales_bytes";
+        else if (llama_nk_rd<uint32_t>(h, 84) != 1)                      why = "scales_type";
+        else if (ggml_nbytes(cw->tensor) != 256 + scales)                why = "companion size";
+        else if (F % 128 != 0 || K % 128 != 0 || compact + prefill != ggml_nbytes(&t_meta)) why = "shape";
+        if (!why.empty()) {
+            throw std::runtime_error(format("NK companion '%s' does not match '%s' (%s) -- refusing",
+                    cname.c_str(), name.c_str(), why.c_str()));
+        }
+        nk_expect ex;
+        ex.compact_bytes = compact;
+        ex.fp_compact    = llama_nk_rd<uint64_t>(h, 60);
+        ex.fp_prefill    = llama_nk_rd<uint64_t>(h, 68);
+        const std::string dname = name + LLAMA_NK_DUAL_SUFFIX;
+        nk_dual[dname] = ex;
+
+        // re-key the file tensor so load_all_data loads the whole blob into the backing tensor, never the view
+        auto node = weights_map.extract(name);
+        GGML_ASSERT(!node.empty());
+        node.key() = dname;
+        weights_map.insert(std::move(node));
+
+        ggml_tensor * dual = ggml_dup_tensor(ctx, &t_meta);
+        ggml_set_name(dual, dname.c_str());
+        ggml_tensor * comp = ggml_dup_tensor(ctx, cw->tensor);
+        ggml_set_name(comp, cname.c_str());
+        dual->extra = comp;
+        n_created += 2;
+
+        ggml_tensor * view = ggml_new_tensor(ctx, t_sel.type, GGML_MAX_DIMS, t_sel.ne);
+        view->view_src  = dual;
+        view->view_offs = 0;
+        ggml_set_name(view, name.c_str());
+        if (t_sel.type == GGML_TYPE_Q2_0) {
+            ggml_q2_0_variant_bind(view, GGML_Q2_0_VARIANT_G128);
+        }
+        return view;
+    }
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
     if (flags & TENSOR_DUPLICATED) {
@@ -1439,6 +1615,7 @@ bool llama_model_loader::load_all_data(
 
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
+    std::vector<std::future<std::tuple<std::string, uint64_t, uint64_t>>> nk_results;   // T400 N4 fingerprints
 
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
     // NVMe raid configurations might require more / larger buffers.
@@ -1553,6 +1730,42 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
+        // T400 N4: fingerprint a dual blob while it passes through host memory (CONTRACT 3.3)
+        const auto nk_it   = nk_dual.find(ggml_get_name(cur));
+        const bool nk_hash = nk_it != nk_dual.end() && llama_nk_verify_enabled();
+        const size_t nk_cb = nk_hash ? nk_it->second.compact_bytes : 0;
+        XXH64_state_t * nk_sc = nullptr;
+        XXH64_state_t * nk_sp = nullptr;
+        bool nk_streamed = false;
+        auto nk_feed = [&](const void * p, size_t off, size_t len) {
+            if (!nk_hash) {
+                return;
+            }
+            if (!nk_sc) {
+                nk_sc = XXH64_createState(); XXH64_reset(nk_sc, 0);
+                nk_sp = XXH64_createState(); XXH64_reset(nk_sp, 0);
+            }
+            nk_streamed = true;
+            const uint8_t * b = (const uint8_t *) p;
+            if (off < nk_cb) {
+                const size_t n = std::min(len, nk_cb - off);
+                XXH64_update(nk_sc, b, n);
+                b += n; len -= n;
+            }
+            if (len) {
+                XXH64_update(nk_sp, b, len);
+            }
+        };
+        auto nk_async = [&](const uint8_t * p) {
+            if (!nk_hash) {
+                return;
+            }
+            const std::string nm = ggml_get_name(cur);
+            nk_results.emplace_back(std::async(std::launch::async, [nm, p, n_size, nk_cb] {
+                return std::make_tuple(nm, XXH64(p, nk_cb, 0), XXH64(p + nk_cb, n_size - nk_cb, 0));
+            }));
+        };
+
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
             ggml_backend_buffer_t buf_mmap = nullptr;
@@ -1560,6 +1773,7 @@ bool llama_model_loader::load_all_data(
                 buf_mmap = bufs.at(weight->idx);
             }
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
+            nk_async(data);
 
             if (check_tensors) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
@@ -1587,6 +1801,7 @@ bool llama_model_loader::load_all_data(
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
+                nk_async((const uint8_t *) cur->data);
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
@@ -1635,6 +1850,8 @@ bool llama_model_loader::load_all_data(
                             data_to_copy -= (read_end - (offset + n_size));
                         }
 
+                        nk_feed(reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
+
                         // Async upload actual data to GPU
                         ggml_backend_tensor_set_async(upload_backend, cur,
                                                       reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
@@ -1650,6 +1867,7 @@ bool llama_model_loader::load_all_data(
                     read_buf.resize(n_size);
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(read_buf.data(), n_size);
+                    nk_feed(read_buf.data(), 0, n_size);
                     ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
                     if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
@@ -1658,8 +1876,29 @@ bool llama_model_loader::load_all_data(
             }
         }
 
+        if (nk_streamed) {
+            nk_check(ggml_get_name(cur), XXH64_digest(nk_sc), XXH64_digest(nk_sp));
+        }
+        if (nk_sc) {
+            XXH64_freeState(nk_sc);
+            XXH64_freeState(nk_sp);
+        }
+
         size_done += n_size;
     }
+
+    // T400 N4: model-facing compact views of dual tensors (normally initialised by the buffer allocation; this
+    // covers buffers whose tensors are placed by load_all_data itself, e.g. CPU mmap)
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->view_src && llama_nk_is_dual(t->view_src->type) && t->data == nullptr && t->view_src->data != nullptr) {
+            GGML_ASSERT(ggml_backend_view_init(t) == GGML_STATUS_SUCCESS);
+        }
+    }
+    for (auto & f : nk_results) {
+        const auto r = f.get();
+        nk_check(std::get<0>(r), std::get<1>(r), std::get<2>(r));
+    }
+    nk_results.clear();
 
     // free temporary resources used for async uploads
     for (auto * event : events) {
@@ -1686,6 +1925,17 @@ bool llama_model_loader::load_all_data(
 
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
+        if (!nk_dual.empty()) {
+            int n_ok = 0;
+            for (const auto & it : nk_dual) {
+                if (llama_nk_verify_enabled() && !it.second.verified) {
+                    throw std::runtime_error(format("NK dual tensor '%s' was not fingerprint-verified", it.first.c_str()));
+                }
+                n_ok += it.second.verified;
+            }
+            LLAMA_LOG_INFO("%s: NK native dual-blob tensors: %zu (fingerprints verified: %d%s)\n", __func__,
+                    nk_dual.size(), n_ok, llama_nk_verify_enabled() ? "" : ", GGML_NK_VERIFY=0");
+        }
         // unmap offloaded tensors and metadata
         if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
@@ -1705,6 +1955,17 @@ bool llama_model_loader::load_all_data(
     }
 
     return true;
+}
+
+void llama_model_loader::nk_check(const std::string & name, uint64_t fp_c, uint64_t fp_p) {
+    auto it = nk_dual.find(name);
+    GGML_ASSERT(it != nk_dual.end());
+    if (fp_c != it->second.fp_compact || fp_p != it->second.fp_prefill) {
+        throw std::runtime_error(format("NK dual tensor '%s': fingerprint mismatch (compact %016" PRIx64 " vs %016" PRIx64
+                ", prefill %016" PRIx64 " vs %016" PRIx64 ") -- refusing", name.c_str(), fp_c, it->second.fp_compact,
+                fp_p, it->second.fp_prefill));
+    }
+    it->second.verified = true;
 }
 
 std::string llama_model_loader::ftype_name() const {

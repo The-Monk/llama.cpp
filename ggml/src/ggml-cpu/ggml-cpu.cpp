@@ -429,6 +429,16 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    // T399: a single-copy W2ONLY tensor is readable by MUL_MAT (as src0) only
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] && op->src[i]->type == GGML_TYPE_NK_Q2_0_W2ONLY && (op->op != GGML_OP_MUL_MAT || i != 0)) {
+            return false;
+        }
+    }
+    if (op->type == GGML_TYPE_NK_Q2_0_W2ONLY) {
+        return false;
+    }
+
     // check extra buffer types
     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {

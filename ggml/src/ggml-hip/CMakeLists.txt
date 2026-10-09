@@ -111,6 +111,11 @@ if (EXISTS "${GGML_HIP_CK_REF_DIR}/include/ck/config.h")
         INCLUDE_DIRECTORIES "${GGML_HIP_CK_REF_DIR}/include;${GGML_HIP_CK_REF_DIR}/library/include")
 endif()
 
+# T399: the single-copy WMMA kernels spill under -funsafe-math-optimizations (NT 32/48: 245/318 VGPRs spilled, ~4x
+# slower in the model); without it they allocate as measured in phase 1 (168/225 VGPRs, 0 spills). The flag comes
+# after the global one, so it wins for this file only.
+set_source_files_properties(../ggml-cuda/mul_mat_sc.cu PROPERTIES COMPILE_OPTIONS "-fno-unsafe-math-optimizations")
+
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)
     target_compile_definitions(ggml PUBLIC GGML_USE_CUDA)

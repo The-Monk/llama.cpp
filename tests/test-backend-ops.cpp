@@ -4278,6 +4278,74 @@ struct test_rwkv_wkv7 : public test_case {
 };
 
 // GGML_OP_MUL_MAT
+// T399 single-copy weights (GGML_TYPE_NK_Q2_0_W2ONLY): random fp32 -> Q2_0 (g128) -> W2 stream + sw on the host.
+// mode 0: one MUL_MAT; mode 1: ng MUL_MATs on the same activation (summed: they run consecutively = one group);
+// mode 2: RMS_NORM -> MUL -> MUL_MAT (act-fuse norm producer); mode 3: SWIGLU -> MUL_MAT (act-fuse GLU producer).
+struct test_mul_mat_w2only : public test_case {
+    const int64_t m, n, k;
+    const int mode, ng;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MUL_MAT_W2ONLY"; }
+    std::string vars() override { return VARS_TO_STR5(m, n, k, mode, ng); }
+    double max_nmse_err() override { return 5e-4; }
+    uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return 2 * m * n * k * (mode == 1 ? ng : 1); }
+
+    test_mul_mat_w2only(int64_t m = 128, int64_t n = 1, int64_t k = 256, int mode = 0, int ng = 1)
+        : m(m), n(n), k(k), mode(mode), ng(ng) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * b;
+        if (mode == 2) {
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+            ggml_set_name(x, "x"); ggml_set_name(w, "nw");
+            b = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        } else if (mode == 3) {
+            ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_tensor * u = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_set_name(g, "gate"); ggml_set_name(u, "up");
+            b = ggml_swiglu_split(ctx, g, u);
+        } else {
+            b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_set_name(b, "b");
+        }
+        const int nm = mode == 1 ? ng : 1;
+        ggml_tensor * mm[4];
+        for (int i = 0; i < nm; ++i) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_NK_Q2_0_W2ONLY, k, m);
+            ggml_set_name(a, ("a" + std::to_string(i)).c_str());
+            mm[i] = ggml_mul_mat(ctx, a, b);
+        }
+        // right-nested sum: the graph visits mm[0], mm[1], ... consecutively
+        ggml_tensor * out = mm[nm - 1];
+        for (int i = nm - 2; i >= 0; --i) {
+            out = ggml_add(ctx, mm[i], out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_NK_Q2_0_W2ONLY) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            const int64_t K = t->ne[0], F = t->ne[1];
+            std::vector<float> data(K * F);
+            std::default_random_engine gen(std::random_device{}());
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            for (auto & v : data) v = dist(gen);
+            GGML_ASSERT(ggml_row_size(GGML_TYPE_Q2_0, K) == (size_t) K / 128 * 34);
+            std::vector<uint8_t> q(ggml_row_size(GGML_TYPE_Q2_0, K) * F);
+            ggml_quantize_chunk(GGML_TYPE_Q2_0, data.data(), q.data(), 0, F, K, nullptr);
+            std::vector<uint8_t> sc(ggml_nbytes(t));
+            ggml_nk_w2only_from_q2_0(q.data(), sc.data(), F, K);
+            ggml_backend_tensor_set(t, sc.data(), 0, sc.size());
+        }
+    }
+};
+
 struct test_mul_mat : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -8171,6 +8239,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
 
+    // T399 single-copy weights: every batch band (GEMV 1..7, WMMA 8..48, N1 >= 49), groups, fused producers
+    for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 47, 48, 49, 50, 56, 63, 64, 65, 127, 128, 200}) {
+        test_cases.emplace_back(new test_mul_mat_w2only(256, n, 512, 0, 1));
+    }
+    for (int64_t n : {1, 8, 48, 64}) {
+        test_cases.emplace_back(new test_mul_mat_w2only(1024, n, 5120, 0, 1));
+        test_cases.emplace_back(new test_mul_mat_w2only(5120, n, 6144, 0, 1));
+    }
+    for (int ng : {2, 3, 4}) {
+        for (int64_t n : {1, 3, 4, 7, 8, 24, 48, 49, 64}) {
+            test_cases.emplace_back(new test_mul_mat_w2only(256, n, 512, 1, ng));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_w2only(17408, 1, 5120, 1, 2));   // ffn gate+up shape: whole-tile GEMV
+    test_cases.emplace_back(new test_mul_mat_w2only(17408, 4, 5120, 1, 2));
+    for (int mode : {2, 3}) {
+        for (int64_t n : {1, 2, 7, 8, 13, 16, 33, 48, 49, 64, 130}) {
+            test_cases.emplace_back(new test_mul_mat_w2only(256, n, 1024, mode, 1));
+        }
+    }
+
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int v : {0, 1}) {
@@ -10016,6 +10105,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t n_tokens : {512, 2048}) {
             test_cases.emplace_back(new test_glu(GGML_GLU_OP_SWIGLU, type, { 2*17408, n_tokens, 1, 1 }, 0, false));
             test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SWIGLU, type, { 17408, n_tokens, 1, 1 }, 0));
+        }
+    }
+
+    // T400 N4 single-copy study: Bonsai-27B weight shapes (F x K) on the Q2_0/Q1_0 path, batch 1 (decode mmvq)
+    // and batch 512 (prefill; with GGML_N1_PREFILL=1 [GGML_N1_TRANSIENT=1] this is N1 [with per-call W2 re-pack])
+    for (ggml_type t : {GGML_TYPE_Q2_0, GGML_TYPE_Q1_0}) {
+        for (auto fk : std::vector<std::array<int64_t, 2>>{{6144, 5120}, {10240, 5120}, {12288, 5120}, {17408, 5120},
+                                                            {5120, 17408}, {5120, 6144}, {1024, 5120}, {248320, 5120}}) {
+            for (int64_t n : {1, 512}) {
+                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, fk[0], n, fk[1], {1, 1}, {1, 1}));
+            }
         }
     }
 

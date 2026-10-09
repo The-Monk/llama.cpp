@@ -38,6 +38,10 @@ enum ggml_cuda_act_fuse_bit {
 // Producers need ncols % 128 == 0 for it; y must hold ggml_cuda_n1_act_bytes(dst) bytes.
 #define GGML_CUDA_ACT_LAYOUT_N1 100
 
+// T399: activation layout id of the single-copy decode / small-batch kernels (sc_act.cuh: int8 xq[NP][K] + half2
+// ds[K/32][NP]). Producers need ncols % 128 == 0; y must hold ggml_cuda_sc_act_bytes(dst) bytes.
+#define GGML_CUDA_ACT_LAYOUT_SC 101
+
 int  ggml_cuda_act_fuse_mask();
 bool ggml_cuda_act_fuse_verify();
 
