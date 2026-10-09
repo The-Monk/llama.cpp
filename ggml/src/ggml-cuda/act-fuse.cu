@@ -11,7 +11,7 @@
 int ggml_cuda_act_fuse_mask() {
     static const int mask = [] {
         const char * e = getenv("GGML_ACT_FUSE");
-        if (e == nullptr || atoi(e) == 0) {
+        if (e != nullptr && atoi(e) == 0) {
             return 0;
         }
         const char * m = getenv("GGML_ACT_FUSE_MASK");

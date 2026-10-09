@@ -2,7 +2,7 @@
 
 // [TAG_ACT_FUSE] T407: activation-path fusion set for prefill (MMQ consumers).
 //
-// GGML_ACT_FUSE=1 enables it (default off); GGML_ACT_FUSE_MASK selects parts:
+// on by default (GGML_ACT_FUSE=0 disables); GGML_ACT_FUSE_MASK selects parts:
 //   1 = quantize dedup: sibling MUL_MATs that read the same src1 share one
 //       MMQ q8_1 activation buffer (ctx.act_cache_*), quantized once.
 //   2 = GLU -> quantize: a swiglu whose only consumer is the next MUL_MAT
