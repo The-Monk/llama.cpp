@@ -14,6 +14,9 @@ cache in `mmq.cu` (`ggml_cuda_mul_mat_q`), graph hooks in `ggml-cuda.cu` (`[TAG_
   (single-op graphs: these do not exercise the producers; VERIFY + KLD do).
 - KLD vs default base, wikitext-2 c512 20 chunks: control, mask 1, 2, 4, 7 all mean 0.000000,
   max 0.000057 (Q2_0) / 0.000060 (Q1_0) = control floor, same top-1 100%.
+- CUDA-graph replay (job 370, -b 512 -ub 512, 20 chunks): 2 graphs evaluated, 18 replayed with the
+  producers + cache captured; KLD vs default base = control floor (max 5.9e-5), top-1 100%, both models.
+- Default path unchanged: default pp512/pp2048 1305/1356 vs T403 census 1307/1353.
 - Decode tg128 r3 x2 rounds: Q2_0 def 63.52/63.76 vs fused 63.65/63.66; Q1_0 def 91.65/91.30 vs fused 91.18/91.67 (noise).
 
 ## Speed (llama-bench -ngl 99 -n 0 -p 512,2048 -r 3, 4 interleaved rounds, mean [min-max] t/s)
