@@ -248,10 +248,12 @@ void ggml_cuda_mul_mat_q(
         // src1 tensor, layout and size, i.e. the bytes this call would write.
         const int  act_layout = ggml_cuda_act_fuse_mask() && !use_native_fp4 && !use_native_f8e4m3 && !use_native_f8e5m2 ?
             (use_scale_hoist ? (int) MMQ_Q8_1_DS_LAYOUT_D128 : (int) mmq_get_q8_1_ds_layout(src0->type)) : -1;
-        const bool act_cache  = act_layout >= 0 && ne11 > MMVQ_MAX_BATCH_SIZE &&
-            ((ggml_cuda_act_fuse_mask() & GGML_ACT_FUSE_DEDUP) || ctx.act_pending == src1);
-        const bool act_hit    = act_cache && ctx.act_cache_tensor == src1 && ctx.act_cache_buf &&
+        // Entries written by a fused producer (GLU / norm) are consumed even
+        // with the dedup bit off; only DEDUP makes a miss populate the cache.
+        const bool act_ok     = act_layout >= 0 && ne11 > MMVQ_MAX_BATCH_SIZE;
+        const bool act_hit    = act_ok && ctx.act_cache_tensor == src1 && ctx.act_cache_buf &&
             ctx.act_cache_layout == act_layout && ctx.act_cache_bytes == nbytes_src1_q8_1;
+        const bool act_cache  = act_hit || (act_ok && (ggml_cuda_act_fuse_mask() & GGML_ACT_FUSE_DEDUP));
         if (ctx.act_pending == src1) {
             // A GLU skipped its fp32 store for this consumer: the cache must hit.
             GGML_ASSERT(act_hit && "act-fuse: pending GLU consumer missed the cache");

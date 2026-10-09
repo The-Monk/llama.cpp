@@ -16,7 +16,7 @@ int ggml_cuda_act_fuse_mask() {
         }
         const char * m = getenv("GGML_ACT_FUSE_MASK");
         const int v = m ? atoi(m) : (GGML_ACT_FUSE_DEDUP | GGML_ACT_FUSE_GLU | GGML_ACT_FUSE_NORM);
-        GGML_LOG_INFO("%s: T407 activation-path fusion on, mask %d (1 dedup, 2 glu, 4 norm/add)%s\n",
+        fprintf(stderr, "%s: T407 activation-path fusion on, mask %d (1 dedup, 2 glu, 4 norm/add)%s\n",
                       __func__, v, getenv("GGML_ACT_FUSE_VERIFY") ? ", VERIFY" : "");
         return v;
     }();

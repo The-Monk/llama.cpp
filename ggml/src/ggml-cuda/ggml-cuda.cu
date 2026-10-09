@@ -5330,7 +5330,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                if (act_fuse && !is_concurrent_event_active && !use_cuda_graph) {
+                // producers only launch kernels and take pool memory (capture-safe, like the
+                // mmvq dedup); VERIFY syncs, so it runs only outside CUDA graph capture
+                if (act_fuse && !is_concurrent_event_active && !(use_cuda_graph && ggml_cuda_act_fuse_verify())) {
                     const int act_n = ggml_cuda_act_try_fuse(cuda_ctx, cgraph, i);
                     if (act_n >= 0) {
                         i += act_n;
@@ -5560,7 +5562,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         static const bool stats = getenv("GGML_ACT_FUSE_STATS") != nullptr;
         ggml_backend_cuda_context & c = *cuda_ctx;
         if (stats && (c.act_stat_hit || c.act_stat_miss || c.act_stat_glu || c.act_stat_norm || c.act_stat_norm_add)) {
-            GGML_LOG_INFO("act-fuse: graph %d nodes: mmq-act hit %lld miss %lld | glu %lld norm %lld add+norm %lld | verify %lld/%lld bytes differ\n",
+            fprintf(stderr, "act-fuse: graph %d nodes: mmq-act hit %lld miss %lld | glu %lld norm %lld add+norm %lld | verify %lld/%lld bytes differ\n",
                 cgraph->n_nodes, (long long) c.act_stat_hit, (long long) c.act_stat_miss, (long long) c.act_stat_glu,
                 (long long) c.act_stat_norm, (long long) c.act_stat_norm_add,
                 (long long) c.act_stat_verify_diff, (long long) c.act_stat_verify_bytes);
