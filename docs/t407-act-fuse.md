@@ -54,3 +54,21 @@ Producers = load functor x store functor. N1 adds a store struct `operator()(row
 layout under the same warp-collective contract (lane L owns columns [4L, 4L+4) of a 128-aligned span),
 a layout id from `ggml_cuda_mmq_act_layout`'s N1 twin, and a case in the layout switches of
 `ggml_cuda_act_glu_quant` / `ggml_cuda_act_norm_quant`; the cache key already includes the layout.
+
+## Re-gate at production ubatch 1024 + llama-server (enki jobs 389/390/391)
+
+Scripts: ~/scratch/t407/scripts/ub_{a,c,bd}.sh. Same binaries as the tip (llama-server built, libs relinked only).
+
+- KLD, -c 1024 -b 1024 -ub 1024, 10 chunks, both models: control and fused both at the control floor
+  (mean 0, max 5.6e-5 Q2_0 / 6.3e-5 Q1_0, top-1 100%). STATS: 2 lines per 10 chunks (graph replay), each
+  hit 432 miss 65, glu 64, norm 1, add+norm 127.
+- VERIFY arm: 0 of 2,038,431,744 q8_1 bytes differ in the eager graph. The captured graph runs without
+  producers when VERIFY is set (ggml-cuda.cu:5335, by design), so its line shows glu/add+norm 0 and
+  verify 0/0. Job 389 exit 1 is the script flagging that line, not a mismatch.
+- llama-server -ub 1024 -c 8192, 12 prompts (4 long: 1951/2034/1864/1896 tokens), greedy n_predict 64,
+  n_probs 5: text and top-5 logprobs identical on 12/12 prompts, both models. Fused path fired in the
+  server: 12 graph lines with hit 432, glu 64, add+norm 127; 0 lines in the default arm.
+- Speed, -ub 1024 -b 4096 -r 3, 4 interleaved rounds (mean t/s, default -> fused):
+  Q2_0 pp2048 1408.7 -> 1457.1 (+3.4%), pp4096 1345.3 -> 1389.0 (+3.2%);
+  Q1_0 pp2048 1409.1 -> 1460.4 (+3.6%), pp4096 1348.3 -> 1394.9 (+3.5%). Fused = 19.3-20.3% of 7,200.
+- Decode tg128, 2 rounds: Q2_0 63.5 / 63.6, Q1_0 91.6 / 91.9 (noise).
