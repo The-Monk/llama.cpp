@@ -1765,7 +1765,7 @@ static __global__ void flash_attn_ext_f16(
 #ifdef RDNA3
     constexpr bool hd256_ok = false;
 #else
-    // T406: DKQ == 256 compiled for RDNA4 (dispatcher only routes it under GGML_HIP_FA_MMA_HD256=1).
+    // T406: DKQ == 256 compiled for RDNA4 (dispatcher routes it by default; GGML_HIP_FA_MMA_HD256=0 disables).
     constexpr bool hd256_ok = DKQ == 256 && DV == 256;
 #endif // RDNA3
     if (ncols1*ncols2 < 16 || ncols2 == 1 || (DKQ > 128 && !hd256_ok)) {
