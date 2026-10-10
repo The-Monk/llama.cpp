@@ -88,6 +88,29 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
     }
 
+    if constexpr (DKQ == 256 && DV == 256) {
+        // T406, RDNA4 hd256 path (default on; GGML_HIP_FA_MMA_HD256=0 disables): use the largest ncols2 in {8,4,2}
+        // that divides gqa_ratio, so no Q columns are padding (gqa 6 -> 2; ncols2 8 would pad 2 of 8 columns).
+        // Measured on Qwen3.x 27B (gqa 6): ncols2 2 vs 8 = +1.2% pp2048, +3.0% pp8192.
+        // GGML_HIP_FA_MMA_HD256_NCOLS2 (2/4/8) overrides.
+        static const int hd256_ncols2_env = [] {
+            const char * e = getenv("GGML_HIP_FA_MMA_HD256_NCOLS2");
+            return e != nullptr ? atoi(e) : 0;
+        }();
+        if (amd_wmma_available(cc) && use_gqa_opt) {
+            int nc2 = hd256_ncols2_env;
+            if (nc2 <= 0 || gqa_ratio % nc2 != 0) {
+                nc2 = gqa_ratio % 8 == 0 ? 8 : gqa_ratio % 4 == 0 ? 4 : gqa_ratio % 2 == 0 ? 2 : 0;
+            }
+            switch (nc2) {
+                case 8: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst); return;
+                case 4: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst); return;
+                case 2: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst); return;
+                default: break; // odd gqa_ratio: fall through to the generic selection below
+            }
+        }
+    }
+
     if (use_gqa_opt && gqa_ratio > 4) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
         return;
@@ -515,6 +538,23 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // AMD WMMA is always faster than the tile kernel if the full tile width of 16 can be utilized.
     if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 128) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
         return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
+    // T406: WMMA MMA path for head size 256 at prefill batch sizes (Qwen3.x/Bonsai full-attention layers).
+    // On by default (GGML_HIP_FA_MMA_HD256=0 disables); Q->ne[1]*gqa_ratio_eff must exceed GGML_HIP_FA_MMA_HD256_MIN
+    // (default 64) so decode and small speculative-verify batches keep the existing vec/tile kernels.
+    if (amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA4(cc) && gqa_opt_applies && Q->ne[0] == 256 && V->ne[0] == 256) {
+        static const bool hd256_on = [] {
+            const char * e = getenv("GGML_HIP_FA_MMA_HD256");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        static const int hd256_min = [] {
+            const char * e = getenv("GGML_HIP_FA_MMA_HD256_MIN");
+            return e != nullptr ? atoi(e) : 64;
+        }();
+        if (hd256_on && Q->ne[1] * gqa_ratio_eff > hd256_min) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
     }
 
     // If there are no tensor cores available, use the generic tile kernel:

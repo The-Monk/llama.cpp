@@ -155,10 +155,13 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 32, 128, 2,  64,  96,  64,  64, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 64, 128, 2,  64,  96,  64,  64, 1, true);
 
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8,  64, 2,  32, 128, 128, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 2,  32, 128, 128, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128,  64, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  64, 128, 128,  64, 1, true);
+    // T406 (RDNA4, opt-in): the previous hd256 rows (Q in registers, nbatch_K2/V2 128, 128 threads) spilled 400-557 VGPRs.
+    // Q in shared memory + nbatch_K2/V2 64 + 256 threads/occupancy 1 for ncols 64 compiles with 0 spills (233-241 VGPR).
+    // Measured within 0.5% of: nbatch_fa 64, nbatch_K2/V2 128, Q in registers (all of which spill again).
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8,  64, 2,  32,  64,  64, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 2,  32,  64,  64, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 1,  32,  64,  64,  64, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 1,  32,  64,  64,  64, 1, false);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 160, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 128, 2,  32, 160, 128, 128, 1, true);
@@ -1759,7 +1762,13 @@ static __global__ void flash_attn_ext_f16(
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
 
 #if defined(AMD_WMMA_AVAILABLE)
-    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 128) {
+#ifdef RDNA3
+    constexpr bool hd256_ok = false;
+#else
+    // T406: DKQ == 256 compiled for RDNA4 (dispatcher routes it by default; GGML_HIP_FA_MMA_HD256=0 disables).
+    constexpr bool hd256_ok = DKQ == 256 && DV == 256;
+#endif // RDNA3
+    if (ncols1*ncols2 < 16 || ncols2 == 1 || (DKQ > 128 && !hd256_ok)) {
         NO_DEVICE_CODE;
         return;
     }
