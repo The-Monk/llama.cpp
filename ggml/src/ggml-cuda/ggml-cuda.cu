@@ -4273,6 +4273,10 @@ static int ggml_cuda_find_sc_group(const ggml_cgraph * cgraph, int i, ggml_tenso
     return n;
 }
 
+// T434 M3: defined with the act-fuse helpers below
+static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i,
+        const ggml_tensor * x, const ggml_tensor * signs, ggml_tensor * mm);
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4394,6 +4398,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_is_contiguous(x) && ggml_is_contiguous(signs) &&
             signs->ne[0] == x->ne[0] && signs->ne[0] % mm->src[0]->ne[0] == 0;
 
+        // T434: GGML_N1_M3 consumers read the FWHT output through the per-token int8 N1 layout: quantize in the same kernel
+        if (pattern_ok && ggml_cuda_m3_fwht_quant(cuda_ctx, cgraph, i, x, signs, mm)) {
+            return 2;
+        }
         if (pattern_ok && ggml_cuda_op_fwht_signed(*cuda_ctx, x, signs, mm)) {
             return 2;
         }
@@ -5159,7 +5167,7 @@ static void ggml_cuda_act_note_write(ggml_backend_cuda_context * ctx, const ggml
 }
 
 static void ggml_cuda_act_cache_set(ggml_backend_cuda_context * ctx, const ggml_tensor * t, int layout, int cc) {
-    const bool n1 = layout == GGML_CUDA_ACT_LAYOUT_N1 || layout == GGML_CUDA_ACT_LAYOUT_N1G256;
+    const bool n1 = layout == GGML_CUDA_ACT_LAYOUT_N1 || layout == GGML_CUDA_ACT_LAYOUT_N1G256 || layout == GGML_CUDA_ACT_LAYOUT_N1TOK;
     const size_t bytes = n1 ? ggml_cuda_n1_act_bytes(t) :
                          layout == GGML_CUDA_ACT_LAYOUT_SC ? ggml_cuda_sc_act_bytes(t) : ggml_cuda_mmq_act_bytes(t, cc);
     ctx->act_cache_buf.reset();
@@ -5382,6 +5390,97 @@ static int ggml_cuda_act_try_fuse(ggml_backend_cuda_context * ctx, ggml_cgraph *
         return n > 0 ? n : -1;
     }
     return -1;
+}
+
+// T434 M3 (GGML_N1_M3=1): the Hadamard sign-flip + FWHT node `mm` (nodes i, i+1, i+2 of the fused pattern) feeds one-GEMM N1
+// matmuls through a RESHAPE view `rs`. Run the signed FWHT fused with the per-token quantize into the N1TOK act cache (keyed
+// on `mm`). The fp32 FWHT output is skipped only when EVERY use of the activation is a one-GEMM matmul that reads the cache
+// and those matmuls directly follow the producer (the cache is a single slot); otherwise it is written as before.
+static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i,
+        const ggml_tensor * x, const ggml_tensor * signs, ggml_tensor * mm) {
+    static const bool fuse_on = [] {
+        const char * m3 = getenv("GGML_N1_M3"), * e = getenv("GGML_N1_M3_FUSE");
+        return m3 && strcmp(m3, "1") == 0 && !(e && atoi(e) == 0);
+    }();
+    if (!fuse_on || !ggml_cuda_n1_enabled() || !(ggml_cuda_act_fuse_mask() & GGML_ACT_FUSE_DEDUP) ||
+        (mm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const int n = cgraph->n_nodes;
+    int jrs = -1;
+    for (int j = i + 3; j < n; ++j) {
+        const ggml_tensor * nd = cgraph->nodes[j];
+        if (nd->op == GGML_OP_RESHAPE && nd->src[0] == mm) { jrs = j; break; }
+    }
+    if (jrs < 0) {
+        return false;
+    }
+    const ggml_tensor * rs = cgraph->nodes[jrs];
+    int n_ready = 0, n_rs_uses = 0, n_mm_other = 0, last_ready = -1;
+    for (int j = i + 3; j < n; ++j) {
+        const ggml_tensor * nd = cgraph->nodes[j];
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (nd->src[k] == rs) {
+                n_rs_uses++;
+            } else if (nd->src[k] == mm && nd != rs) {
+                n_mm_other++;
+            }
+        }
+        if (nd->op == GGML_OP_MUL_MAT && nd->src[1] == rs && (nd->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            ggml_cuda_n1_m3_ready(nd->src[0], rs, nd)) {
+            n_ready++;
+            last_ready = j;
+        }
+    }
+    if (n_ready == 0) {
+        return false;
+    }
+    // no fp32 needed iff every use is a one-GEMM consumer and they run back to back (views and those matmuls only)
+    bool skip_fp32 = n_ready == n_rs_uses && n_mm_other == 0 && !(rs->flags & GGML_TENSOR_FLAG_OUTPUT);
+    for (int j = i + 3; skip_fp32 && j <= last_ready; ++j) {
+        const ggml_tensor * nd = cgraph->nodes[j];
+        if (!ggml_cuda_is_view_or_noop(nd) && !(nd->op == GGML_OP_MUL_MAT && nd->src[1] == rs)) {
+            skip_fp32 = false;
+        }
+    }
+    const int cc = ggml_cuda_info().devices[ctx->device].cc;
+    ggml_cuda_act_cache_set(ctx, rs, GGML_CUDA_ACT_LAYOUT_N1TOK, cc);
+    static const bool verify = getenv("GGML_N1_M3_VERIFY") != nullptr;   // gate only: syncs (run with GGML_CUDA_DISABLE_GRAPHS=1)
+    if (!ggml_cuda_op_fwht_signed_quant_n1t(*ctx, x, signs, mm, verify || !skip_fp32, ctx->act_cache_buf->get())) {
+        ctx->act_cache_tensor = nullptr;
+        ctx->act_cache_buf.reset();
+        return false;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    if (verify) {
+        // (a) the fused kernel's fp32 rotation vs the unfused FWHT kernel, (b) its int8 bytes vs the unfused per-token quantizer
+        // run on the UNFUSED kernel's fp32, (c) the same quantizer run on the fused kernel's own fp32 (isolates the quantize)
+        struct totals {
+            int64_t n = 0, df = 0, bf = 0, dq = 0, dq2 = 0, bq = 0;
+            ~totals() {
+                fprintf(stderr, "[N1] M3 VERIFY: %lld fused producers; fp32 FWHT bytes differ %lld / %lld; int8+scale bytes differ vs unfused-fp32 quantize %lld, "
+                        "vs quantize of the fused kernel's own fp32 %lld (of %lld)\n", (long long) n, (long long) df, (long long) bf, (long long) dq,
+                        (long long) dq2, (long long) bq);
+            }
+        };
+        static totals t;
+        const size_t nbf = ggml_nbytes(mm), bytes = ctx->act_cache_bytes;
+        ggml_cuda_pool_alloc<char> reff(ctx->pool(), nbf), ref(ctx->pool(), bytes), ref2(ctx->pool(), bytes);
+        ggml_tensor tmp = *mm;
+        tmp.data = reff.get();
+        ggml_cuda_op_fwht_signed(*ctx, x, signs, &tmp);   // the unfused reference fp32 into a scratch buffer
+        CUDA_CHECK(cudaMemsetAsync(ref.get(), 0, bytes, ctx->stream()));
+        CUDA_CHECK(cudaMemsetAsync(ref2.get(), 0, bytes, ctx->stream()));
+        ggml_cuda_n1_act_ref_quant_tok((const float *) reff.get(), rs->ne[0], rs->ne[0], ggml_nrows(rs), ref.get(), ctx->stream());
+        ggml_cuda_n1_act_ref_quant_tok((const float *) mm->data, rs->ne[0], rs->ne[0], ggml_nrows(rs), ref2.get(), ctx->stream());
+        t.df += ggml_cuda_act_count_diff(reff.get(), mm->data, nbf, ctx->stream());
+        t.dq += ggml_cuda_act_count_diff(ref.get(), ctx->act_cache_buf->get(), bytes, ctx->stream());
+        t.dq2 += ggml_cuda_act_count_diff(ref2.get(), ctx->act_cache_buf->get(), bytes, ctx->stream());
+        t.bf += (int64_t) nbf; t.bq += (int64_t) bytes; t.n++;
+    }
+    ctx->act_cache_tensor = mm;   // the consumers key on the FWHT MUL_MAT node (their src1 is its RESHAPE view)
+    ctx->act_nofp32       = skip_fp32 ? mm : nullptr;
+    return true;
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
@@ -5730,6 +5829,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // [TAG_ACT_FUSE] T407: same lifetime rule for the MMQ activation cache.
     cuda_ctx->act_cache_tensor = nullptr;
     cuda_ctx->act_cache_buf.reset();
+    cuda_ctx->act_nofp32 = nullptr;
     GGML_ASSERT(cuda_ctx->act_pending == nullptr);
 
     bool use_cuda_graph             = false;

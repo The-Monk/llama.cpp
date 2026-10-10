@@ -69,6 +69,9 @@ struct n1_env {
     bool    transient = false;
     bool    m1 = true;
     bool    m2 = false;
+    bool    m3 = false;     // GGML_N1_M3=1 (T434, default OFF, DIFFERENT MATH, KLD-gated): Hadamard-model activations (src1 = FWHT node)
+                            // quantised per TOKEN, folded int8 weights, ONE int32 accumulation over the whole K (no in-loop rescale)
+    int     m3_segs = 1;
     int     m2bc_flush = 8;
     bool    m2bc = false;   // GGML_N1_M2=2 (T424): M2 path + bias-carry rescale (one fmac per element per 256 K)
     n1_env() {
@@ -77,6 +80,10 @@ struct n1_env {
         const char * m2e = getenv("GGML_N1_M2");
         m2 = m2e && (strcmp(m2e, "1") == 0 || strcmp(m2e, "2") == 0);
         m2bc = m2e && strcmp(m2e, "2") == 0;
+        const char * m3e = getenv("GGML_N1_M3");
+        m3 = m3e && strcmp(m3e, "1") == 0;
+        const char * m3s = getenv("GGML_N1_M3_SEGS");
+        m3_segs = m3s && atoi(m3s) == 2 ? 2 : 1;
         const char * fe = getenv("GGML_N1_M2BC_FLUSH");
         m2bc_flush = fe ? atoi(fe) : 8;
         dump = getenv("GGML_N1_DUMP");
@@ -120,8 +127,13 @@ struct n1_stats {
     std::atomic<uint64_t> act_glu{0}, act_norm{0};          // ... hits written by the GLU / norm producers
     std::atomic<uint64_t> mm_nk{0}, mm_transient{0}, dumped{0};
     std::atomic<uint64_t> mm_m2{0}, fl_m2{0}, conv_fold{0};  // T422: g128-arm calls on the fold+g256 kernel
+    std::atomic<uint64_t> mm_m3{0}, fl_m3{0}, m3_hit{0};      // T434: one-GEMM calls (m3_hit: activation from the FWHT producer)
     ~n1_stats() {
         if (!env().on || !env().stats) return;
+        if (env().m3) {
+            fprintf(stderr, "[N1] stats: m3 one-gemm %llu ops / %.3f TFLOP, activation from the fused FWHT producer %llu\n",
+                    (unsigned long long) mm_m3.load(), fl_m3.load() * 1e-12, (unsigned long long) m3_hit.load());
+        }
         if (env().m2) {
             fprintf(stderr, "[N1] stats: m2 fold+g256 %llu ops / %.3f TFLOP, fold side-tables %llu\n",
                     (unsigned long long) mm_m2.load(), fl_m2.load() * 1e-12, (unsigned long long) conv_fold.load());
@@ -550,6 +562,28 @@ void launch_m2_bc(const void * X, const void * W, const n1_w * fo, const float *
         default:    launch_m2_kt<0,                   BC>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
     }
 }
+// T434 M3: ONE int32 accumulation over all of K (gemm_fold<ONEACC>, RS = 1), per-token scale sx[t], epilogue (acc * sx) * S_f
+template <int KT, int SEGS>
+void launch_m3_kt(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
+    const int ntile = Npad / 128;
+    const dim3 grid((ntile + 1) / 2, F / 64);
+    m2::gemm_fold<8, 1, SEGS, 1, KT | m2::ONEACC><<<grid, 256, 0, st>>>((const uint4 *) X, (const uint4 *) W, (const int8_t *) fo->w,
+        (const float *) fo->sw, sx, Y, N, ntile, F, K, ldy);
+}
+template <int SEGS>
+void launch_m3_s(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
+    switch (K) {
+        case 5120:  launch_m3_kt<(5120 / 1024) << 3,  SEGS>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+        case 6144:  launch_m3_kt<(6144 / 1024) << 3,  SEGS>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+        case 17408: launch_m3_kt<(17408 / 1024) << 3, SEGS>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+        default:    launch_m3_kt<0,                   SEGS>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+    }
+}
+void launch_m3(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
+    if (env().m3_segs == 2 && (K / 128) % 2 == 0) launch_m3_s<2>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
+    else launch_m3_s<1>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
+}
+
 void launch_m2(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
     if (!env().m2bc) { launch_m2_bc<0>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); return; }
     switch (env().m2bc_flush) {   // GGML_N1_M2BC_FLUSH = 1, 2, 4 or 8 (default 8)
@@ -607,6 +641,16 @@ bool n1_shape_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_
         ggml_is_contiguous(dst) && ggml_is_contiguous(src0) && src1->ne[1] <= (1 << 20);
 }
 
+// T434: src1 is the output of a prism.hadamard FWHT node (llama_mul_mat_hadamard: MUL_MAT with the HADAMARD hint), i.e. the
+// activation of a rotation-folded weight
+// (llama_mul_mat_hadamard: MUL_MAT(rot, x2d) with the HADAMARD hint, then a RESHAPE view back to the activation shape).
+// Returns the MUL_MAT node (the act-cache key of the FWHT producer) or nullptr.
+const ggml_tensor * n1_hada_base(const ggml_tensor * src1) {
+    const ggml_tensor * mm = src1->op == GGML_OP_RESHAPE && src1->src[0] ? src1->src[0] : src1;
+    return mm->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD ? mm : nullptr;
+}
+bool n1_hada_act(const ggml_tensor * src1) { return n1_hada_base(src1) != nullptr; }
+
 bool n1_use_row(const ggml_tensor * src0) {
     if (src0->type == GGML_TYPE_NK_Q2_0_W2ONLY) {
         return false;   // T399: no compact blocks to fold from
@@ -627,6 +671,14 @@ int n1_weight_state(const ggml_tensor * src0, int mode) {
 } // namespace
 
 bool ggml_cuda_n1_enabled() { return env().on; }
+
+// T434: this MUL_MAT will run the one-GEMM path (GGML_N1_M3) and read the N1TOK cache entry of its FWHT src1. Mirrors the
+// routing of n1_mul_mat_impl (weight already converted, so the fold side-table can be built from it).
+bool ggml_cuda_n1_m3_ready(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return env().on && env().m3 && !env().act_tok && !env().transient && n1_hada_act(src1) &&
+        (src0->type == GGML_TYPE_Q2_0 || src0->type == GGML_TYPE_Q1_0) && src1->ne[1] >= env().min_n &&
+        n1_shape_ok(src0, src1, dst) && !n1_use_row(src0) && n1_weight_state(src0, 1) == 1;
+}
 
 void ggml_cuda_n1_count(const ggml_tensor * src0, const ggml_tensor * src1) {
     if (src1->ne[1] < env().min_n) return;
@@ -698,6 +750,7 @@ static bool n1_mul_mat_impl(ggml_backend_cuda_context & ctx, const ggml_tensor *
             // a producer only fuses for this consumer once the weight is converted (ggml_cuda_n1_act_route), so a
             // pending GLU can never be left for the default route here
             GGML_ASSERT(ctx.act_pending != src1 && "N1: pending GLU consumer fell back");
+            GGML_ASSERT((ctx.act_nofp32 == nullptr || ctx.act_nofp32 != n1_hada_base(src1)) && "N1: FWHT consumer fell back without fp32");
             return false;
         }
         Wp = cw->w; SWp = cw->sw;
@@ -706,6 +759,45 @@ static bool n1_mul_mat_impl(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const bool per_token = row || env().act_tok;
     float * Y = (float *) dst->data;
     const int ldy = (int) (dst->nb[1] / sizeof(float));
+
+    // T434 M3 (one-GEMM): Hadamard-model activations (src1 is the FWHT node) quantised per token, folded int8 weights, no in-loop
+    // rescale. Bonsai 1 (no Hadamard node) never takes this branch.
+    if (env().m3 && !per_token && n1_hada_act(src1) && !env().transient) {
+        const n1_w * fo3 = get_fold(src0, Wp, SWp);
+        if (fo3) {
+            const size_t nbytes   = n1_act_bytes(K, N);
+            const int    mask     = ggml_cuda_act_fuse_mask();
+            const ggml_tensor * hb = n1_hada_base(src1);   // the cache is keyed on the FWHT MUL_MAT node
+            const bool   act_hit  = mask && ctx.act_cache_tensor == hb && ctx.act_cache_buf &&
+                ctx.act_cache_layout == GGML_CUDA_ACT_LAYOUT_N1TOK && ctx.act_cache_bytes == nbytes;
+            const bool   act_cache = act_hit || (mask & GGML_ACT_FUSE_DEDUP);
+            GGML_ASSERT(ctx.act_pending != src1 && "N1 M3: pending GLU consumer");
+            GGML_ASSERT((act_hit || ctx.act_nofp32 != hb) && "N1 M3: FWHT fp32 output was skipped but the cache missed");
+            act_hit ? g_stats.act_hit++ : g_stats.act_miss++;
+            if (act_hit) g_stats.m3_hit++;
+            ggml_cuda_pool_alloc<char> local(ctx.pool(), act_cache ? 0 : nbytes);
+            if (act_cache && !act_hit) {
+                ctx.act_cache_buf.reset();
+                ctx.act_cache_buf    = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes);
+                ctx.act_cache_tensor = hb;
+                ctx.act_cache_layout = GGML_CUDA_ACT_LAYOUT_N1TOK;
+                ctx.act_cache_bytes  = nbytes;
+            }
+            char * buf = act_cache ? ctx.act_cache_buf->get() : local.get();
+            int8_t * X  = (int8_t *) buf;
+            float  * sx = (float *) (buf + (size_t) Npad * K);
+            if (!act_hit) {
+                k_n1_quant_act<<<dim3(1, Npad), 256, 0, st>>>((const char *) src1->data, src1->nb[1], N, K, K, Npad, X, sx);
+            }
+            launch_m3(X, Wp, fo3, sx, Y, N, Npad, F, K, ldy, st);
+            g_stats.mm_n1++; g_stats.fl_n1 += fl;
+            g_stats.mm_m3++; g_stats.fl_m3 += fl;
+            CUDA_CHECK(hipGetLastError());
+            return true;
+        }
+    }
+    GGML_ASSERT((ctx.act_nofp32 == nullptr || ctx.act_nofp32 != n1_hada_base(src1)) &&
+                "N1: FWHT fp32 output was skipped but this consumer cannot take the N1TOK cache");
 
     const n1_w * fold = (!per_token && env().m2 && K % 256 == 0) ? get_fold(src0, Wp, SWp) : nullptr;
     if (fold) {
@@ -834,6 +926,13 @@ void ggml_cuda_n1_act_ref_quant256(const float * x, int64_t s11, int64_t K, int6
         (int) N, (int) K, (int) Npad, (int8_t *) y, (float *) ((char *) y + (size_t) Npad * K));
 }
 
+// T434: reference per-token quantizer (the unfused M3 producer: k_n1_quant_act with G = K) for the VERIFY of the FWHT producer
+void ggml_cuda_n1_act_ref_quant_tok(const float * x, int64_t s11, int64_t K, int64_t N, void * y, cudaStream_t stream) {
+    const int64_t Npad = n1_npad(N);
+    k_n1_quant_act<<<dim3(1, (unsigned) Npad), 256, 0, stream>>>((const char *) x, (size_t) s11 * sizeof(float),
+        (int) N, (int) K, (int) K, (int) Npad, (int8_t *) y, (float *) ((char *) y + (size_t) Npad * K));
+}
+
 size_t ggml_cuda_n1_act_bytes(const ggml_tensor * src1) {
     return n1_act_bytes(src1->ne[0], src1->ne[1] * src1->ne[2] * src1->ne[3]);
 }
@@ -847,6 +946,7 @@ void ggml_cuda_n1_act_ref_quant(const float * x, int64_t s11, int64_t K, int64_t
 #else
 
 bool ggml_cuda_n1_enabled() { return false; }
+bool ggml_cuda_n1_m3_ready(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }
 void ggml_cuda_n1_count(const ggml_tensor *, const ggml_tensor *) {}
 bool ggml_cuda_n1_mul_mat(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { return false; }
 bool ggml_cuda_n1_mul_mat_w2only(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { return false; }
@@ -855,5 +955,6 @@ size_t ggml_cuda_n1_act_bytes(const ggml_tensor *) { return 0; }
 void ggml_cuda_n1_act_ref_quant(const float *, int64_t, int64_t, int64_t, void *, cudaStream_t) {}
 int ggml_cuda_n1_w2only_act_layout(const ggml_tensor *) { return -1; }
 void ggml_cuda_n1_act_ref_quant256(const float *, int64_t, int64_t, int64_t, void *, cudaStream_t) {}
+void ggml_cuda_n1_act_ref_quant_tok(const float *, int64_t, int64_t, int64_t, void *, cudaStream_t) {}
 
 #endif

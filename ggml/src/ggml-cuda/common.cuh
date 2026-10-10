@@ -2037,6 +2037,9 @@ struct ggml_backend_cuda_context {
     int    act_cache_layout = -1;
     size_t act_cache_bytes  = 0;
     const ggml_tensor * act_pending = nullptr;
+    // T434: a Hadamard FWHT node whose fp32 output was NOT written (all its consumers are one-GEMM N1 matmuls reading the
+    // N1TOK cache entry); a consumer that cannot take the cache must abort rather than read stale memory
+    const ggml_tensor * act_nofp32 = nullptr;
     int64_t act_stat_hit = 0, act_stat_miss = 0, act_stat_glu = 0, act_stat_norm = 0, act_stat_norm_add = 0;
     int64_t act_stat_verify_bytes = 0, act_stat_verify_diff = 0;
 

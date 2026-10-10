@@ -46,6 +46,10 @@ enum ggml_cuda_act_fuse_bit {
 // consumed by the GGML_N1_M2 fold+g256 arm. Producers need ncols % 256 == 0.
 #define GGML_CUDA_ACT_LAYOUT_N1G256 102
 
+// T434 M3 (one-GEMM): the N1 buffer with ONE activation scale per token (sx[t], the rest of the sx region unused),
+// consumed by gemm_fold<ONEACC>; written by the Hadamard FWHT producer (fwht_quant_n1t) or k_n1_quant_act (G = K).
+#define GGML_CUDA_ACT_LAYOUT_N1TOK 103
+
 int  ggml_cuda_act_fuse_mask();
 bool ggml_cuda_act_fuse_verify();
 

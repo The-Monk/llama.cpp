@@ -36,3 +36,8 @@ void ggml_cuda_n1_act_ref_quant(const float * x, int64_t s11, int64_t K, int64_t
 int ggml_cuda_n1_w2only_act_layout(const ggml_tensor * src0);
 // Reference per-256 quantizer (k_n1_quant_act256) into an N1 buffer; VERIFY only.
 void ggml_cuda_n1_act_ref_quant256(const float * x, int64_t s11, int64_t K, int64_t N, void * y, cudaStream_t stream);
+
+// T434 M3 (GGML_N1_M3=1): this MUL_MAT (weight already converted) runs the one-GEMM path and reads the N1TOK activation
+// layout (GGML_CUDA_ACT_LAYOUT_N1TOK: per-token scale) that the Hadamard FWHT producer can write for its src1.
+void ggml_cuda_n1_act_ref_quant_tok(const float * x, int64_t s11, int64_t K, int64_t N, void * y, cudaStream_t stream);
+bool ggml_cuda_n1_m3_ready(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);

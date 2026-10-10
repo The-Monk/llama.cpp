@@ -38,6 +38,7 @@
 
 namespace m2 {
 
+constexpr int ONEACC = 1 << 27;  // T434 variant bit: ONE int32 accumulation over the whole K (RS = 1), epilogue acc * sx[t] * S_f; no in-loop rescale
 constexpr int BCARRY = 1 << 24;   // T424 variant bit: bias-carry rescale (GGML_N1_M2=2); the low bits tag K (K / 1024 << 3)
 
 __device__ __forceinline__ uint32_t fold_lut(uint32_t mb) {   // mb = m as a zero-extended byte; LUT bytes {-m,0,m,2m}
@@ -65,7 +66,8 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
     static_assert(RS == 1 || RS == 2, "RS");
     static_assert(SEGS == 1 || SEGS == 2, "SEGS");
     static_assert(RS >= SEGS || RS == 1, "a stage may not split... RS < SEGS handled per segment");
-    constexpr bool kLpf = V & LPF, kBc = V & BCARRY;
+    constexpr bool kLpf = V & LPF, kBc = V & BCARRY, kOne = V & ONEACC;
+    static_assert(!kOne || RS == 1, "ONEACC: per-token scale, no rescale groups");
     constexpr int U = (RS > SEGS) ? RS / SEGS : 1;   // stages unrolled per loop iteration
     constexpr int P0N = SEGS * (1 + DWN);
     constexpr int WSTAGE = SEGS * WSEG;
@@ -146,14 +148,25 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
               asm volatile("ds_store_b128 %0, %1 offset:%2" :: "v"(a_), "v"(w8), "i"(d * 4096) : "memory");       \
               M2_ESM_STORE_WAIT } } }
 
+    if (kOne) SXLOAD(0)   // T434: the per-token scale, loaded once (sx[0][t]); COMMIT(0, 0) drains it with the first W stage
     P0LOAD(0)
     COMMIT(0, 0)
+    if (kOne) {
+#pragma unroll
+        for (int i = 0; i < FT; ++i) asm volatile("" : "+v"(sxa[i]));
+    }
 #pragma unroll
     for (int kb = 0; kb < KBN; ++kb) XLOAD(0, kb)
     lds_barrier();
 
     const i32x8 bias8 = i32x8{BIASI, BIASI, BIASI, BIASI, BIASI, BIASI, BIASI, BIASI};
     i32x8 acc[FT][FF];
+    if (kOne) {
+#pragma unroll
+        for (int i = 0; i < FT; ++i)
+#pragma unroll
+            for (int j = 0; j < FF; ++j) acc[i][j] = i32x8{0, 0, 0, 0, 0, 0, 0, 0};
+    }
     const int NST = S / SEGS;
 
     auto rescale = [&](int waitsel) {
@@ -208,7 +221,8 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
                 const int p = (u * SEGS + g) % RS;          // position inside the rescale group (compile-time)
                 const int G = s * SEGS + g;
                 const int Gn = (g + 1 < SEGS) ? G + 1 : sn * SEGS;
-                if (p == 0) SXLOAD(G)
+                const bool sxl = !kOne && p == 0;
+                if (sxl) SXLOAD(G)
                 const uint4* b = (const uint4*)(bW + g * WSEG);
                 uint4 w[2][FF];
                 if constexpr (kLpf) {
@@ -228,9 +242,9 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
                         for (int j = 0; j < FF; ++j) wc[j] = b[((wf * FF + j) * KBN + kb) * 32 + lane];
                     }
                     // newer than X(G, kb): (3-kb)FT + [g == 0: P0N] + [p == 0: FT] + kb*FT
-                    if (g == 0 && p == 0) asm volatile("s_wait_loadcnt %0" :: "i"(3 * FT + P0N + FT) : "memory");
+                    if (g == 0 && sxl) asm volatile("s_wait_loadcnt %0" :: "i"(3 * FT + P0N + FT) : "memory");
                     else if (g == 0) asm volatile("s_wait_loadcnt %0" :: "i"(3 * FT + P0N) : "memory");
-                    else if (p == 0) asm volatile("s_wait_loadcnt %0" :: "i"(3 * FT + FT) : "memory");
+                    else if (sxl) asm volatile("s_wait_loadcnt %0" :: "i"(3 * FT + FT) : "memory");
                     else asm volatile("s_wait_loadcnt %0" :: "i"(3 * FT) : "memory");
 #pragma unroll
                     for (int i = 0; i < FT; ++i) asm volatile("" : "+v"(xr[kb][i]));
@@ -238,7 +252,7 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
                     for (int i = 0; i < FT; ++i)
 #pragma unroll
                         for (int j = 0; j < FF; ++j) {
-                            i32x8 c0 = (kb == 0 && p == 0) ? bias8 : acc[i][j];
+                            i32x8 c0 = (!kOne && kb == 0 && p == 0) ? bias8 : acc[i][j];
                             const i32x2 x0{(int)xr[kb][i].x, (int)xr[kb][i].y}, x1{(int)xr[kb][i].z, (int)xr[kb][i].w};
                             const i32x2 w0{(int)wc[j].x, (int)wc[j].y}, w1{(int)wc[j].z, (int)wc[j].w};
                             c0 = wmma_iu8(w0, x0, c0);
@@ -251,18 +265,18 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
                 // a P0 lies between this group's sx and now only when the group spans a stage boundary (SEGS = 1, RS = 2)
                 const int ws = (SEGS == 1 && RS == 2) ? 1 : 0;
                 if (g + 1 < SEGS) {
-                    if (resc) rescale(ws);
+                    if (resc && !kOne) rescale(ws);
                 } else {
 #pragma unroll
                     for (int i = 0; i < FT; ++i)
 #pragma unroll
                         for (int j = 0; j < FF; ++j) asm volatile("" : "+v"(acc[i][j]));
                     // newer than the last P0 load: this stage's sx loads + 4 FT reloads per segment
-                    constexpr int SXN = (RS == 1) ? SEGS * FT : FT;   // RS == SEGS == 2: one sx group per stage
+                    constexpr int SXN = kOne ? 0 : (RS == 1) ? SEGS * FT : FT;   // RS == SEGS == 2: one sx group per stage
                     if (SEGS == 1 && RS == 2 && p == 1) COMMIT((s + 1) & 1, 4 * FT)
                     else COMMIT((s + 1) & 1, SXN + SEGS * 4 * FT)
                     bar_signal();
-                    if (resc) rescale(ws);
+                    if (resc && !kOne) rescale(ws);
                     bar_wait();
                 }
             }
@@ -286,7 +300,7 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
             if (t >= Ntok) continue;
             float o[8];
 #pragma unroll
-            for (int l = 0; l < 8; ++l) o[l] = (kBc ? __builtin_fmaf(-BIASF, sxs[i], accf[i][j][l]) : accf[i][j][l]) * rs[l];
+            for (int l = 0; l < 8; ++l) o[l] = kOne ? ((float) acc[i][j][l] * sxa[i]) * rs[l] : (kBc ? __builtin_fmaf(-BIASF, sxs[i], accf[i][j][l]) : accf[i][j][l]) * rs[l];
             float4* yp = (float4*)(Y + (size_t)t * ldy + f0);
             yp[0] = make_float4(o[0], o[1], o[2], o[3]);
             yp[1] = make_float4(o[4], o[5], o[6], o[7]);
