@@ -216,7 +216,7 @@ static __global__ void cpy_f32_vec4(const char * cx, char * cdst, const int n4,
 }
 
 static bool ggml_cpy_f32_vec4_cuda(const ggml_tensor * src0, const ggml_tensor * src1, cudaStream_t stream) {
-    static const bool enabled = getenv("GGML_CUDA_CPY_VEC") != nullptr && atoi(getenv("GGML_CUDA_CPY_VEC")) != 0;
+    static const bool enabled = getenv("GGML_CUDA_CPY_VEC") == nullptr || atoi(getenv("GGML_CUDA_CPY_VEC")) != 0;   // default ON, =0 disables
     if (!enabled || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) ||
             src0->nb[0] != 4 || src0->ne[0] % 4 != 0 || src0->nb[1] % 16 || src0->nb[2] % 16 || src0->nb[3] % 16 ||
             ((uintptr_t) src0->data) % 16 || ((uintptr_t) src1->data) % 16 || ggml_nelements(src0) >= (int64_t) INT_MAX) {
