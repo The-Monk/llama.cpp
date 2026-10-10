@@ -5321,7 +5321,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // T447 GGML_GDN_GATED_NORM: Qwen3.5 GDN gated norm RMS_NORM + MUL(w) + SILU(z) + MUL in one launch (the graph builder
     // hoists z so the four nodes are adjacent). Prefill-sized inputs only; decode keeps the existing two fusions.
     if (node->op == GGML_OP_RMS_NORM && i + 3 < cgraph->n_nodes && node->ne[0] == 128 && ggml_nrows(node) >= 64) {
-        static const bool gated_norm = getenv("GGML_GDN_GATED_NORM") != nullptr && atoi(getenv("GGML_GDN_GATED_NORM")) == 1;   // 2 = hoist z only (debug)
+        static const bool gated_norm = getenv("GGML_GDN_GATED_NORM") == nullptr || atoi(getenv("GGML_GDN_GATED_NORM")) == 1;   // default ON, =0 disables, 2 = hoist z only (debug)
         // the z view (RESHAPE) is a graph node of its own between the weight MUL and the SILU
         // (ggml_can_fuse_subgraph rejects it: the view's source z is produced outside the span, so the span is validated by hand:
         // ops in order, each intermediate used exactly once, not a graph output)
@@ -5912,7 +5912,7 @@ static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph
 // activation tensor (GDN ssm_beta / ssm_alpha) and arm the context so the pair converts the activation to bf16 once. Nothing between the
 // two may write into the activation's memory. Prefill-sized activations only (>= 64 rows), which never run under a captured CUDA graph.
 static void ggml_cuda_bf16_share_arm(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
-    static const bool enabled = getenv("GGML_CUDA_BF16_SHARE") != nullptr && atoi(getenv("GGML_CUDA_BF16_SHARE")) != 0;
+    static const bool enabled = getenv("GGML_CUDA_BF16_SHARE") == nullptr || atoi(getenv("GGML_CUDA_BF16_SHARE")) != 0;   // default ON, =0 disables
     if (!enabled) {
         return;
     }

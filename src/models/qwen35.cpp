@@ -423,8 +423,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // SILU(z)*normed; hoisting makes RMS_NORM, MUL, SILU, MUL adjacent so the CUDA backend can run them as one kernel. Same
     // values, different (still valid) topological order; prefill-sized ubatches only.
     if (n_seq_tokens > 1) {
-        const char * gn = getenv("GGML_GDN_GATED_NORM");
-        if (gn != nullptr && atoi(gn) != 0) {
+        const char * gn = getenv("GGML_GDN_GATED_NORM");   // default ON, =0 disables
+        if (gn == nullptr || atoi(gn) != 0) {
             ggml_build_forward_expand(gf, z);
         }
     }
@@ -455,7 +455,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // GGML_GDN_FUSED_L2NORM_PF (T447, default off): the same fold for prefill-sized ubatches. The chunked GDN kernel's prep stage already
     // takes raw q/k and derives the per-token L2 scale itself (same lane order and rsqrt as l2_norm_f32<32>), so the two L2_NORM
     // launches (and their 8 MB-per-tensor round trip) disappear. n_seq_tokens > 32 keeps spec-verify batches on the unfused path.
-    const bool gdn_fused_l2norm_pf = []() { const char * e = getenv("GGML_GDN_FUSED_L2NORM_PF"); return e != nullptr && atoi(e) != 0; }() &&
+    const bool gdn_fused_l2norm_pf = []() { const char * e = getenv("GGML_GDN_FUSED_L2NORM_PF"); return e == nullptr || atoi(e) != 0; }() &&   // default ON, =0 disables
                                      gdn_layer_on_cuda_like(model, il) && n_seq_tokens > 32 && cparams.n_rs_seq == 0 &&
                                      hparams.ssm_d_state == 128;
     const bool gdn_fused_l2norm = (gdn_rung_default_on("GGML_GDN_FUSED_L2NORM") && gdn_layer_on_cuda_like(model, il) &&
