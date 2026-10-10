@@ -532,6 +532,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * conv_input       = nullptr;
     ggml_tensor * conv_output_silu = nullptr;
     if (gdn_glue_fuse) {
+        // the kernel never reads s_copy: a reused graph must recheck s_copy(0) == head (seq_cp'd cell)
+        inp->s_copy_identity = true;
         ggml_tensor * conv_state = build_rs_state_view(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
         conv_state = ggml_reshape_3d(ctx0, conv_state, conv_kernel_size - 1, conv_channels, n_seqs);
         cb(conv_state, "conv_state_inplace_view", il);
