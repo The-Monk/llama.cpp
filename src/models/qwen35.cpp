@@ -418,6 +418,17 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
+    // GGML_GDN_GATED_NORM (T447): expand the z projection here so its nodes precede the recurrence. Graph order is a
+    // depth-first walk from the output, which otherwise puts z's quantize+GEMM BETWEEN the gated norm's RMS_NORM/MUL and its
+    // SILU(z)*normed; hoisting makes RMS_NORM, MUL, SILU, MUL adjacent so the CUDA backend can run them as one kernel. Same
+    // values, different (still valid) topological order; prefill-sized ubatches only.
+    if (n_seq_tokens > 1) {
+        const char * gn = getenv("GGML_GDN_GATED_NORM");
+        if (gn != nullptr && atoi(gn) != 0) {
+            ggml_build_forward_expand(gf, z);
+        }
+    }
+
     // EXPERIMENT (env-gated GGML_GDN_FUSED_BA, ported from PrismML
     // megakernel/rmsnorm-qmv-fuse commit c92cf5ebc): fold sigmoid(beta) and
     // softplus(alpha+ssm_dt)*ssm_a into the GDN kernel, skipping 4 separate
@@ -441,8 +452,14 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // n_seq_tokens==1 && n_rs_seq==0 is sufficient to guarantee the fused
     // K=1 kernel path is actually taken; build_delta_net/build_delta_net_fused
     // carry a GGML_ASSERT that would catch it if that assumption ever broke).
-    const bool gdn_fused_l2norm = gdn_rung_default_on("GGML_GDN_FUSED_L2NORM") && gdn_layer_on_cuda_like(model, il) &&
-                                  n_seq_tokens == 1 && cparams.n_rs_seq == 0;
+    // GGML_GDN_FUSED_L2NORM_PF (T447, default off): the same fold for prefill-sized ubatches. The chunked GDN kernel's prep stage already
+    // takes raw q/k and derives the per-token L2 scale itself (same lane order and rsqrt as l2_norm_f32<32>), so the two L2_NORM
+    // launches (and their 8 MB-per-tensor round trip) disappear. n_seq_tokens > 32 keeps spec-verify batches on the unfused path.
+    const bool gdn_fused_l2norm_pf = []() { const char * e = getenv("GGML_GDN_FUSED_L2NORM_PF"); return e != nullptr && atoi(e) != 0; }() &&
+                                     gdn_layer_on_cuda_like(model, il) && n_seq_tokens > 32 && cparams.n_rs_seq == 0 &&
+                                     hparams.ssm_d_state == 128;
+    const bool gdn_fused_l2norm = (gdn_rung_default_on("GGML_GDN_FUSED_L2NORM") && gdn_layer_on_cuda_like(model, il) &&
+                                   n_seq_tokens == 1 && cparams.n_rs_seq == 0) || gdn_fused_l2norm_pf;
 
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     const bool hfuse_pin = (qwen35_hfuse_mask() & 1) && ubatch.n_tokens == 1;   // [TAG_MMVQ_MTAB]
