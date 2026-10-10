@@ -500,7 +500,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         inp->mctx->get_n_rs() == 1 &&
         inp->mctx->get_rs_z() < 0;
 
-    // EXPERIMENT (GGML_GDN_GLUE_FUSE=1, default OFF; card T409): prefill counterpart of GGML_GDN_CONV_INPLACE.
+    // GGML_GDN_GLUE_FUSE (default ON, =0 disables; card T409, gated 2026-10-09: KLD = 1-ulp floor, seq_cp reuse matrix 14/14, +3% prefill): prefill counterpart of GGML_GDN_CONV_INPLACE.
     // One multi-token ssm_conv_update reads the conv state row directly (or treats it as zeros on a fresh cell)
     // and the new tokens in qkv_mixed's native layout, applies silu, and writes the new state back in place:
     // removes build_rs's gather, the transposed concat (21 MB at ub 1024), the separate silu fusion and the
@@ -517,7 +517,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     const int32_t rs_head_cell = (int32_t) inp->mctx->get_head();
     const bool gdn_glue_fuse =
         !gdn_conv_inplace &&
-        gdn_env_on("GGML_GDN_GLUE_FUSE") &&
+        gdn_rung_default_on("GGML_GDN_GLUE_FUSE") &&
         gdn_layer_on_cuda_like(model, il) &&
         n_seq_tokens > 32 &&
         cparams.n_rs_seq == 0 &&
