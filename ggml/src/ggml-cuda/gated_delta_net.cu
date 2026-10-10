@@ -83,7 +83,8 @@ gated_delta_net_cuda(const float * q,
                                      int           K,
                                      const float * ssm_dt,   // [H], FusedBA only (else nullptr)
                                      const float * ssm_a,    // [H], FusedBA only (else nullptr)
-                                     float         l2norm_eps) { // L2Norm only
+                                     float         l2norm_eps,   // L2Norm only
+                                     int64_t       dst_tokens) { // tokens per sequence in dst (>= n_tokens)
     static_assert(!(FusedBA && KDA), "fused beta/alpha glue is scalar-gate (qwen35) only, not KDA");
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
@@ -102,7 +103,7 @@ gated_delta_net_cuda(const float * q,
     const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
     state += state_out_offset;
     curr_state += state_in_offset + col * S_v;
-    attn_data += (sequence * n_tokens * H + h_idx) * S_v;
+    attn_data += (sequence * dst_tokens * H + h_idx) * S_v;
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
     static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
@@ -278,6 +279,8 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+#include "gated_delta_net_chunk.cuh"
+
 template <bool KDA, bool keep_rs_t, bool FusedBA = false, bool L2Norm = false>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -290,7 +293,10 @@ static void launch_gated_delta_net(
         int64_t neqk1, int64_t rq3,
         float scale, int64_t state_slot_stride, int K, cudaStream_t stream,
         const float * ssm_dt_d = nullptr, const float * ssm_a_d = nullptr,
-        float l2norm_eps_d = 0.0f) {
+        float l2norm_eps_d = 0.0f, int64_t dst_tokens = -1) {
+    if (dst_tokens < 0) {
+        dst_tokens = n_tokens;
+    }
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
@@ -306,26 +312,26 @@ static void launch_gated_delta_net(
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, FusedBA, L2Norm>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ssm_dt_d, ssm_a_d, l2norm_eps_d);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ssm_dt_d, ssm_a_d, l2norm_eps_d, dst_tokens);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, FusedBA, L2Norm>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ssm_dt_d, ssm_a_d, l2norm_eps_d);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ssm_dt_d, ssm_a_d, l2norm_eps_d, dst_tokens);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, FusedBA, L2Norm>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ssm_dt_d, ssm_a_d, l2norm_eps_d);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ssm_dt_d, ssm_a_d, l2norm_eps_d, dst_tokens);
             break;
         }
         case 128: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, FusedBA, L2Norm>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ssm_dt_d, ssm_a_d, l2norm_eps_d);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ssm_dt_d, ssm_a_d, l2norm_eps_d, dst_tokens);
             break;
         }
         default:
@@ -411,7 +417,12 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const int64_t sb2 = nbb2 / sizeof(float);
     const int64_t sb3 = nbb3 / sizeof(float);
 
-    const float scale = 1.0f / sqrtf((float) S_v);
+    float scale = 1.0f / sqrtf((float) S_v);
+    // T405 calibration only: GGML_GDN_PERTURB_ULP=1 moves the output scale by one ulp (~6e-8 relative),
+    // the smallest non-bit-exact change, to measure the model-level KLD floor of any inexact GDN path.
+    if (getenv("GGML_GDN_PERTURB_ULP") != nullptr) {
+        scale = nextafterf(scale, 1.0f);
+    }
 
     cudaStream_t stream = ctx.stream();
 
@@ -427,61 +438,56 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
+    // T405: chunked WMMA prefill path (default on, GGML_GDN_CHUNK=0 disables; scalar gate)
+    if (!kda && !keep_rs &&
+            gdn_chunk_launch(ctx, stream, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                S_v, H, n_tokens, n_tokens, n_seqs, neqk1, rq3, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, scale,
+                fused_ba, ssm_dt_d, ssm_a_d, l2norm_qk, l2norm_eps, K)) {
+        return;
+    }
+
+    // T405 phase 2, snapshot mode (K > 1, i.e. n_rs_seq > 0): slot j holds the state after token
+    // n_tokens-1-j, so only the last K tokens need per-token states (slots of a short ubatch beyond
+    // n_tokens are carried by the graph). The chunked kernel runs the first L = n_tokens - K tokens and
+    // writes its final state into slot 0; the sequential kernel then runs the K tail tokens starting from
+    // slot 0 and writes slots K-1..0. In place is safe: each sequential workgroup loads its (seq, head,
+    // column) slice of slot 0 into registers before any store and only stores to that same slice.
+    const int64_t dst_tokens   = n_tokens;
+    int64_t       n_tokens_seq = n_tokens;
+    if (!kda && keep_rs && n_tokens > K &&
+            gdn_chunk_launch(ctx, stream, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                S_v, H, n_tokens - K, n_tokens, n_seqs, neqk1, rq3, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, scale,
+                fused_ba, ssm_dt_d, ssm_a_d, l2norm_qk, l2norm_eps, K)) {
+        const int64_t L = n_tokens - K;
+        q_d   += L * sq2;
+        k_d   += L * sq2;
+        v_d   += L * sv2;
+        g_d   += L * sb2;
+        b_d   += L * sb2;
+        dst_d += L * S_v * H;
+        s_d    = state_d;
+        n_tokens_seq = K;
+    }
+
+#define GDN_SEQ(...) launch_gated_delta_net<__VA_ARGS__>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, \
+        S_v, H, n_tokens_seq, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, \
+        state_slot_stride, K, stream, ssm_dt_d, ssm_a_d, l2norm_eps, dst_tokens)
     if (kda) {
-        if (keep_rs) {
-            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
-        } else {
-            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
-        }
+        if (keep_rs) { GDN_SEQ(true, true); } else { GDN_SEQ(true, false); }
     } else if (fused_ba) {
         if (keep_rs) {
-            if (l2norm_qk) {
-                launch_gated_delta_net<false, true, true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                    S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, ssm_dt_d, ssm_a_d, l2norm_eps);
-            } else {
-                launch_gated_delta_net<false, true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                    S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, ssm_dt_d, ssm_a_d);
-            }
+            if (l2norm_qk) { GDN_SEQ(false, true, true, true); } else { GDN_SEQ(false, true, true); }
         } else {
-            if (l2norm_qk) {
-                launch_gated_delta_net<false, false, true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                    S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, ssm_dt_d, ssm_a_d, l2norm_eps);
-            } else {
-                launch_gated_delta_net<false, false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                    S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, ssm_dt_d, ssm_a_d);
-            }
+            if (l2norm_qk) { GDN_SEQ(false, false, true, true); } else { GDN_SEQ(false, false, true); }
         }
     } else {
         if (keep_rs) {
-            if (l2norm_qk) {
-                launch_gated_delta_net<false, true, false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                    S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, nullptr, nullptr, l2norm_eps);
-            } else {
-                launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                    S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
-            }
+            if (l2norm_qk) { GDN_SEQ(false, true, false, true); } else { GDN_SEQ(false, true); }
         } else {
-            if (l2norm_qk) {
-                launch_gated_delta_net<false, false, false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                    S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, nullptr, nullptr, l2norm_eps);
-            } else {
-                launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                    S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
-            }
+            if (l2norm_qk) { GDN_SEQ(false, false, false, true); } else { GDN_SEQ(false, false); }
         }
     }
+#undef GDN_SEQ
 }
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
