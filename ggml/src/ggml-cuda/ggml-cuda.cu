@@ -5428,7 +5428,7 @@ static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_c
         const ggml_tensor * x, const ggml_tensor * up, const ggml_tensor * signs, ggml_tensor * mm) {
     static const bool fuse_on = [] {
         const char * m3 = getenv("GGML_N1_M3"), * e = getenv("GGML_N1_M3_FUSE");
-        return m3 && strcmp(m3, "1") == 0 && !(e && atoi(e) == 0);
+        return !(m3 && strcmp(m3, "0") == 0) && !(e && atoi(e) == 0);   // default ON, like n1_env().m3
     }();
     if (!fuse_on || !ggml_cuda_n1_enabled() || !(ggml_cuda_act_fuse_mask() & GGML_ACT_FUSE_DEDUP) ||
         (mm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
