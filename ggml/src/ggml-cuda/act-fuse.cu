@@ -9,6 +9,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 
 int ggml_cuda_act_fuse_mask() {
     static const int mask = [] {
@@ -130,7 +131,18 @@ static __global__ void act_glu_quant_kernel(
         const int64_t c = i0 + k;
         v[k] = c < nc ? ggml_cuda_op_silu_single(g[c]) * u[c] : 0.0f;
     }
-    store(i1, i0, make_float4(v[0], v[1], v[2], v[3]));
+    if constexpr (std::is_same_v<store_t, n1_act_store256>) {
+        // T422: the other half of this 256-group (column ^ 128), same expression
+        float p[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int64_t c = (i0 + k) ^ 128;
+            p[k] = c < nc ? ggml_cuda_op_silu_single(g[c]) * u[c] : 0.0f;
+        }
+        store(i1, i0, make_float4(v[0], v[1], v[2], v[3]), make_float4(p[0], p[1], p[2], p[3]));
+    } else {
+        store(i1, i0, make_float4(v[0], v[1], v[2], v[3]));
+    }
 }
 
 template <class store_t>
@@ -161,6 +173,10 @@ void ggml_cuda_act_glu_quant(const float * gate, const float * up, int64_t nc, i
         case GGML_CUDA_ACT_LAYOUT_N1:
             GGML_ASSERT(nc % 128 == 0);
             act_glu_quant_launch(gate, up, nc, nrows, s_gate, s_up, ne0_padded, n1_act_store_make(y, nc, nrows), stream);
+            break;
+        case GGML_CUDA_ACT_LAYOUT_N1G256:
+            GGML_ASSERT(nc % 256 == 0);
+            act_glu_quant_launch(gate, up, nc, nrows, s_gate, s_up, ne0_padded, n1_act_store256_make(y, nc, nrows), stream);
             break;
         case GGML_CUDA_ACT_LAYOUT_SC:
             GGML_ASSERT(nc % 128 == 0);
@@ -232,7 +248,18 @@ act_norm_quant_kernel(
                 v[k] = 0.0f;
             }
         }
-        store(row, i0, make_float4(v[0], v[1], v[2], v[3]));
+        if constexpr (std::is_same_v<store_t, n1_act_store256>) {
+            // T422: the other half of this 256-group (column ^ 128) from the staged row, same expression
+            float p[4];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int64_t c = (i0 + k) ^ 128;
+                p[k] = c < ncols ? scale * xs[c] * w[c] : 0.0f;
+            }
+            store(row, i0, make_float4(v[0], v[1], v[2], v[3]), make_float4(p[0], p[1], p[2], p[3]));
+        } else {
+            store(row, i0, make_float4(v[0], v[1], v[2], v[3]));
+        }
     }
 }
 
@@ -276,6 +303,12 @@ bool ggml_cuda_act_norm_quant(const float * a, const float * add_b, float * dst_
                 return false;
             }
             act_norm_quant_launch(a, add_b, dst_add, dst_mul, w, ncols, nrows, s_a, s_b, eps, ne0_padded, n1_act_store_make(y, ncols, nrows), stream);
+            return true;
+        case GGML_CUDA_ACT_LAYOUT_N1G256:
+            if (ncols % 256 != 0) {
+                return false;
+            }
+            act_norm_quant_launch(a, add_b, dst_add, dst_mul, w, ncols, nrows, s_a, s_b, eps, ne0_padded, n1_act_store256_make(y, ncols, nrows), stream);
             return true;
         case GGML_CUDA_ACT_LAYOUT_SC:
             if (ncols % 128 != 0) {

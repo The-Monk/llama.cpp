@@ -363,7 +363,7 @@ int ggml_cuda_sc_act_layout(const ggml_tensor * mm) {
         return GGML_CUDA_ACT_LAYOUT_SC;
     }
     // N1 reads the weight in place, so it is always "converted"; its token arm cannot read a fused activation
-    return env().n1_act_tok ? -1 : GGML_CUDA_ACT_LAYOUT_N1;
+    return env().n1_act_tok ? -1 : ggml_cuda_n1_w2only_act_layout(src0);   // T422: N1G256 under GGML_N1_M2=1
 }
 
 void ggml_cuda_sc_act_ref_quant(const float * x, int64_t s11, int64_t K, int64_t N, void * y, cudaStream_t stream) {

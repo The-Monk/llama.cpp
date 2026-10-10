@@ -42,6 +42,10 @@ enum ggml_cuda_act_fuse_bit {
 // ds[K/32][NP]). Producers need ncols % 128 == 0; y must hold ggml_cuda_sc_act_bytes(dst) bytes.
 #define GGML_CUDA_ACT_LAYOUT_SC 101
 
+// T422 M2: the N1 buffer with per-256 activation scales (n1_act_store256; both 128-slots of a group hold the same d),
+// consumed by the GGML_N1_M2 fold+g256 arm. Producers need ncols % 256 == 0.
+#define GGML_CUDA_ACT_LAYOUT_N1G256 102
+
 int  ggml_cuda_act_fuse_mask();
 bool ggml_cuda_act_fuse_verify();
 

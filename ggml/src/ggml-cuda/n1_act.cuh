@@ -61,6 +61,48 @@ struct n1_act_store {
     }
 };
 
+// T422 M2: per-256 activation scale (layout GGML_CUDA_ACT_LAYOUT_N1G256, same buffer shape as N1). Called like
+// n1_act_store plus `vp` = the 4 values 128 columns away (column c ^ 128, the other half of the 256-group), which the
+// producer computes with the same expression; the warp's amax then covers the whole group, so both warps of a group
+// derive the same d without any cross-warp exchange. Each warp writes its own 128-slot of sx (both slots = d), X gets
+// only the warp's own values. Bytes equal k_n1_quant_act256 for the same fp32 values.
+struct n1_act_store256 {
+    int8_t * X;
+    float  * sx;
+    int      K;
+    int      S;
+    int      Npad;
+
+    __device__ __forceinline__ void operator()(const int64_t i1, const int64_t i0, const float4 v, const float4 vp) const {
+        if (i0 >= K) {
+            return;
+        }
+        float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+        amax = fmaxf(amax, fmaxf(fmaxf(fabsf(vp.x), fabsf(vp.y)), fmaxf(fabsf(vp.z), fabsf(vp.w))));
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, o, 32));
+        }
+        const float d = n1_scale(amax);
+        const int   t = (int) i1;
+        if ((i0 & 127) == 0) {
+            sx[(size_t) (i0 >> 7) * Npad + t] = d;
+        }
+        *(uint32_t *) (X + n1_off(t, (int) i0, S)) = d > 0.f ? n1_quant4(v, d) : 0u;
+    }
+};
+
+static inline n1_act_store256 n1_act_store256_make(void * y, int64_t K, int64_t N) {
+    const int64_t Npad = n1_npad(N);
+    n1_act_store256 s;
+    s.X    = (int8_t *) y;
+    s.sx   = (float *) ((char *) y + (size_t) Npad * K);
+    s.K    = (int) K;
+    s.S    = (int) (K / 128);
+    s.Npad = (int) Npad;
+    return s;
+}
+
 static inline n1_act_store n1_act_store_make(void * y, int64_t K, int64_t N) {
     const int64_t Npad = n1_npad(N);
     n1_act_store s;

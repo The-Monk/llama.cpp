@@ -30,3 +30,9 @@ size_t ggml_cuda_n1_act_bytes(const ggml_tensor * src1);
 
 // Reference quantizer (the unfused N1 activation quantize) into an N1 activation buffer; VERIFY only.
 void ggml_cuda_n1_act_ref_quant(const float * x, int64_t s11, int64_t K, int64_t N, void * y, cudaStream_t stream);
+
+// T422 M2 (GGML_N1_M2=1): act_route returns 3 = N1 takes it and reads GGML_CUDA_ACT_LAYOUT_N1G256 (per-256 scales).
+// Activation layout an N1 consumer of a single-copy weight reads (N1, N1G256, or -1 = no fusion yet).
+int ggml_cuda_n1_w2only_act_layout(const ggml_tensor * src0);
+// Reference per-256 quantizer (k_n1_quant_act256) into an N1 buffer; VERIFY only.
+void ggml_cuda_n1_act_ref_quant256(const float * x, int64_t s11, int64_t K, int64_t N, void * y, cudaStream_t stream);

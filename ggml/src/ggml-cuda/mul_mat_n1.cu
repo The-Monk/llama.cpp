@@ -19,6 +19,11 @@
 //   GGML_N1_TRANSIENT=1    T400 single-copy study: re-pack W2 + sw into pool scratch on every call (no cache)
 //   GGML_N1_M1=0           T420: the g128 arm uses the release kernel (gemm_iu8 FL=9) instead of gemm_xd (X direct-to-VGPR,
 //                          bias-initialised accumulators; bit-identical output, +13% standalone)
+//   GGML_N1_M2=1           T422 (default OFF, DIFFERENT MATH, KLD-gated): for K % 256 == 0 the g128 arm runs CONTRACT
+//                          mode ROW weights (M0 fold: W' = code * m[g][f], row scale S_f; m/S_f derived on device from the
+//                          W2 stream + fp16 sw, for cached and native weights alike) x per-256 activation scales (T402
+//                          g256) on gemm_fold<8,1,1,2> (n1_m2_fold.cuh: 256 tok x 64 feat, rescale every 256 K with one
+//                          pairable sub + fmac). The activation is quantized here (no act-fuse producer for g256 yet).
 //
 // T400 N4: weights loaded from a native dual-blob GGUF (llama-model-loader, GGML_TYPE_NK_*_W2) arrive as a compact
 // Q2_0/Q1_0 view whose view_src is the dual tensor; its W2 region and its companion's sw are used in place (no
@@ -44,6 +49,7 @@
 #if defined(GGML_USE_HIP)
 #include "n1_gemm_iu8.cuh"
 #include "n1_gemm_xd.cuh"
+#include "n1_m2_fold.cuh"
 #include "n1_act.cuh"
 
 namespace {
@@ -59,9 +65,12 @@ struct n1_env {
     const char * dump = nullptr;
     bool    transient = false;
     bool    m1 = true;
+    bool    m2 = false;
     n1_env() {
         const char * m1e = getenv("GGML_N1_M1");
         m1 = !(m1e && strcmp(m1e, "0") == 0);
+        const char * m2e = getenv("GGML_N1_M2");
+        m2 = m2e && strcmp(m2e, "1") == 0;
         dump = getenv("GGML_N1_DUMP");
         const char * tr = getenv("GGML_N1_TRANSIENT");
         transient = tr && strcmp(tr, "1") == 0;
@@ -83,7 +92,7 @@ struct n1_env {
         if (on) {
             fprintf(stderr, "[N1] Q2_0/Q1_0 prefill on native int8 WMMA (GGML_N1_PREFILL=0 disables): act=%s row=%s min_n=%lld dump=%s transient=%d g128_kernel=%s\n",
                     act_tok ? "token" : "g128", row_all ? "all" : row_ffn ? "ffn" : "none", (long long) min_n, dump ? dump : "-", (int) transient,
-                    m1 ? "xd(m1)" : "iu8(release)");
+                    m2 ? "fold+g256(m2, K%256==0; else xd)" : m1 ? "xd(m1)" : "iu8(release)");
         }
     }
 };
@@ -102,8 +111,13 @@ struct n1_stats {
     std::atomic<uint64_t> act_hit{0}, act_miss{0};          // N1 activation from the act-fuse cache (hit) / quantized here
     std::atomic<uint64_t> act_glu{0}, act_norm{0};          // ... hits written by the GLU / norm producers
     std::atomic<uint64_t> mm_nk{0}, mm_transient{0}, dumped{0};
+    std::atomic<uint64_t> mm_m2{0}, fl_m2{0}, conv_fold{0};  // T422: g128-arm calls on the fold+g256 kernel
     ~n1_stats() {
         if (!env().on || !env().stats) return;
+        if (env().m2) {
+            fprintf(stderr, "[N1] stats: m2 fold+g256 %llu ops / %.3f TFLOP, fold side-tables %llu\n",
+                    (unsigned long long) mm_m2.load(), fl_m2.load() * 1e-12, (unsigned long long) conv_fold.load());
+        }
         fprintf(stderr, "[N1] stats: activation cache hit %llu (from glu producer %llu, norm producer %llu) miss %llu\n",
                 (unsigned long long) act_hit.load(), (unsigned long long) act_glu.load(),
                 (unsigned long long) act_norm.load(), (unsigned long long) act_miss.load());
@@ -273,6 +287,70 @@ __global__ void k_n1_quant_act(const char * __restrict__ src, size_t nb1, int N,
     }
 }
 
+// T422 M2: per-256 activation quantisation (T402 g256): one block of 64 threads per (256-K group g, token t); d =
+// amax/127 over the 256 values, q = n1_quant4 (same rounding as k_n1_quant_act); the scale is written into BOTH
+// 128-slots of the group (sx keeps the [K/128][Npad] layout; gemm_fold reads the group's first slot).
+__global__ void k_n1_quant_act256(const char * __restrict__ src, size_t nb1, int N, int K, int Npad,
+                                  int8_t * __restrict__ X, float * __restrict__ sx) {
+    const int g = blockIdx.x, t = blockIdx.y, S = K / 128;
+    const float4 * row = (const float4 *) (src + (size_t) t * nb1) + (size_t) g * 64;
+    float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (t < N) v = row[threadIdx.x];
+    float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor(amax, o, 32));
+    __shared__ float red[2];
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = amax;
+    __syncthreads();
+    amax = fmaxf(red[0], red[1]);
+    const float d = n1_scale(amax);
+    if (threadIdx.x == 0) {
+        sx[(size_t) (2 * g) * Npad + t]     = d;
+        sx[(size_t) (2 * g + 1) * Npad + t] = d;
+    }
+    const uint32_t p = (t < N && d > 0.f) ? n1_quant4(v, d) : 0u;
+    *(uint32_t *) (X + n1_off(t, g * 256 + 4 * (int) threadIdx.x, S)) = p;
+}
+
+// T422 M2: ROW fold side-table from the W2 stream + fp16 sw (same rule as k_n1_row_fold: S_f = max_g|d| / (63 if the
+// row uses code 3 else 127), m = rint(d / S_f), |m| >= 1 keeping sign, m = 0 iff d == 0). mq is [S][F] (gemm_fold's
+// layout). One 256-thread block per row f; the row's 8 packed dwords per segment are read to detect code 3.
+__global__ void k_n1_fold_sw(const uint32_t * __restrict__ w2, const __half * __restrict__ sw, int F, int K,
+                             float * __restrict__ rowS, int8_t * __restrict__ mq) {
+    const int S = K / 128, f = blockIdx.x;
+    const int tile = f / 128, r = f % 128, ri = r / 16, l16 = r % 16;
+    float amax = 0.f; int c3 = 0;
+    for (int s = threadIdx.x; s < S; s += blockDim.x) {
+        amax = fmaxf(amax, fabsf(__half2float(sw[(size_t) s * F + f])));
+        const uint32_t * base = w2 + ((size_t) tile * S + s) * 1024;
+#pragma unroll
+        for (int kb = 0; kb < 4; ++kb)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int q = ri * 128 + kb * 32 + h * 16 + l16;
+                const uint32_t p = base[(q % 256) * 4 + q / 256];
+                c3 |= (p & (p >> 1) & 0x55555555u) != 0;
+            }
+    }
+    __shared__ float sa[256]; __shared__ int sc[256];
+    sa[threadIdx.x] = amax; sc[threadIdx.x] = c3;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) { sa[threadIdx.x] = fmaxf(sa[threadIdx.x], sa[threadIdx.x + o]); sc[threadIdx.x] |= sc[threadIdx.x + o]; }
+        __syncthreads();
+    }
+    float Sf = sa[0] / (sc[0] ? 63.f : 127.f);
+    if (Sf == 0.f) Sf = 1.f;
+    if (threadIdx.x == 0) rowS[f] = Sf;
+    for (int s = threadIdx.x; s < S; s += blockDim.x) {
+        const float d = __half2float(sw[(size_t) s * F + f]);
+        float m = rintf(d / Sf);
+        if (fabsf(m) < 1.f) m = d < 0.f ? -1.f : 1.f;
+        if (d == 0.f) m = 0.f;
+        mq[(size_t) s * F + f] = (int8_t) m;
+    }
+}
+
 // ---------------- weight cache ----------------
 struct n1_w {
     int    mode  = 0;   // 1 = w2 g128, 2 = row int8
@@ -284,10 +362,23 @@ std::mutex g_mtx;
 std::unordered_map<const void *, n1_w> g_cache;
 std::unordered_set<const void *> g_refused;   // conversion refused (VRAM): stays on the default route, not retried
 size_t g_cache_bytes = 0;
+// T422 M2: ROW fold side-tables (w = mq int8 [S][F], sw = rowS fp32 [F]), keyed like g_cache
+std::unordered_map<const void *, n1_w> g_fold;
 
 void n1_invalidate(const void * base, size_t size) {
     std::lock_guard<std::mutex> lk(g_mtx);
     const char * b = (const char *) base;
+    for (auto it = g_fold.begin(); it != g_fold.end();) {
+        const char * k = (const char *) it->first;
+        if (k >= b && k < b + size) {
+            if (it->second.w)  (void) hipFree(it->second.w);
+            if (it->second.sw) (void) hipFree(it->second.sw);
+            g_cache_bytes -= it->second.bytes;
+            it = g_fold.erase(it);
+        } else {
+            ++it;
+        }
+    }
     for (auto it = g_refused.begin(); it != g_refused.end();) {
         const char * k = (const char *) *it;
         it = (k >= b && k < b + size) ? g_refused.erase(it) : std::next(it);
@@ -403,6 +494,51 @@ const n1_w * get_weight(const ggml_tensor * src0, int mode) {
     if (mode == 1) { g_stats.conv_w2++;  g_stats.bytes_w2  += c.bytes; }
     else           { g_stats.conv_row++; g_stats.bytes_row += c.bytes; }
     return &g_cache.emplace(src0->data, c).first->second;
+}
+
+bool n1_has_fold(const ggml_tensor * src0) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    return g_fold.count(src0->data) != 0;
+}
+
+// T422 M2: the fold side-table of a g128-arm weight (W2 stream + fp16 sw already resident), built once on the
+// conversion stream. nullptr = refused (VRAM): the caller stays on the exact g128 kernel.
+const n1_w * get_fold(const ggml_tensor * src0, const void * W2, const void * SW) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    auto it = g_fold.find(src0->data);
+    if (it != g_fold.end()) return &it->second;
+    const int F = (int) src0->ne[1], K = (int) src0->ne[0], S = K / 128;
+    const size_t mb = (size_t) S * F, rb = (size_t) F * sizeof(float);
+    if (!vram_ok(mb + rb)) return nullptr;
+    n1_w c; c.mode = 3;
+    if (hipMalloc(&c.w, mb) != hipSuccess) return nullptr;
+    if (hipMalloc(&c.sw, rb) != hipSuccess) { (void) hipFree(c.w); return nullptr; }
+    c.bytes = mb + rb;
+    hipStream_t st = conv_stream();
+    k_n1_fold_sw<<<F, 256, 0, st>>>((const uint32_t *) W2, (const __half *) SW, F, K, (float *) c.sw, (int8_t *) c.w);
+    CUDA_CHECK(hipGetLastError());
+    CUDA_CHECK(hipStreamSynchronize(st));
+    g_cache_bytes += c.bytes;
+    g_stats.conv_fold++;
+    return &g_fold.emplace(src0->data, c).first->second;
+}
+
+template <int KT>
+void launch_m2_kt(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
+    const int ntile = Npad / 128;
+    const dim3 grid((ntile + 1) / 2, F / 64);
+    m2::gemm_fold<8, 1, 1, 2, KT><<<grid, 256, 0, st>>>((const uint4 *) X, (const uint4 *) W, (const int8_t *) fo->w,
+        (const float *) fo->sw, sx, Y, N, ntile, F, K, ldy);
+}
+void launch_m2(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
+    // the last template slot of gemm_fold is its variant mask (bit LPF = 4); KT tags K in the kernel name for
+    // rocprofv3 with values that never set bit 2 (K / 1024 << 3)
+    switch (K) {
+        case 5120:  launch_m2_kt<(5120 / 1024) << 3 >(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+        case 6144:  launch_m2_kt<(6144 / 1024) << 3 >(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+        case 17408: launch_m2_kt<(17408 / 1024) << 3>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+        default:    launch_m2_kt<0                  >(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+    }
 }
 
 // ---------------- GEMM launch ----------------
@@ -552,6 +688,44 @@ static bool n1_mul_mat_impl(ggml_backend_cuda_context & ctx, const ggml_tensor *
     float * Y = (float *) dst->data;
     const int ldy = (int) (dst->nb[1] / sizeof(float));
 
+    const n1_w * fold = (!per_token && env().m2 && K % 256 == 0) ? get_fold(src0, Wp, SWp) : nullptr;
+    if (fold) {
+        // T422 M2: per-256 activation (own layout tag in the dedup cache: siblings sharing src1 quantize once; the act-fuse
+        // producers never write it, ggml_cuda_n1_act_route returns 2 for these consumers)
+        constexpr int LAYOUT_N1G256 = GGML_CUDA_ACT_LAYOUT_N1G256;
+        const size_t nbytes = n1_act_bytes(K, N);
+        const int    mask   = ggml_cuda_act_fuse_mask();
+        const bool   act_hit = mask && ctx.act_cache_tensor == src1 && ctx.act_cache_buf &&
+            ctx.act_cache_layout == LAYOUT_N1G256 && ctx.act_cache_bytes == nbytes;
+        const bool   act_cache = act_hit || (mask & GGML_ACT_FUSE_DEDUP);
+        if (ctx.act_pending == src1) {
+            GGML_ASSERT(act_hit && "act-fuse: pending GLU consumer missed the N1G256 cache");
+            ctx.act_pending = nullptr;
+        }
+        act_hit ? g_stats.act_hit++ : g_stats.act_miss++;
+        if (act_hit && src1->op == GGML_OP_GLU) g_stats.act_glu++;
+        if (act_hit && src1->op == GGML_OP_MUL) g_stats.act_norm++;
+        ggml_cuda_pool_alloc<char> local(ctx.pool(), act_cache ? 0 : nbytes);
+        if (act_cache && !act_hit) {
+            ctx.act_cache_buf.reset();
+            ctx.act_cache_buf    = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes);
+            ctx.act_cache_tensor = src1;
+            ctx.act_cache_layout = LAYOUT_N1G256;
+            ctx.act_cache_bytes  = nbytes;
+        }
+        char * buf = act_cache ? ctx.act_cache_buf->get() : local.get();
+        int8_t * X  = (int8_t *) buf;
+        float  * sx = (float *) (buf + (size_t) Npad * K);
+        if (!act_hit) {
+            k_n1_quant_act256<<<dim3(K / 256, Npad), 64, 0, st>>>((const char *) src1->data, src1->nb[1], N, K, Npad, X, sx);
+        }
+        launch_m2(X, Wp, fold, sx, Y, N, Npad, F, K, ldy, st);
+        g_stats.mm_n1++; g_stats.fl_n1 += fl;
+        g_stats.mm_m2++; g_stats.fl_m2 += fl;
+        CUDA_CHECK(hipGetLastError());
+        return true;
+    }
+
     if (!per_token) {
         // [TAG_ACT_FUSE] T412: the g128 arm reads its activation through the act-fuse cache (N1 layout), so a fused
         // producer (GLU / norm) feeds it directly and siblings sharing src1 quantize once. Mirrors mmq.cu.
@@ -621,7 +795,24 @@ int ggml_cuda_n1_act_route(const ggml_tensor * src0, const ggml_tensor * src1, c
     if (ws < 0) {
         return 0;   // refused: ggml_cuda_n1_mul_mat falls back to the default route
     }
+    if (!row && !env().act_tok && env().m2 && src0->ne[0] % 256 == 0) {
+        // T422 M2: the fold+g256 arm reads the N1G256 layout once its fold side-table exists (built on first use)
+        return ws == 1 && n1_has_fold(src0) ? 3 : 2;
+    }
     return ws == 1 && !row && !env().act_tok ? 1 : 2;
+}
+
+int ggml_cuda_n1_w2only_act_layout(const ggml_tensor * src0) {
+    if (env().m2 && src0->ne[0] % 256 == 0) {
+        return n1_has_fold(src0) ? GGML_CUDA_ACT_LAYOUT_N1G256 : -1;
+    }
+    return GGML_CUDA_ACT_LAYOUT_N1;
+}
+
+void ggml_cuda_n1_act_ref_quant256(const float * x, int64_t s11, int64_t K, int64_t N, void * y, cudaStream_t stream) {
+    const int64_t Npad = n1_npad(N);
+    k_n1_quant_act256<<<dim3((unsigned) (K / 256), (unsigned) Npad), 64, 0, stream>>>((const char *) x, (size_t) s11 * sizeof(float),
+        (int) N, (int) K, (int) Npad, (int8_t *) y, (float *) ((char *) y + (size_t) Npad * K));
 }
 
 size_t ggml_cuda_n1_act_bytes(const ggml_tensor * src1) {
@@ -643,5 +834,7 @@ bool ggml_cuda_n1_mul_mat_w2only(ggml_backend_cuda_context &, const ggml_tensor 
 int ggml_cuda_n1_act_route(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return 0; }
 size_t ggml_cuda_n1_act_bytes(const ggml_tensor *) { return 0; }
 void ggml_cuda_n1_act_ref_quant(const float *, int64_t, int64_t, int64_t, void *, cudaStream_t) {}
+int ggml_cuda_n1_w2only_act_layout(const ggml_tensor *) { return -1; }
+void ggml_cuda_n1_act_ref_quant256(const float *, int64_t, int64_t, int64_t, void *, cudaStream_t) {}
 
 #endif

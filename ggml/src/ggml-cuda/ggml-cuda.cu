@@ -5111,6 +5111,9 @@ static int ggml_cuda_act_consumer_layout(const ggml_tensor * mm, const int cc) {
         if (r == 1) {
             return GGML_CUDA_ACT_LAYOUT_N1;
         }
+        if (r == 3) {
+            return GGML_CUDA_ACT_LAYOUT_N1G256;   // T422: GGML_N1_M2 fold+g256 arm
+        }
         if (r == 2) {
             return -1;
         }
@@ -5156,14 +5159,15 @@ static void ggml_cuda_act_note_write(ggml_backend_cuda_context * ctx, const ggml
 }
 
 static void ggml_cuda_act_cache_set(ggml_backend_cuda_context * ctx, const ggml_tensor * t, int layout, int cc) {
-    const size_t bytes = layout == GGML_CUDA_ACT_LAYOUT_N1 ? ggml_cuda_n1_act_bytes(t) :
+    const bool n1 = layout == GGML_CUDA_ACT_LAYOUT_N1 || layout == GGML_CUDA_ACT_LAYOUT_N1G256;
+    const size_t bytes = n1 ? ggml_cuda_n1_act_bytes(t) :
                          layout == GGML_CUDA_ACT_LAYOUT_SC ? ggml_cuda_sc_act_bytes(t) : ggml_cuda_mmq_act_bytes(t, cc);
     ctx->act_cache_buf.reset();
     ctx->act_cache_buf    = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx->pool(), bytes);
     ctx->act_cache_tensor = t;
     ctx->act_cache_layout = layout;
     ctx->act_cache_bytes  = bytes;
-    if (layout == GGML_CUDA_ACT_LAYOUT_N1) {
+    if (n1) {
         // producers write rows < N only: zero the last (padded) token tile of X and all of sx, as the N1
         // quantizer does (padded rows never reach dst, this keeps the buffer equal to the unfused one)
         const int64_t K = t->ne[0], N = ggml_nrows(t), Npad = (N + 127) / 128 * 128;
@@ -5193,6 +5197,8 @@ static void ggml_cuda_act_ref_quant(const ggml_tensor * src0, const float * x, i
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     if (layout == GGML_CUDA_ACT_LAYOUT_N1) {
         ggml_cuda_n1_act_ref_quant(x, s11, ne10, ne11, y, stream);
+    } else if (layout == GGML_CUDA_ACT_LAYOUT_N1G256) {
+        ggml_cuda_n1_act_ref_quant256(x, s11, ne10, ne11, y, stream);
     } else if (layout == GGML_CUDA_ACT_LAYOUT_SC) {
         ggml_cuda_sc_act_ref_quant(x, s11, ne10, ne11, y, stream);
     } else if (layout == (int) MMQ_Q8_1_DS_LAYOUT_D128) {
@@ -5210,7 +5216,8 @@ static void ggml_cuda_act_verify(ggml_backend_cuda_context * ctx, const ggml_ten
     CUDA_CHECK(cudaMemsetAsync(ref.get(), 0, bytes, ctx->stream()));
     // compare only the quantized activation, not the MMQ tile over-allocation tail
     // (N1 layout: the whole buffer, padded rows included, equals the unfused quantizer's)
-    const size_t act_bytes = (layout == GGML_CUDA_ACT_LAYOUT_N1 || layout == GGML_CUDA_ACT_LAYOUT_SC) ? bytes :
+    const size_t act_bytes = (layout == GGML_CUDA_ACT_LAYOUT_N1 || layout == GGML_CUDA_ACT_LAYOUT_N1G256 ||
+                              layout == GGML_CUDA_ACT_LAYOUT_SC) ? bytes :
         ne11*GGML_PAD(ne10, MATRIX_ROW_PADDING) * sizeof(block_q8_1)/QK8_1;
     ggml_cuda_act_ref_quant(consumer->src[0], x, ne10, s11, ne11, layout, ref.get(), ctx->stream());
     const int64_t diff = ggml_cuda_act_count_diff(ref.get(), ctx->act_cache_buf->get(), act_bytes, ctx->stream());
@@ -5227,7 +5234,7 @@ static void ggml_cuda_act_verify(ggml_backend_cuda_context * ctx, const ggml_ten
         }
     };
     static totals t;
-    const int c = layout == GGML_CUDA_ACT_LAYOUT_N1 ? 1 : layout == GGML_CUDA_ACT_LAYOUT_SC ? 2 : 0;
+    const int c = (layout == GGML_CUDA_ACT_LAYOUT_N1 || layout == GGML_CUDA_ACT_LAYOUT_N1G256) ? 1 : layout == GGML_CUDA_ACT_LAYOUT_SC ? 2 : 0;
     t.n[c]++; t.d[c] += diff; t.b[c] += (int64_t) act_bytes;
 }
 
