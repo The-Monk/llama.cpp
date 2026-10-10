@@ -38,6 +38,12 @@
 
 namespace m2 {
 
+// T435 timing-only ablations (results are WRONG by design; the harness skips verification): ABX no X reload in the loop, ABW no W-fragment
+// LDS reads (stage-0 fragment reused), ABC no W widen/ds_store/P0 loads in the loop, ABB no per-segment barrier
+constexpr int ABX = 1 << 29, ABW = 1 << 30, ABC = 1 << 9, ABB = 1 << 10;
+constexpr int FF8 = 1 << 11, FT4 = 1 << 12;
+constexpr int ABCV = 1 << 13, ABCM = 1 << 14, ABCS = 1 << 15;   // commit sub-ablations: no widen VALU (raw dword splat), no m u8 loads, no ds_store (which also kills the widen)
+constexpr int LDSA = 1 << 28;  // T435: W fragments read by inline-asm ds_load_b128, ONE s_wait_dscnt per k-block (the compiler emits one per fragment)
 constexpr int ONEACC = 1 << 27;  // T434 variant bit: ONE int32 accumulation over the whole K (RS = 1), epilogue acc * sx[t] * S_f; no in-loop rescale
 constexpr int BCARRY = 1 << 24;   // T424 variant bit: bias-carry rescale (GGML_N1_M2=2); the low bits tag K (K / 1024 << 3)
 
@@ -59,14 +65,18 @@ __global__ __launch_bounds__(WTn * WFn * 32, 1)
 void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const int8_t* __restrict__ mq,
                const float* __restrict__ rowS, const float* __restrict__ sx, float* __restrict__ Y,
                int Ntok, int ntile, int F, int K, int ldy) {
-    constexpr int NT = WTn * WFn * 32, FT = 2, FF = 4, KBN = 4;
-    constexpr int BT = 32 * WTn, BF = 64 * WFn, XB = 128 * 128, WSEG = BF * 128;
+    // FF8 (T435): 32 tokens x 128 features per wave (X bytes per WMMA halved); FT4: 64 tokens x 64 features per wave (W LDS reads per WMMA halved)
+    constexpr int NT = WTn * WFn * 32, FT = (V & FT4) ? 4 : 2, FF = (V & FF8) ? 8 : 4, KBN = 4;
+    static_assert(!((V & FT4) && (V & FF8)), "FT4 and FF8 together need 256 accumulator VGPRs");
+    constexpr int WPT = 8 / FT;   // waves per 128-token tile
+    constexpr int BT = 16 * FT * WTn, BF = 16 * FF * WFn, XB = 128 * 128, WSEG = BF * 128;
     constexpr int DWN = BF * 8 / NT;
-    static_assert(DWN == 2 || DWN == 4, "W load is b64 or b128 per thread");
+    static_assert(DWN == 1 || DWN == 2 || DWN == 4, "W load is b32, b64 or b128 per thread");
     static_assert(RS == 1 || RS == 2, "RS");
     static_assert(SEGS == 1 || SEGS == 2, "SEGS");
     static_assert(RS >= SEGS || RS == 1, "a stage may not split... RS < SEGS handled per segment");
-    constexpr bool kLpf = V & LPF, kBc = V & BCARRY, kOne = V & ONEACC;
+    constexpr bool kLpf = V & LPF, kBc = V & BCARRY, kOne = V & ONEACC, kLa = V & LDSA;
+    constexpr bool kAbX = V & ABX, kAbW = V & ABW, kAbC = V & ABC, kAbB = V & ABB, kAbCV = V & ABCV, kAbCM = V & ABCM, kAbCS = V & ABCS;
     static_assert(!kOne || RS == 1, "ONEACC: per-token scale, no rescale groups");
     constexpr int U = (RS > SEGS) ? RS / SEGS : 1;   // stages unrolled per loop iteration
     constexpr int P0N = SEGS * (1 + DWN);
@@ -76,20 +86,20 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
     const int wt = wave % WTn, wf = wave / WTn;
     const int S = K / 128;
-    const int tile_raw = blockIdx.x * (BT / 128) + wt / 4;
+    const int tile_raw = blockIdx.x * (BT / 128) + wt / WPT;
     const bool tok_ok = tile_raw < ntile;
     const int tile = tok_ok ? tile_raw : ntile - 1;
-    const int tok0 = tile * 128 + (wt % 4) * 32;
+    const int tok0 = tile * 128 + (wt % WPT) * (16 * FT);
     const int fbase = blockIdx.y * BF;
     const int ftile = fbase / 128, fhalf = (fbase % 128) / 64;
-    const int fea0 = fbase + wf * 64;
+    const int fea0 = fbase + wf * 16 * FF;
     const int pt = tid & 255;
-    const int d0 = (BF == 64) ? 2 * fhalf : (DWN == 2 ? 2 * (tid >> 8) : 0);
-    const int dl0 = (BF == 64) ? 0 : d0;
+    const int d0 = (BF == 64) ? 2 * fhalf + (DWN == 1 ? (tid >> 8) : 0) : (DWN == 2 ? 2 * (tid >> 8) : 0);
+    const int dl0 = (BF == 64) ? (DWN == 1 ? (tid >> 8) : 0) : d0;
 
     const char* xg = (const char*)Xt;
     const char* wg = (const char*)Wt + (size_t)ftile * S * 4096;
-    const uint32_t xvoff = (uint32_t)(((size_t)tile * S * XB) + ((wt % 4) * FT * KBN * 32 + lane) * 16);
+    const uint32_t xvoff = (uint32_t)(((size_t)tile * S * XB) + ((wt % WPT) * FT * KBN * 32 + lane) * 16);
     const uint32_t wvoff = (uint32_t)(pt * 16 + d0 * 4);
     // fold multiplier byte of packed dword d (q = pt + 256 d): row in the 128-feature tile = (q >> 7) * 16 + (q & 15)
     uint32_t mvoff[DWN];
@@ -113,6 +123,12 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
 
     u32x4 xr[KBN][FT];
     uint32_t rw[SEGS][DWN], rm[SEGS][DWN];
+    if constexpr (kAbCM) {   // ablation: a valid, runtime-opaque fold multiplier so the widened weights keep realistic data (zero weights would cut power and raise the clock)
+#pragma unroll
+        for (int g = 0; g < SEGS; ++g)
+#pragma unroll
+            for (int d = 0; d < DWN; ++d) { rm[g][d] = 64u + (uint32_t)(lane & 7); asm volatile("" : "+v"(rm[g][d])); }
+    }
     float sxa[FT];
     float sxs[FT] = {0.f, 0.f};   // BC (T424): running sum of the group scales; BIASF * sxs is subtracted every BC_FLUSH groups and in the epilogue
     int nres = 0;
@@ -128,12 +144,16 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
           if constexpr (DWN == 4) { u32x4 t_;                                                                  \
               M2_EPRE asm volatile("global_load_b128 %0, %1, %2 offset:0" : "=v"(t_) : "v"(wvoff), "s"(wb_) : "memory"); M2_EPOST \
               rw[g][0] = t_.x; rw[g][1] = t_.y; rw[g][DWN - 2] = t_.z; rw[g][DWN - 1] = t_.w; }                   \
-          else { u32x2 t_;                                                                                     \
+          else if constexpr (DWN == 2) { u32x2 t_;                                                             \
               M2_EPRE asm volatile("global_load_b64 %0, %1, %2 offset:0" : "=v"(t_) : "v"(wvoff), "s"(wb_) : "memory"); M2_EPOST \
               rw[g][0] = t_.x; rw[g][1] = t_.y; }                                                               \
+          else { uint32_t t_;                                                                                  \
+              M2_EPRE asm volatile("global_load_b32 %0, %1, %2 offset:0" : "=v"(t_) : "v"(wvoff), "s"(wb_) : "memory"); M2_EPOST \
+              rw[g][0] = t_; }                                                                                 \
           const char* mb_ = (const char*)(mq + (size_t)((stg) * SEGS + g) * F);                                 \
+          if constexpr (!kAbCM) {                                                                              \
           _Pragma("unroll") for (int d = 0; d < DWN; ++d)                                                       \
-              { M2_EPRE asm volatile("global_load_u8 %0, %1, %2 offset:0" : "=v"(rm[g][d]) : "v"(mvoff[d]), "s"(mb_) : "memory"); M2_EPOST } } }
+              { M2_EPRE asm volatile("global_load_u8 %0, %1, %2 offset:0" : "=v"(rm[g][d]) : "v"(mvoff[d]), "s"(mb_) : "memory"); M2_EPOST } } } }
 #define SXLOAD(G)                                                                                            \
     { const char* sxb_ = (const char*)(sx + (size_t)(G) * Npad);                                                \
       _Pragma("unroll") for (int i = 0; i < FT; ++i)                                                           \
@@ -144,8 +164,10 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
           _Pragma("unroll") for (int d = 0; d < DWN; ++d) { asm volatile("" : "+v"(rw[g][d])); asm volatile("" : "+v"(rm[g][d])); } \
           const uint32_t a_ = ldsw + (uint32_t)(buf) * WSTAGE + g * WSEG;                                        \
           _Pragma("unroll") for (int d = 0; d < DWN; ++d) {                                                     \
-              const u32x4 w8 = widen2l(rw[g][d], fold_lut(rm[g][d]));                                          \
-              asm volatile("ds_store_b128 %0, %1 offset:%2" :: "v"(a_), "v"(w8), "i"(d * 4096) : "memory");       \
+              u32x4 w8;                                                                                         \
+              if constexpr (kAbCV) w8 = u32x4{rw[g][d], rw[g][d], rw[g][d], rw[g][d]};                           \
+              else w8 = widen2l(rw[g][d], fold_lut(rm[g][d]));                                                 \
+              if constexpr (!kAbCS) { asm volatile("ds_store_b128 %0, %1 offset:%2" :: "v"(a_), "v"(w8), "i"(d * 4096) : "memory"); } \
               M2_ESM_STORE_WAIT } } }
 
     if (kOne) SXLOAD(0)   // T434: the per-token scale, loaded once (sx[0][t]); COMMIT(0, 0) drains it with the first W stage
@@ -158,6 +180,15 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
 #pragma unroll
     for (int kb = 0; kb < KBN; ++kb) XLOAD(0, kb)
     lds_barrier();
+    u32x4 wfix[FF];
+    if constexpr (kAbW) {   // stage-0 fragments, read once; the loop reuses them
+        const uint32_t r0_ = lds0 + (uint32_t)(wf * FF * KBN * 512 + lane * 16);
+#pragma unroll
+        for (int j = 0; j < FF; ++j) asm volatile("ds_load_b128 %0, %1 offset:%2" : "=v"(wfix[j]) : "v"(r0_), "i"(j * KBN * 512) : "memory");
+        asm volatile("s_wait_dscnt 0" ::: "memory");
+#pragma unroll
+        for (int j = 0; j < FF; ++j) asm volatile("" : "+v"(wfix[j]));
+    }
 
     const i32x8 bias8 = i32x8{BIASI, BIASI, BIASI, BIASI, BIASI, BIASI, BIASI, BIASI};
     i32x8 acc[FT][FF];
@@ -214,7 +245,7 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
         for (int u = 0; u < U; ++u) {
             const int s = s2 + u;
             const int sn = s + 1 < NST ? s + 1 : s;
-            P0LOAD(sn)
+            if constexpr (!kAbC) P0LOAD(sn)
             const char* bW = (const char*)lds + (s & 1) * WSTAGE;
 #pragma unroll
             for (int g = 0; g < SEGS; ++g) {
@@ -223,16 +254,30 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
                 const int Gn = (g + 1 < SEGS) ? G + 1 : sn * SEGS;
                 const bool sxl = !kOne && p == 0;
                 if (sxl) SXLOAD(G)
-                const uint4* b = (const uint4*)(bW + g * WSEG);
-                uint4 w[2][FF];
-                if constexpr (kLpf) {
+                const u32x4* b = (const u32x4*)(bW + g * WSEG);
+                u32x4 w[2][FF];
+                const uint32_t rd_ = lds0 + (uint32_t)((wf * FF * KBN * 512 + lane * 16) + ((s & 1) * WSTAGE + g * WSEG));
+#define LDSLOAD(bf, kbv)                                                                                       \
+    { _Pragma("unroll") for (int j = 0; j < FF; ++j)                                                          \
+          asm volatile("ds_load_b128 %0, %1 offset:%2" : "=v"(w[bf][j]) : "v"(rd_), "i"(j * KBN * 512 + (kbv) * 512) : "memory"); }
+                if constexpr (kAbW) {
+                } else if constexpr (kLa) {
+                    LDSLOAD(0, 0)
+                } else if constexpr (kLpf) {
 #pragma unroll
                     for (int j = 0; j < FF; ++j) w[0][j] = b[((wf * FF + j) * KBN + 0) * 32 + lane];
                 }
 #pragma unroll
                 for (int kb = 0; kb < KBN; ++kb) {
-                    uint4* wc = w[kLpf ? (kb & 1) : 0];
-                    if constexpr (kLpf) {
+                    u32x4* wc = w[(kLpf || kLa) ? (kb & 1) : 0];
+                    if constexpr (kAbW) wc = wfix;
+                    if constexpr (kAbW) {
+                    } else if constexpr (kLa) {
+                        if (kb + 1 < KBN) { LDSLOAD((kb + 1) & 1, kb + 1) asm volatile("s_wait_dscnt 4" ::: "memory"); }
+                        else asm volatile("s_wait_dscnt 0" ::: "memory");
+#pragma unroll
+                        for (int j = 0; j < FF; ++j) asm volatile("" : "+v"(wc[j]));
+                    } else if constexpr (kLpf) {
                         if (kb + 1 < KBN) {
 #pragma unroll
                             for (int j = 0; j < FF; ++j) w[(kb + 1) & 1][j] = b[((wf * FF + j) * KBN + kb + 1) * 32 + lane];
@@ -259,7 +304,7 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
                             acc[i][j] = wmma_iu8(w1, x1, c0);
                         }
                     __builtin_amdgcn_sched_barrier(0);
-                    XLOAD(Gn, kb)
+                    if constexpr (!kAbX) XLOAD(Gn, kb)
                 }
                 const bool resc = (p == RS - 1);
                 // a P0 lies between this group's sx and now only when the group spans a stage boundary (SEGS = 1, RS = 2)
@@ -273,11 +318,13 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
                         for (int j = 0; j < FF; ++j) asm volatile("" : "+v"(acc[i][j]));
                     // newer than the last P0 load: this stage's sx loads + 4 FT reloads per segment
                     constexpr int SXN = kOne ? 0 : (RS == 1) ? SEGS * FT : FT;   // RS == SEGS == 2: one sx group per stage
-                    if (SEGS == 1 && RS == 2 && p == 1) COMMIT((s + 1) & 1, 4 * FT)
-                    else COMMIT((s + 1) & 1, SXN + SEGS * 4 * FT)
-                    bar_signal();
+                    if constexpr (!kAbC) {
+                        if (SEGS == 1 && RS == 2 && p == 1) COMMIT((s + 1) & 1, 4 * FT)
+                        else COMMIT((s + 1) & 1, SXN + SEGS * 4 * FT)
+                    }
+                    if constexpr (!kAbB) bar_signal();
                     if (resc && !kOne) rescale(ws);
-                    bar_wait();
+                    if constexpr (!kAbB) bar_wait();
                 }
             }
         }
@@ -287,6 +334,7 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
 #undef P0LOAD
 #undef SXLOAD
 #undef COMMIT
+#undef LDSLOAD
 
     if (!tok_ok) return;
 #pragma unroll
