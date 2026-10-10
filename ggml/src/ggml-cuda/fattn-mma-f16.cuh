@@ -1993,11 +1993,11 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     constexpr bool V_is_K_view = DKQ == 576; // Guaranteed by the kernel selection logic in fattn.cu
 
-    // T441: RDNA4 hd256 transposed-V LDS tile (GGML_HIP_FA_VT=1 enables; see flash_attn_ext_f16_load_tile_Vt).
+    // T441: RDNA4 hd256 transposed-V LDS tile (GGML_HIP_FA_VT=0 disables; see flash_attn_ext_f16_load_tile_Vt).
     constexpr bool vt_possible = DKQ == 256 && DV == 256;
     static const bool vt_env = [] {
         const char * e = getenv("GGML_HIP_FA_VT");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     const bool use_vt = vt_possible && vt_env && GGML_CUDA_CC_IS_RDNA4(cc) && nstages <= 1;
 
