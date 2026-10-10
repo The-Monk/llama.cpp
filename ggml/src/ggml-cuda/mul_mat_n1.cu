@@ -72,7 +72,7 @@ struct n1_env {
     bool    m3 = false;     // GGML_N1_M3=1 (T434, default OFF, DIFFERENT MATH, KLD-gated): Hadamard-model activations (src1 = FWHT node)
                             // quantised per TOKEN, folded int8 weights, ONE int32 accumulation over the whole K (no in-loop rescale)
     int     m3_segs = 1;
-    int     m3_feed = 0;       // GGML_N1_M3_FEED (T435): 1 = wave tile 64 tok x 64 feat (W LDS reads per WMMA halved), 2 = 32 tok x 128 feat (X loads per WMMA halved), 3 = tile 1 + s_setprio 2 around each k-block's WMMA burst (T440); all on a 256 x 128 block
+    int     m3_feed = 3;       // GGML_N1_M3_FEED (T435; default 3 since T440, =0 disables): 1 = wave tile 64 tok x 64 feat (W LDS reads per WMMA halved), 2 = 32 tok x 128 feat (X loads per WMMA halved), 3 = tile 1 + s_setprio 2 around each k-block's WMMA burst (T440); all on a 256 x 128 block
     bool    m3_wide = false;   // GGML_N1_M3_WIDE=1: always the 256-token tile (A/B only)
     int     m2bc_flush = 8;
     bool    m2bc = false;   // GGML_N1_M2=2 (T424): M2 path + bias-carry rescale (one fmac per element per 256 K)
@@ -88,7 +88,7 @@ struct n1_env {
         const char * m3s = getenv("GGML_N1_M3_SEGS");
         m3_segs = m3s && atoi(m3s) == 2 ? 2 : 1;
         const char * m3f = getenv("GGML_N1_M3_FEED");
-        m3_feed = m3f && atoi(m3f) >= 1 && atoi(m3f) <= 3 ? atoi(m3f) : 0;
+        m3_feed = m3f && atoi(m3f) >= 0 && atoi(m3f) <= 3 ? atoi(m3f) : 3;   // default 3 (T440); GGML_N1_M3_FEED=0 disables
         const char * fe = getenv("GGML_N1_M2BC_FLUSH");
         m2bc_flush = fe ? atoi(fe) : 8;
         dump = getenv("GGML_N1_DUMP");
