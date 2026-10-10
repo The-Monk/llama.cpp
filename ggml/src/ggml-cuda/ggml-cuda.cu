@@ -4355,13 +4355,19 @@ static int ggml_cuda_find_sc_group(const ggml_cgraph * cgraph, int i, ggml_tenso
 
 // T434 M3: defined with the act-fuse helpers below
 static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, int off,
-        const ggml_tensor * x, const ggml_tensor * up, const ggml_tensor * signs, ggml_tensor * mm);
+        const ggml_tensor * x, const ggml_tensor * up, const ggml_tensor * signs, ggml_tensor * mm,
+        int perm_hd = 0, int perm_nk = 0, int perm_rep = 0);
 
 
 static const ggml_tensor * ggml_cuda_act_first_consumer(const ggml_cgraph * cgraph, int i, const ggml_tensor * t);
 static int ggml_cuda_fwht_quant_mode() {   // bit 0: FWHT+q8_1 fusion, bit 1: + RMS_NORM fused in, bit 2: verify against the reference quantizer
     static const int m = [] { const char * v = getenv("GGML_CUDA_FWHT_QUANT"); return v ? atoi(v) : 3; }();   // default ON (3), =0 disables
     return m;
+}
+// T439: fold the ssm_out tiled->grouped feature reorder (CONT) into the M3 FWHT producer (prefill). =1 on, default off.
+static bool ggml_cuda_b2_perm_fuse_enabled() {
+    static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_PERM_FUSE"); return v && atoi(v) != 0; }();
+    return on;
 }
 static bool ggml_cuda_fwht_quant_enabled() { return (ggml_cuda_fwht_quant_mode() & 1) != 0; }
 
@@ -4585,6 +4591,35 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_node_get_use_count(cgraph, i) == 1 && !(glu->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_is_contiguous(glu);
         if (pattern_ok && ggml_cuda_m3_fwht_quant(cuda_ctx, cgraph, i, 1, glu->src[0], glu->src[1], signs, mm)) {
             return 3;
+        }
+    }
+
+    // T439 GGML_CUDA_B2_PERM_FUSE: prefill ssm_out input: [reshape+permute view] CONT + RESHAPE + MUL(signs) + RESHAPE + FWHT matmul.
+    // The tiled->grouped feature reorder (a 25 MB scalar cpy kernel per GDN layer per ubatch) is folded into the M3 producer's load.
+    if (ggml_cuda_b2_perm_fuse_enabled() && ggml_cuda_n1_enabled() && node->op == GGML_OP_CONT && i + 4 < cgraph->n_nodes &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 4 })) {
+        const ggml_tensor * perm  = node->src[0];
+        const ggml_tensor * rsh   = cgraph->nodes[i + 1];
+        const ggml_tensor * muls  = cgraph->nodes[i + 2];
+        const ggml_tensor * rsh2  = cgraph->nodes[i + 3];
+        ggml_tensor *       mm    = cgraph->nodes[i + 4];
+        const ggml_tensor * base  = perm && perm->op == GGML_OP_PERMUTE && perm->src[0] && perm->src[0]->op == GGML_OP_RESHAPE ? perm->src[0]->src[0] : nullptr;
+        const ggml_tensor * signs = muls->src[1];
+        if (base && rsh->src[0] == node && muls->src[0] == rsh && rsh2->src[0] == muls && mm->src[1] == rsh2 &&
+            ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD && mm->src[0]->ne[0] == 1024 &&
+            base->type == GGML_TYPE_F32 && ggml_is_contiguous(base) && node->type == GGML_TYPE_F32 && muls->type == GGML_TYPE_F32 &&
+            perm->ne[3] > 1 && ggml_nelements(base) == ggml_nelements(node) && ggml_nelements(perm) == ggml_nelements(base) &&
+            perm->src[0]->ne[0] == perm->ne[0] && perm->src[0]->ne[1] == perm->ne[2] && perm->src[0]->ne[2] == perm->ne[1] &&
+            perm->src[0]->ne[3] == perm->ne[3] &&
+            perm->nb[0] == sizeof(float) && perm->nb[1] == perm->ne[0] * perm->ne[2] * sizeof(float) &&
+            perm->nb[2] == perm->ne[0] * sizeof(float) &&
+            base->ne[0] == perm->ne[0] * perm->ne[1] * perm->ne[2] && ggml_nelements(base) == base->ne[0] * perm->ne[3] &&
+            signs->type == GGML_TYPE_F32 && ggml_is_contiguous(signs) && signs->ne[1] == 1 && signs->ne[2] == 1 && signs->ne[3] == 1 &&
+            signs->ne[0] == base->ne[0] && signs->ne[0] % 1024 == 0 &&
+            ggml_nelements(rsh2) == ggml_nelements(base)) {
+            if (ggml_cuda_m3_fwht_quant(cuda_ctx, cgraph, i, 2, base, nullptr, signs, mm, (int) perm->ne[0], (int) perm->ne[2], (int) perm->ne[1])) {
+                return 4;
+            }
         }
     }
 
@@ -5780,7 +5815,8 @@ static int ggml_cuda_act_try_fuse(ggml_backend_cuda_context * ctx, ggml_cgraph *
 // and those matmuls directly follow the producer (the cache is a single slot); otherwise it is written as before.
 // off = 1 with `up` set: the pattern starts one node earlier with the swiglu_split GLU (x = gate, up = up).
 static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, int off,
-        const ggml_tensor * x, const ggml_tensor * up, const ggml_tensor * signs, ggml_tensor * mm) {
+        const ggml_tensor * x, const ggml_tensor * up, const ggml_tensor * signs, ggml_tensor * mm,
+        int perm_hd, int perm_nk, int perm_rep) {
     static const bool fuse_on = [] {
         const char * m3 = getenv("GGML_N1_M3"), * e = getenv("GGML_N1_M3_FUSE");
         return !(m3 && strcmp(m3, "0") == 0) && !(e && atoi(e) == 0);   // default ON, like n1_env().m3
@@ -5868,7 +5904,7 @@ static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_c
     if (up) gs.fused++;
     const int cc = ggml_cuda_info().devices[ctx->device].cc;
     ggml_cuda_act_cache_set(ctx, rs, GGML_CUDA_ACT_LAYOUT_N1TOK, cc);
-    static const bool verify = getenv("GGML_N1_M3_VERIFY") != nullptr;   // gate only: syncs (run with GGML_CUDA_DISABLE_GRAPHS=1)
+    static const bool verify = getenv("GGML_N1_M3_VERIFY") != nullptr && perm_rep == 0;   // gate only: syncs (run with GGML_CUDA_DISABLE_GRAPHS=1)
     // VERIFY reference, computed BEFORE the fused kernel (mm may alias the transform's input in the graph allocator): the
     // unfused swiglu (GLU variant) -> signed FWHT kernel -> per-token quantizer, all into scratch buffers
     const size_t nbf = ggml_nbytes(mm), bytes = ctx->act_cache_bytes;
@@ -5893,7 +5929,7 @@ static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_c
     }
     // the GLU variant under VERIFY keeps its fp32 output off (mm may alias gate/up): only its int8 bytes are compared
     const bool write_fp32 = !skip_fp32 || (verify && !up);
-    if (!ggml_cuda_op_fwht_signed_quant_n1t(*ctx, x, up, signs, mm, write_fp32, ctx->act_cache_buf->get())) {
+    if (!ggml_cuda_op_fwht_signed_quant_n1t(*ctx, x, up, signs, mm, write_fp32, ctx->act_cache_buf->get(), perm_hd, perm_nk, perm_rep)) {
         ctx->act_cache_tensor = nullptr;
         ctx->act_cache_buf.reset();
         return false;
@@ -5930,14 +5966,15 @@ static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_c
 }
 
 static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, int off,
-        const ggml_tensor * x, const ggml_tensor * up, const ggml_tensor * signs, ggml_tensor * mm) {
+        const ggml_tensor * x, const ggml_tensor * up, const ggml_tensor * signs, ggml_tensor * mm,
+        int perm_hd, int perm_nk, int perm_rep) {
     struct host_time {
         double us = 0; int64_t calls = 0;
         ~host_time() { if (getenv("GGML_N1_STATS") && calls) fprintf(stderr, "[N1] stats: m3 FWHT-producer host time %.1f ms over %lld calls\n", us * 1e-3, (long long) calls); }
     };
     static host_time ht;
     const auto t0 = std::chrono::steady_clock::now();
-    const bool r = ggml_cuda_m3_fwht_quant_impl(ctx, cgraph, i, off, x, up, signs, mm);
+    const bool r = ggml_cuda_m3_fwht_quant_impl(ctx, cgraph, i, off, x, up, signs, mm, perm_hd, perm_nk, perm_rep);
     ht.us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
     ht.calls++;
     return r;

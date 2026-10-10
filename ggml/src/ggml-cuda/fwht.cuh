@@ -10,7 +10,8 @@ bool ggml_cuda_op_fwht_signed(ggml_backend_cuda_context & ctx, const ggml_tensor
 // written. Returns false (nothing launched) for an unsupported shape.
 // up != nullptr: the FWHT input is silu(src) * up (a swiglu_split node fused in; src = gate), rows 2D with their own strides.
 bool ggml_cuda_op_fwht_signed_quant_n1t(ggml_backend_cuda_context & ctx, const ggml_tensor * src, const ggml_tensor * up,
-                                        const ggml_tensor * signs, ggml_tensor * dst, bool write_fp32, void * y);
+                                        const ggml_tensor * signs, ggml_tensor * dst, bool write_fp32, void * y,
+                                        int perm_hd = 0, int perm_nk = 0, int perm_rep = 0);   // perm_rep > 0: src is the tiled GDN output (see fwht.cu)
 // As above, and also writes the Q2_FIELD-layout q8_1 quantization of dst into qy (N=1024 only; false = declined).
 bool ggml_cuda_op_fwht_signed_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
                                    const ggml_tensor * signs, ggml_tensor * dst, void * qy);

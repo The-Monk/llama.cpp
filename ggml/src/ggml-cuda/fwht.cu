@@ -93,12 +93,15 @@ __global__ void fwht_cuda(const float * src, float * dst, const int64_t n_rows, 
 // bytes (u32) at n1_off. write_fp32: also store the rotated fp32 (the unfused FWHT output) for consumers that need it.
 // glu: the FWHT input is silu(src) * up (a swiglu_split node whose only consumer is this transform), read straight from the
 // gate (src) and up tensors with row strides s_src / s_up (elements); the same float expression as the GLU producers.
-template <bool write_fp32, bool glu>
+// perm (T439 GGML_CUDA_B2_PERM_FUSE): src rows are the TILED [hd, nk, rep] layout of the GDN output and the transform input is
+// the grouped [hd, rep, nk] reorder (build_lora_mm's reshape/permute/cont of ssm_out, folded into the load). 32 | hd, so each
+// warp-wide load stays one contiguous run; the values are copied unchanged, so the result equals the cont + plain producer.
+template <bool write_fp32, bool glu, bool perm = false>
 __launch_bounds__(1024, 1)
 __global__ void fwht_quant_n1t(const float * __restrict__ src, const float * __restrict__ up, const int64_t s_src, const int64_t s_up,
                                float * __restrict__ dst, const float scale,
                                const float * __restrict__ signs, int8_t * __restrict__ X, float * __restrict__ sx,
-                               const int S) {
+                               const int S, const int perm_hd = 0, const int perm_nk = 0, const int perm_rep = 0) {
     constexpr int N = 1024, warp_size = 32, el_w = N / warp_size;
     const int tok = blockIdx.x, w = threadIdx.y, lane = threadIdx.x;
     const int K = blockDim.y * N;
@@ -113,7 +116,13 @@ __global__ void fwht_quant_n1t(const float * __restrict__ src, const float * __r
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
         const int idx = i * warp_size + lane;
-        float v = glu ? ggml_cuda_op_silu_single(s[idx]) * u[idx] : s[idx];
+        int sidx = idx;
+        if (perm) {
+            const int ob = w * N + i * warp_size;   // warp-uniform start of 32 consecutive grouped elements
+            const int a0 = ob % perm_hd, t = ob / perm_hd;
+            sidx = (a0 + lane + perm_hd * (t / perm_rep + perm_nk * (t % perm_rep))) - w * N;
+        }
+        float v = glu ? ggml_cuda_op_silu_single(s[idx]) * u[idx] : s[sidx];
         v *= scale;
         v *= sg[idx];
         reg[i] = v;
@@ -124,6 +133,9 @@ __global__ void fwht_quant_n1t(const float * __restrict__ src, const float * __r
         asm volatile("" : "+v"(reg[i]));   // the rotated value is a rounded fp32 from here on (as when the unfused kernel stores it)
     }
     if (write_fp32) {   // dst is the FWHT node: contiguous rows of K
+        if (perm) {
+            __syncthreads();   // dst may alias src: every warp gathers from the whole row before any warp overwrites its chunk
+        }
         float * d = dst + (size_t) tok * K + (size_t) w * N;
 #pragma unroll
         for (int i = 0; i < el_w; ++i) {
@@ -339,8 +351,13 @@ bool ggml_cuda_op_fwht_signed(ggml_backend_cuda_context & ctx, const ggml_tensor
 }
 
 bool ggml_cuda_op_fwht_signed_quant_n1t(ggml_backend_cuda_context & ctx, const ggml_tensor * src, const ggml_tensor * up,
-                                        const ggml_tensor * signs, ggml_tensor * dst, bool write_fp32, void * y) {
+                                        const ggml_tensor * signs, ggml_tensor * dst, bool write_fp32, void * y,
+                                        int perm_hd, int perm_nk, int perm_rep) {
     const bool glu = up != nullptr;
+    const bool perm = perm_rep > 0;
+    if (perm && (glu || perm_hd % 32 != 0 || perm_hd <= 0 || perm_nk <= 0 || (int64_t) perm_hd * perm_nk * perm_rep != src->ne[0])) {
+        return false;
+    }
     if (!ggml_is_contiguous(dst) || !ggml_is_contiguous(signs) ||
         src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || signs->type != GGML_TYPE_F32) {
         return false;
@@ -375,13 +392,17 @@ bool ggml_cuda_op_fwht_signed_quant_n1t(ggml_backend_cuda_context & ctx, const g
     float *       d = (float *) dst->data;
     const float * g = (const float *) signs->data;
     const int     S = (int) (K / 128);
-#define FQ(WF, GL) ggml_cuda_kernel_launch(fwht_quant_n1t<WF, GL>, lp, a, b, s_src, s_up, d, scale, g, X, sx, S)
-    if (glu) {
+#define FQ(WF, GL) ggml_cuda_kernel_launch(fwht_quant_n1t<WF, GL>, lp, a, b, s_src, s_up, d, scale, g, X, sx, S, 0, 0, 0)
+#define FQP(WF) ggml_cuda_kernel_launch(fwht_quant_n1t<WF, false, true>, lp, a, b, s_src, s_up, d, scale, g, X, sx, S, perm_hd, perm_nk, perm_rep)
+    if (perm) {
+        if (write_fp32) FQP(true); else FQP(false);
+    } else if (glu) {
         if (write_fp32) FQ(true, true); else FQ(false, true);
     } else {
         if (write_fp32) FQ(true, false); else FQ(false, false);
     }
 #undef FQ
+#undef FQP
     return true;
 }
 
