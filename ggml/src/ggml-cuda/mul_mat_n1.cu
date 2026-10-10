@@ -17,6 +17,8 @@
 //   GGML_N1_MIN_N=<n>      minimum src1 batch (default 64)
 //   GGML_N1_DUMP=<dir>     T400 gate: write every runtime-converted g128 weight (W2 stream, fp16 sw) to <dir>
 //   GGML_N1_TRANSIENT=1    T400 single-copy study: re-pack W2 + sw into pool scratch on every call (no cache)
+//   GGML_N1_M1=0           T420: the g128 arm uses the release kernel (gemm_iu8 FL=9) instead of gemm_xd (X direct-to-VGPR,
+//                          bias-initialised accumulators; bit-identical output, +13% standalone)
 //
 // T400 N4: weights loaded from a native dual-blob GGUF (llama-model-loader, GGML_TYPE_NK_*_W2) arrive as a compact
 // Q2_0/Q1_0 view whose view_src is the dual tensor; its W2 region and its companion's sw are used in place (no
@@ -41,6 +43,7 @@
 
 #if defined(GGML_USE_HIP)
 #include "n1_gemm_iu8.cuh"
+#include "n1_gemm_xd.cuh"
 #include "n1_act.cuh"
 
 namespace {
@@ -55,7 +58,10 @@ struct n1_env {
     int64_t min_n   = 64;
     const char * dump = nullptr;
     bool    transient = false;
+    bool    m1 = true;
     n1_env() {
+        const char * m1e = getenv("GGML_N1_M1");
+        m1 = !(m1e && strcmp(m1e, "0") == 0);
         dump = getenv("GGML_N1_DUMP");
         const char * tr = getenv("GGML_N1_TRANSIENT");
         transient = tr && strcmp(tr, "1") == 0;
@@ -75,8 +81,9 @@ struct n1_env {
         const char * m = getenv("GGML_N1_MIN_N");
         if (m) min_n = atoll(m);
         if (on) {
-            fprintf(stderr, "[N1] Q2_0/Q1_0 prefill on native int8 WMMA (GGML_N1_PREFILL=0 disables): act=%s row=%s min_n=%lld dump=%s transient=%d\n",
-                    act_tok ? "token" : "g128", row_all ? "all" : row_ffn ? "ffn" : "none", (long long) min_n, dump ? dump : "-", (int) transient);
+            fprintf(stderr, "[N1] Q2_0/Q1_0 prefill on native int8 WMMA (GGML_N1_PREFILL=0 disables): act=%s row=%s min_n=%lld dump=%s transient=%d g128_kernel=%s\n",
+                    act_tok ? "token" : "g128", row_all ? "all" : row_ffn ? "ffn" : "none", (long long) min_n, dump ? dump : "-", (int) transient,
+                    m1 ? "xd(m1)" : "iu8(release)");
         }
     }
 };
@@ -415,6 +422,21 @@ void launch(const void * X, const void * W, const void * sw, const float * sx, f
     }
 }
 
+// T420: g128 arm on gemm_xd (KT tags the K for rocprofv3, as launch_kt does)
+template <int KT>
+void launch_xd_kt(const void * X, const void * W, const void * sw, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
+    const dim3 grid(Npad / N1_BT, F / N1_BF);
+    dw::gemm_xd<KT><<<grid, N1_NT, 0, st>>>((const uint4 *) X, (const uint4 *) W, sw, sx, Y, N, F, K, ldy);
+}
+void launch_xd(const void * X, const void * W, const void * sw, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
+    switch (K) {
+        case 5120:  launch_xd_kt<5120 >(X, W, sw, sx, Y, N, Npad, F, K, ldy, st); break;
+        case 6144:  launch_xd_kt<6144 >(X, W, sw, sx, Y, N, Npad, F, K, ldy, st); break;
+        case 17408: launch_xd_kt<17408>(X, W, sw, sx, Y, N, Npad, F, K, ldy, st); break;
+        default:    launch_xd_kt<0    >(X, W, sw, sx, Y, N, Npad, F, K, ldy, st); break;
+    }
+}
+
 // The one routing predicate (shape side), shared by the GEMM entry and the act-fuse probe.
 // src1 [K, n, s2, s3] with a 2D weight and contiguous rows collapses to N = n*s2*s3 tokens (e.g. the GDN ssm_out
 // projection arrives as [K, n_seq_tokens, n_seqs]); dst is then [F, N] contiguous as well.
@@ -564,7 +586,11 @@ static bool n1_mul_mat_impl(ggml_backend_cuda_context & ctx, const ggml_tensor *
         if (!act_hit) {
             k_n1_quant_act<<<dim3(S, Npad), 32, 0, st>>>((const char *) src1->data, src1->nb[1], N, K, 128, Npad, X, sx);
         }
-        launch<1, 9>(X, Wp, SWp, sx, Y, N, Npad, F, K, ldy, st);
+        if (env().m1) {
+            launch_xd(X, Wp, SWp, sx, Y, N, Npad, F, K, ldy, st);
+        } else {
+            launch<1, 9>(X, Wp, SWp, sx, Y, N, Npad, F, K, ldy, st);
+        }
         g_stats.mm_n1++; g_stats.fl_n1 += fl;
         CUDA_CHECK(hipGetLastError());
         return true;
