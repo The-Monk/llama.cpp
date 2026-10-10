@@ -4353,10 +4353,18 @@ static int ggml_cuda_find_sc_group(const ggml_cgraph * cgraph, int i, ggml_tenso
     return n;
 }
 
+// T439: the residual ADD + RMS_NORM + MUL(weight) in front of the producer (GGML_CUDA_B2_ADDNORM_FUSE): x is the ADD node's src[0]
+struct ggml_cuda_m3_norm {
+    ggml_tensor *       add;       // ADD node (written by the fused kernel)
+    ggml_tensor *       normdst;   // MUL(weight) node, or nullptr when no other node reads it
+    const ggml_tensor * mulw;      // the norm weight
+    float               eps;
+};
+
 // T434 M3: defined with the act-fuse helpers below
 static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, int off,
         const ggml_tensor * x, const ggml_tensor * up, const ggml_tensor * signs, ggml_tensor * mm,
-        int perm_hd = 0, int perm_nk = 0, int perm_rep = 0);
+        int perm_hd = 0, int perm_nk = 0, int perm_rep = 0, const ggml_cuda_m3_norm * na = nullptr);
 
 
 static const ggml_tensor * ggml_cuda_act_first_consumer(const ggml_cgraph * cgraph, int i, const ggml_tensor * t);
@@ -4365,6 +4373,10 @@ static int ggml_cuda_fwht_quant_mode() {   // bit 0: FWHT+q8_1 fusion, bit 1: + 
     return m;
 }
 // T439: fold the ssm_out tiled->grouped feature reorder (CONT) into the M3 FWHT producer (prefill). =1 on, default off.
+static bool ggml_cuda_b2_addnorm_fuse_enabled() {
+    static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_ADDNORM_FUSE"); return v && atoi(v) != 0; }();
+    return on;
+}
 static bool ggml_cuda_b2_perm_fuse_enabled() {
     static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_PERM_FUSE"); return v && atoi(v) != 0; }();
     return on;
@@ -4591,6 +4603,39 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_node_get_use_count(cgraph, i) == 1 && !(glu->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_is_contiguous(glu);
         if (pattern_ok && ggml_cuda_m3_fwht_quant(cuda_ctx, cgraph, i, 1, glu->src[0], glu->src[1], signs, mm)) {
             return 3;
+        }
+    }
+
+    // T439 GGML_CUDA_B2_ADDNORM_FUSE: prefill ADD (residual) + RMS_NORM + MUL(weight) + MUL(signs) + RESHAPE + FWHT matmul -> ONE launch
+    // (the M3 producer with the add and the norm in front of it)
+    if (ggml_cuda_b2_addnorm_fuse_enabled() && ggml_cuda_n1_enabled() && node->op == GGML_OP_ADD && i + 5 < cgraph->n_nodes &&
+        cgraph->nodes[i + 1]->op == GGML_OP_RMS_NORM && cgraph->nodes[i + 1]->src[0] == node) {
+        ggml_tensor *       add   = cgraph->nodes[i];
+        const ggml_tensor * rms   = cgraph->nodes[i + 1];
+        ggml_tensor *       mulw  = cgraph->nodes[i + 2];
+        const ggml_tensor * muls  = cgraph->nodes[i + 3];
+        const ggml_tensor * rsh   = cgraph->nodes[i + 4];
+        ggml_tensor *       mm    = cgraph->nodes[i + 5];
+        const bool norm_shared = ggml_node_get_use_count(cgraph, i + 2) > 1;   // another node (e.g. an unfolded bf16 matmul) reads the normalized row
+        const bool can = norm_shared ? ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i, i + 2, i + 5 })
+                                     : ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i, i + 5 });
+        const ggml_tensor * w     = mulw->src[0] == rms ? mulw->src[1] : mulw->src[0];
+        const ggml_tensor * signs = muls->src[1];
+        float eps;
+        memcpy(&eps, rms->op_params, sizeof(float));
+        if (can && (mulw->src[0] == rms || mulw->src[1] == rms) && muls->src[0] == mulw && rsh->src[0] == muls && mm->src[1] == rsh &&
+            ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD && mm->src[0]->ne[0] == 1024 &&
+            add->type == GGML_TYPE_F32 && add->src[0]->type == GGML_TYPE_F32 && add->src[1]->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(add->src[0], add) && ggml_are_same_shape(add->src[1], add) &&
+            ggml_is_contiguous(add->src[0]) && ggml_is_contiguous(add->src[1]) && ggml_is_contiguous(add) &&
+            mulw->type == GGML_TYPE_F32 && muls->type == GGML_TYPE_F32 && ggml_are_same_shape(mulw, add) &&
+            w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && w->ne[0] == add->ne[0] && ggml_nelements(w) == add->ne[0] &&
+            signs->type == GGML_TYPE_F32 && ggml_is_contiguous(signs) && signs->ne[0] == add->ne[0] && ggml_nelements(signs) == add->ne[0] &&
+            muls->src[0]->ne[0] == add->ne[0] && add->ne[0] % 1024 == 0 && ggml_nelements(rsh) == ggml_nelements(add)) {
+            const ggml_cuda_m3_norm na = { add, norm_shared ? mulw : nullptr, w, eps };
+            if (ggml_cuda_m3_fwht_quant(cuda_ctx, cgraph, i, 3, add->src[0], nullptr, signs, mm, 0, 0, 0, &na)) {
+                return 5;
+            }
         }
     }
 
@@ -5816,7 +5861,7 @@ static int ggml_cuda_act_try_fuse(ggml_backend_cuda_context * ctx, ggml_cgraph *
 // off = 1 with `up` set: the pattern starts one node earlier with the swiglu_split GLU (x = gate, up = up).
 static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, int off,
         const ggml_tensor * x, const ggml_tensor * up, const ggml_tensor * signs, ggml_tensor * mm,
-        int perm_hd, int perm_nk, int perm_rep) {
+        int perm_hd, int perm_nk, int perm_rep, const ggml_cuda_m3_norm * na) {
     static const bool fuse_on = [] {
         const char * m3 = getenv("GGML_N1_M3"), * e = getenv("GGML_N1_M3_FUSE");
         return !(m3 && strcmp(m3, "0") == 0) && !(e && atoi(e) == 0);   // default ON, like n1_env().m3
@@ -5904,7 +5949,7 @@ static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_c
     if (up) gs.fused++;
     const int cc = ggml_cuda_info().devices[ctx->device].cc;
     ggml_cuda_act_cache_set(ctx, rs, GGML_CUDA_ACT_LAYOUT_N1TOK, cc);
-    static const bool verify = getenv("GGML_N1_M3_VERIFY") != nullptr && perm_rep == 0;   // gate only: syncs (run with GGML_CUDA_DISABLE_GRAPHS=1)
+    static const bool verify = getenv("GGML_N1_M3_VERIFY") != nullptr && perm_rep == 0 && !na;   // gate only: syncs (run with GGML_CUDA_DISABLE_GRAPHS=1)
     // VERIFY reference, computed BEFORE the fused kernel (mm may alias the transform's input in the graph allocator): the
     // unfused swiglu (GLU variant) -> signed FWHT kernel -> per-token quantizer, all into scratch buffers
     const size_t nbf = ggml_nbytes(mm), bytes = ctx->act_cache_bytes;
@@ -5929,7 +5974,10 @@ static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_c
     }
     // the GLU variant under VERIFY keeps its fp32 output off (mm may alias gate/up): only its int8 bytes are compared
     const bool write_fp32 = !skip_fp32 || (verify && !up);
-    if (!ggml_cuda_op_fwht_signed_quant_n1t(*ctx, x, up, signs, mm, write_fp32, ctx->act_cache_buf->get(), perm_hd, perm_nk, perm_rep)) {
+    const bool launched = na ? ggml_cuda_op_add_norm_fwht_quant_n1t(*ctx, na->add->src[0], na->add->src[1], na->add, na->mulw, signs, na->normdst, mm,
+                                                                    na->eps, write_fp32, ctx->act_cache_buf->get())
+                             : ggml_cuda_op_fwht_signed_quant_n1t(*ctx, x, up, signs, mm, write_fp32, ctx->act_cache_buf->get(), perm_hd, perm_nk, perm_rep);
+    if (!launched) {
         ctx->act_cache_tensor = nullptr;
         ctx->act_cache_buf.reset();
         return false;
@@ -5967,14 +6015,14 @@ static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_c
 
 static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, int off,
         const ggml_tensor * x, const ggml_tensor * up, const ggml_tensor * signs, ggml_tensor * mm,
-        int perm_hd, int perm_nk, int perm_rep) {
+        int perm_hd, int perm_nk, int perm_rep, const ggml_cuda_m3_norm * na) {
     struct host_time {
         double us = 0; int64_t calls = 0;
         ~host_time() { if (getenv("GGML_N1_STATS") && calls) fprintf(stderr, "[N1] stats: m3 FWHT-producer host time %.1f ms over %lld calls\n", us * 1e-3, (long long) calls); }
     };
     static host_time ht;
     const auto t0 = std::chrono::steady_clock::now();
-    const bool r = ggml_cuda_m3_fwht_quant_impl(ctx, cgraph, i, off, x, up, signs, mm, perm_hd, perm_nk, perm_rep);
+    const bool r = ggml_cuda_m3_fwht_quant_impl(ctx, cgraph, i, off, x, up, signs, mm, perm_hd, perm_nk, perm_rep, na);
     ht.us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
     ht.calls++;
     return r;

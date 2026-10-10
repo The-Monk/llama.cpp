@@ -4,6 +4,7 @@
 #include "unary.cuh"
 #include "fwht-dev.cuh"
 
+#include <algorithm>
 #include <climits>
 #include <cstdlib>
 
@@ -173,6 +174,162 @@ __global__ void fwht_quant_n1t(const float * __restrict__ src, const float * __r
     for (int m = 0; m < N / 4 / warp_size; ++m) {
         const int j = lane + warp_size * m;
         *(uint32_t *) (X + n1_off(tok, w * N + 4 * j, S)) = *(const uint32_t *) (qs + w * N + 4 * j);
+    }
+}
+
+// T439 GGML_CUDA_B2_ADDNORM_FUSE: the residual ADD + RMS_NORM + MUL(weight) in front of a Hadamard-folded matmul fused with the
+// M3 producer: one launch per token instead of k_bin_bcast add, rms_norm_f32<1024,true> and fwht_quant_n1t. Stage 1 is
+// rms_norm_f32<1024, true> verbatim (strided partial sums over the same columns in the same order, the same block_reduce, the
+// same `scale * x * w` expression), the sum row is stored as the ADD node's value; the normalized row is staged in LDS (and
+// stored as the MUL node's value when another node reads it); stage 2 is fwht_quant_n1t's tail on the staged values, one warp
+// per 1024-block (warps beyond the row's blocks only take part in the barriers).
+template <int NB, bool write_norm, bool write_fp32>
+__launch_bounds__(256, 1)
+__global__ void add_norm_fwht_quant_n1t(const float * __restrict__ xa, const float * __restrict__ xb, float * __restrict__ sum_dst,
+                                        const int ntok, const float eps, const float * __restrict__ mulw,
+                                        const float * __restrict__ signs, const float fscale,
+                                        float * __restrict__ norm_dst, float * __restrict__ fwht_dst,
+                                        int8_t * __restrict__ X, float * __restrict__ sx, const int S) {
+    constexpr int N = 1024, warp_size = 32, el_w = N / warp_size, NT = 256, NJ = 1024 / NT, ncols = NB * N;
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    extern __shared__ __align__(16) char smem[];
+    float  * s_sum = (float *) smem;
+    float  * red   = (float *) (smem + 128);
+    int8_t * qs    = (int8_t *) (smem + 256);
+    float  * nvs   = (float *) (smem + 256 + (size_t) NB * N);
+
+    // Persistent over tokens (tok, tok + gridDim.x, ...): the next token's two input rows are loaded into registers before the
+    // current token's reduction / transform / quantize, so the memory pipe stays busy while the block computes.
+    float ca[NJ][NB], cb[NJ][NB];
+    int tok = blockIdx.x;
+    if (tok < ntok) {
+#pragma unroll
+        for (int j = 0; j < NJ; ++j) {
+#pragma unroll
+            for (int k = 0; k < NB; ++k) {
+                const size_t o = (size_t) tok * ncols + tid + NT * j + k * 1024;
+                ca[j][k] = xa[o];
+                cb[j][k] = xb[o];
+            }
+        }
+    }
+    for (; tok < ntok; tok += gridDim.x) {
+        const size_t row = (size_t) tok * ncols;
+        // This block has NT = 256 threads where rms_norm_f32<1024> has 1024: thread `tid` carries the partial sums of the
+        // reference threads t = tid + NT * j (j < NJ), each over its own strided columns in ascending order, so every partial
+        // sum and, below, the per-warp tree and the final 32-way tree are the reference's (reference warp w + 8 * j lives in
+        // warp w).
+        float p[NJ];
+        float sv[NJ][NB];
+#pragma unroll
+        for (int j = 0; j < NJ; ++j) {
+            p[j] = 0.0f;
+#pragma unroll
+            for (int k = 0; k < NB; ++k) {
+                const float s = ca[j][k] + cb[j][k];
+                sv[j][k] = s;
+                sum_dst[row + tid + NT * j + k * 1024] = s;
+                p[j] += s * s;
+            }
+        }
+        const int tn = tok + gridDim.x;
+        if (tn < ntok) {   // prefetch the next token's rows
+#pragma unroll
+            for (int j = 0; j < NJ; ++j) {
+#pragma unroll
+                for (int k = 0; k < NB; ++k) {
+                    const size_t o = (size_t) tn * ncols + tid + NT * j + k * 1024;
+                    ca[j][k] = xa[o];
+                    cb[j][k] = xb[o];
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < NJ; ++j) {
+            p[j] = block_reduce_policy<block_reduce_method::SUM, float>::reduce(p[j]);
+            if (lane == 0) {
+                s_sum[w + (NT / warp_size) * j] = p[j];
+            }
+        }
+        __syncthreads();
+        const float tmp   = block_reduce_policy<block_reduce_method::SUM, float>::reduce(s_sum[lane]);
+        const float mean  = tmp / ncols;
+        const float scale = rsqrtf(mean + eps);
+#pragma unroll
+        for (int j = 0; j < NJ; ++j) {
+#pragma unroll
+            for (int k = 0; k < NB; ++k) {
+                const int col = tid + NT * j + k * 1024;
+                const float nv = scale * sv[j][k] * mulw[col];
+                nvs[col] = nv;
+                if (write_norm) {
+                    norm_dst[row + col] = nv;
+                }
+            }
+        }
+        __syncthreads();
+
+        float reg[el_w];
+        float amax = 0.f;
+        if (w < NB) {
+            const float * sg = signs + (size_t) w * N;
+#pragma unroll
+            for (int i = 0; i < el_w; ++i) {
+                const int idx = i * warp_size + lane;
+                float v = nvs[w * N + idx];
+                v *= fscale;
+                v *= sg[idx];
+                reg[i] = v;
+            }
+            fwht_net<N, warp_size>(reg, lane);
+#pragma unroll
+            for (int i = 0; i < el_w; ++i) {
+                asm volatile("" : "+v"(reg[i]));
+            }
+            if (write_fp32) {
+                float * d = fwht_dst + row + (size_t) w * N;
+#pragma unroll
+                for (int i = 0; i < el_w; ++i) {
+                    d[i * warp_size + lane] = reg[i];
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < el_w; ++i) {
+                amax = fmaxf(amax, fabsf(reg[i]));
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, o, 32));
+            }
+            if (lane == 0) {
+                red[w] = amax;
+            }
+        }
+        __syncthreads();
+        amax = 0.f;
+#pragma unroll
+        for (int i = 0; i < NB; ++i) {
+            amax = fmaxf(amax, red[i]);
+        }
+        const float d  = n1_scale(amax);
+        const float id = n1_recip(d);
+        if (tid == 0) {
+            sx[tok] = d;
+        }
+        if (w < NB) {
+#pragma unroll
+            for (int i = 0; i < el_w; ++i) {
+                qs[w * N + i * warp_size + lane] = (int8_t) (d > 0.f ? (uint8_t) n1_q1(reg[i], id) : 0);
+            }
+        }
+        __syncthreads();
+        if (w < NB) {
+#pragma unroll
+            for (int m = 0; m < N / 4 / warp_size; ++m) {
+                const int jj = lane + warp_size * m;
+                *(uint32_t *) (X + n1_off(tok, w * N + 4 * jj, S)) = *(const uint32_t *) (qs + w * N + 4 * jj);
+            }
+        }
     }
 }
 
@@ -403,6 +560,52 @@ bool ggml_cuda_op_fwht_signed_quant_n1t(ggml_backend_cuda_context & ctx, const g
     }
 #undef FQ
 #undef FQP
+    return true;
+}
+
+bool ggml_cuda_op_add_norm_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const ggml_tensor * xa, const ggml_tensor * xb,
+                                          ggml_tensor * sum, const ggml_tensor * mulw, const ggml_tensor * signs,
+                                          ggml_tensor * norm_dst, ggml_tensor * mm, float eps, bool write_fp32, void * y) {
+    const int64_t ncols = xa->ne[0];
+    const int64_t ntok  = ggml_nelements(xa) / ncols;
+    if (ncols % 1024 != 0 || ncols > 8192 || ntok > (1 << 20) || ncols % 128 != 0 ||
+        xa->type != GGML_TYPE_F32 || xb->type != GGML_TYPE_F32 || sum->type != GGML_TYPE_F32 || mulw->type != GGML_TYPE_F32 ||
+        signs->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || (norm_dst && norm_dst->type != GGML_TYPE_F32) ||
+        !ggml_is_contiguous(xa) || !ggml_is_contiguous(xb) || !ggml_is_contiguous(sum) || !ggml_is_contiguous(mulw) ||
+        !ggml_is_contiguous(signs) || !ggml_is_contiguous(mm) || (norm_dst && !ggml_is_contiguous(norm_dst)) ||
+        xb->ne[0] != ncols || ggml_nelements(xb) != ggml_nelements(xa) || ggml_nelements(sum) != ggml_nelements(xa) ||
+        ggml_nelements(mulw) != ncols || ggml_nelements(signs) != ncols || ggml_nelements(mm) != ggml_nelements(xa) ||
+        (norm_dst && ggml_nelements(norm_dst) != ggml_nelements(xa)) || mm->ne[0] != 1024) {
+        return false;
+    }
+    const int nblk = (int) (ncols / 1024);
+    if (nblk != 4 && nblk != 5 && nblk != 6 && nblk != 8) {
+        return false;
+    }
+    const int64_t Npad = n1_npad(ntok);
+    int8_t * X  = (int8_t *) y;
+    float *  sx = (float *) ((char *) y + (size_t) Npad * ncols);
+    static const int blocks_per_sm = [] { const char * v = getenv("GGML_CUDA_B2_ADDNORM_BPS"); return v ? atoi(v) : 8; }();
+    const int sms = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    const dim3   grid((unsigned) std::min<int64_t>(ntok, (int64_t) sms * blocks_per_sm), 1, 1), block(256, 1, 1);
+    const size_t shmem = 256 + (size_t) nblk * 1024 + (size_t) ncols * sizeof(float);
+    const ggml_cuda_kernel_launch_params lp(grid, block, shmem, ctx.stream());
+    const float fscale = 1 / sqrtf(1024.f);
+    const int   S      = (int) (ncols / 128);
+#define AQ(NB, WN, WF) ggml_cuda_kernel_launch(add_norm_fwht_quant_n1t<NB, WN, WF>, lp, (const float *) xa->data, (const float *) xb->data, \
+        (float *) sum->data, (int) ntok, eps, (const float *) mulw->data, (const float *) signs->data, fscale, \
+        norm_dst ? (float *) norm_dst->data : (float *) nullptr, (float *) mm->data, X, sx, S)
+#define AQN(NB) \
+    if (norm_dst) { if (write_fp32) AQ(NB, true, true); else AQ(NB, true, false); } \
+    else          { if (write_fp32) AQ(NB, false, true); else AQ(NB, false, false); }
+    switch (nblk) {
+        case 4: AQN(4) break;
+        case 5: AQN(5) break;
+        case 6: AQN(6) break;
+        default: AQN(8) break;
+    }
+#undef AQN
+#undef AQ
     return true;
 }
 
