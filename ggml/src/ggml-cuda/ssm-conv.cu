@@ -210,14 +210,26 @@ static __global__ void ssm_conv_prefill_f32(float * __restrict__ state, const fl
     const bool l2_block = do_l2 && (int) ((bidy + 1) * split_d_inner) <= l2_n;
     float * ys = smem + split_d_inner * n_cols; // [split_n_t][split_d_inner], do_l2 only
 
-    // Compute from shared memory (verbatim ssm_conv_long_token_f32)
+    // Compute from shared memory (ssm_conv_long_token_f32's loop)
     for (int64_t i = 0; i < local_n_t; i++) {
-        float sumf = 0.0f;
+        float sumf;
+        if constexpr (d_conv == 4) {
+            // Pin the tap order ssm_conv_long_token_f32<*, 128, 4, 32> compiles to under -funsafe-math (read off
+            // the gfx1201 ISA, T409; same order T368 found for ssm_conv_f32): fma(x3,w3,b) -> x1*w1 -> x2*w2 ->
+            // x0*w0. Without the pin the do_l2 instantiation reassociated to w0..w3 and was not bit-identical.
+            const float * xs = smem + tid * n_cols + i;
+            sumf = fmaf(xs[3], w[3], b);
+            sumf = fmaf(xs[1], w[1], sumf);
+            sumf = fmaf(xs[2], w[2], sumf);
+            sumf = fmaf(xs[0], w[0], sumf);
+        } else {
+            sumf = 0.0f;
 #pragma unroll
-        for (size_t j = 0; j < d_conv; j++) {
-            sumf += smem[tid * n_cols + i + j] * w[j];
+            for (size_t j = 0; j < d_conv; j++) {
+                sumf += smem[tid * n_cols + i + j] * w[j];
+            }
+            sumf += b;
         }
-        sumf += b;
         const float yv = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
         if (l2_block) {
             ys[i * split_d_inner + tid] = yv;
