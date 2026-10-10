@@ -646,7 +646,7 @@ bool ggml_cuda_op_fwht_signed_quant_n1t(ggml_backend_cuda_context & ctx, const g
     const int     S = (int) (K / 128);
 #define FQ(WF, GL) ggml_cuda_kernel_launch(fwht_quant_n1t<WF, GL>, lp, a, b, s_src, s_up, d, scale, g, X, sx, S, 0, 0, 0)
 #define FQP(WF) ggml_cuda_kernel_launch(fwht_quant_n1t<WF, false, true>, lp, a, b, s_src, s_up, d, scale, g, X, sx, S, perm_hd, perm_nk, perm_rep)
-    static const bool glu_pf = [] { const char * v = getenv("GGML_CUDA_B2_GLUPF"); return v && atoi(v) != 0; }();
+    static const bool glu_pf = [] { const char * v = getenv("GGML_CUDA_B2_GLUPF"); return !v || atoi(v) != 0; }();   // default ON, =0 disables
     if (glu && glu_pf) {
         static const int pf_bps = [] { const char * v = getenv("GGML_CUDA_B2_GLUPF_BPS"); return v ? atoi(v) : 2; }();
         const int sms = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;

@@ -283,7 +283,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
     // norm and its sign flip, which breaks the ADD+RMS_NORM+MUL+MUL+RESHAPE+MUL_MAT adjacency the CUDA producer fusion matches.
     static const bool b2_order = [] {
         const char * e = getenv("GGML_CUDA_B2_ADDNORM_FUSE"), * g = getenv("GGML_CUDA_B2_GATENORM_FUSE");
-        return (e && atoi(e) != 0) || (g && atoi(g) != 0);
+        return !e || atoi(e) != 0 || (g && atoi(g) != 0);   // ADDNORM default ON, =0 disables
     }();
     const bool pin_order = hfuse_pin || (b2_order && ubatch.n_tokens > 1);
     if (pin_order) {

@@ -4382,7 +4382,7 @@ static bool ggml_cuda_b2_gatenorm_fuse_enabled() {
     return on;
 }
 static bool ggml_cuda_b2_addnorm_fuse_enabled() {
-    static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_ADDNORM_FUSE"); return v && atoi(v) != 0; }();
+    static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_ADDNORM_FUSE"); return !v || atoi(v) != 0; }();   // default ON, =0 disables
     return on;
 }
 static bool ggml_cuda_b2_perm_fuse_enabled() {
