@@ -20,7 +20,13 @@ static __device__ __forceinline__ float n1_scale(const float amax) { return amax
 
 // T434: the scalar quantizer behind n1_quant4, so a producer that holds one value per lane (fwht_quant_n1t) runs the very same
 // instructions as the 4-wide form (they differed in ~7e-7 of bytes when each kernel got its own roundf/reciprocal expansion)
-static __device__ __forceinline__ float n1_recip(const float d) { return 1.0f / d; }
+// (d is made opaque first: under -funsafe-math-optimizations 1/(amax * (1/127)) may fold into 127/amax in one kernel but not
+// in another, a 1-ulp difference in the reciprocal that moves a few round-half cases)
+static __device__ __forceinline__ float n1_recip(const float d) {
+    float r = d;
+    asm volatile("" : "+v"(r));
+    return 1.0f / r;
+}
 static __device__ __forceinline__ uint32_t n1_q1(const float v, const float id) { return (uint32_t) (uint8_t) (int8_t) (int) roundf(v * id); }
 
 static __device__ __forceinline__ uint32_t n1_quant4(const float4 v, const float d) {
