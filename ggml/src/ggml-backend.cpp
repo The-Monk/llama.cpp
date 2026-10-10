@@ -1575,7 +1575,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             }
         }
 
-        // [TAG_PREFILL_GAPS] T408: GGML_SCHED_DEFER_SYNC=1 defers this synchronization. Without it the host
+        // [TAG_PREFILL_GAPS] T408: GGML_SCHED_DEFER_SYNC (default on, =0 restores the sync) defers this synchronization. Without it the host
         // waits for the whole previous graph (a ~0.5 s prefill ubatch) and only then re-plans the allocation,
         // allocates and fills the inputs while the device sits idle. Deferring is safe when:
         //  - no buffer is freed while queued work may use it: the gallocr calls back (and we synchronize)
@@ -1588,8 +1588,8 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         // New tensor addresses inside the same device buffer are only touched by kernels queued after the
         // previous graph on the same stream.
         static const bool defer_sync = [] {
-            const char * e = getenv("GGML_SCHED_DEFER_SYNC");
-            return e != nullptr && atoi(e) != 0;
+            const char * e = getenv("GGML_SCHED_DEFER_SYNC"); // T408: default ON (=0 disables)
+            return e == nullptr || atoi(e) != 0;
         }();
         bool defer = defer_sync && sched->n_copies == 1;
         if (defer) {

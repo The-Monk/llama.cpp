@@ -5144,8 +5144,8 @@ static void ggml_cuda_act_cache_set(ggml_backend_cuda_context * ctx, const ggml_
         // padding: the producer writes every X byte and every sx[s*Npad + t], so both memsets are dead stores.
         // Skipping them removes 2 fill launches per fused GEMM input (~380 per 1024-token ubatch on Bonsai-27B).
         static const bool skip_pad_zero = [] {
-            const char * e = getenv("GGML_CUDA_ACT_PAD_SKIP");
-            return e != nullptr && atoi(e) != 0;
+            const char * e = getenv("GGML_CUDA_ACT_PAD_SKIP"); // T408: default ON (=0 disables)
+            return e == nullptr || atoi(e) != 0;
         }();
         if (skip_pad_zero && N == Npad && K % 128 == 0) {
             return;
