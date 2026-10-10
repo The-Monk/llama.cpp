@@ -1334,11 +1334,28 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // T408 diagnostic: host phase timing per ubatch (zero cost unless LLAMA_T408_TIMING is set)
+    static const bool t408_timing = getenv("LLAMA_T408_TIMING") != nullptr;
+    const int64_t t408_0 = t408_timing ? ggml_time_us() : 0;
+    int64_t t408_apply = 0, t408_build = 0, t408_alloc = 0, t408_inp = 0;
+    bool t408_reused = false;
+    struct t408_print {
+        bool on; const int64_t & t0; const int64_t & a; const int64_t & b; const int64_t & c; const int64_t & d; const bool & reused; uint32_t n;
+        ~t408_print() {
+            if (!on || d == 0) { return; }
+            const int64_t t5 = ggml_time_us();
+            fprintf(stderr, "[T408] t0=%lld end=%lld ubatch n=%u reused=%d apply=%.3f build=%.3f alloc=%.3f set_inputs=%.3f compute_launch=%.3f total=%.3f ms\n",
+                    (long long) t0, (long long) t5, n, (int) reused, (a - t0)/1e3, (b - a)/1e3, (c - b)/1e3, (d - c)/1e3, (t5 - d)/1e3, (t5 - t0)/1e3);
+        }
+    } t408_p { t408_timing, t408_0, t408_apply, t408_build, t408_alloc, t408_inp, t408_reused, ubatch.n_tokens };
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+
+    if (t408_timing) { t408_apply = ggml_time_us(); }
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
@@ -1358,6 +1375,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        if (t408_timing) { t408_reused = true; t408_build = t408_alloc = ggml_time_us(); }
     } else {
         res->reset();
 
@@ -1367,6 +1385,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+        if (t408_timing) {
+            // measurement mode: wait for the previous graph here so `alloc` below is pure host time
+            static const bool presync = getenv("LLAMA_T408_PRESYNC") != nullptr;
+            if (presync) {
+                const int64_t ts = ggml_time_us();
+                ggml_backend_sched_synchronize(sched.get());
+                fprintf(stderr, "[T408] presync wait=%.3f ms\n", (ggml_time_us() - ts)/1e3);
+            }
+            t408_build = ggml_time_us();
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1381,6 +1409,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        if (t408_timing) { t408_alloc = ggml_time_us(); }
     }
 
     // set the input data for the input tensors
@@ -1389,6 +1418,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+        if (t408_timing) { t408_inp = ggml_time_us(); }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }

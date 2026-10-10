@@ -3360,6 +3360,9 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
+        if (getenv("GGML_HIP_GRAPH_STATS_DIFF") && !graph->node_props.empty()) {
+            fprintf(stderr, "[GRAPH_DIFF] node count %d -> %d\n", (int) graph->node_props.size(), cgraph->n_nodes);
+        }
         res = true;
         graph->node_props.resize(cgraph->n_nodes);
     }
@@ -3377,6 +3380,32 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            // T408 diagnostic: name the first nodes whose captured properties changed (GGML_HIP_GRAPH_STATS_DIFF=<n>)
+            static const int stats_diff = [] { const char * e = getenv("GGML_HIP_GRAPH_STATS_DIFF"); return e ? atoi(e) : 0; }();
+            static int stats_diff_printed = 0;
+            if (stats_diff > 0 && stats_diff_printed < stats_diff && !res) {
+                const ggml_cuda_graph::node_properties & o = graph->node_props[i];
+                const ggml_tensor & a = o.node;
+                const ggml_tensor & b = prop.node;
+                std::string why;
+                if (a.op != b.op)                              why += " op";
+                if (memcmp(a.ne, b.ne, sizeof(a.ne)) != 0)     why += " ne";
+                if (memcmp(a.nb, b.nb, sizeof(a.nb)) != 0)     why += " nb";
+                if (a.data != b.data)                          why += " data";
+                if (a.view_offs != b.view_offs)                why += " view_offs";
+                if (memcmp(a.op_params, b.op_params, sizeof(a.op_params)) != 0) why += " op_params";
+                if (memcmp(a.src, b.src, sizeof(a.src)) != 0)  why += " src_ptr";
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (o.node_src_data_ptrs[j] != prop.node_src_data_ptrs[j]) why += " src" + std::to_string(j) + "_data";
+                    if (memcmp(o.node_src_ne[j], prop.node_src_ne[j], sizeof(o.node_src_ne[j])) != 0) why += " src" + std::to_string(j) + "_ne";
+                    if (memcmp(o.node_src_nb[j], prop.node_src_nb[j], sizeof(o.node_src_nb[j])) != 0) why += " src" + std::to_string(j) + "_nb";
+                }
+                if (why.empty()) why = " other-bytes";
+                fprintf(stderr, "[GRAPH_DIFF] n_nodes=%d node %d %s (%s) ne=[%lld,%lld,%lld,%lld]:%s\n", cgraph->n_nodes, i,
+                        cgraph->nodes[i]->name, ggml_op_desc(cgraph->nodes[i]), (long long) b.ne[0], (long long) b.ne[1],
+                        (long long) b.ne[2], (long long) b.ne[3], why.c_str());
+                stats_diff_printed++;
+            }
             graph->node_props[i] = prop;
             res = true;
         }
@@ -5111,6 +5140,16 @@ static void ggml_cuda_act_cache_set(ggml_backend_cuda_context * ctx, const ggml_
         // producers write rows < N only: zero the last (padded) token tile of X and all of sx, as the N1
         // quantizer does (padded rows never reach dst, this keeps the buffer equal to the unfused one)
         const int64_t K = t->ne[0], N = ggml_nrows(t), Npad = (N + 127) / 128 * 128;
+        // [TAG_PREFILL_GAPS] T408: with N % 128 == 0 (and K % 128 == 0, required by the N1 layout) there is no
+        // padding: the producer writes every X byte and every sx[s*Npad + t], so both memsets are dead stores.
+        // Skipping them removes 2 fill launches per fused GEMM input (~380 per 1024-token ubatch on Bonsai-27B).
+        static const bool skip_pad_zero = [] {
+            const char * e = getenv("GGML_CUDA_ACT_PAD_SKIP"); // T408: default ON (=0 disables)
+            return e == nullptr || atoi(e) != 0;
+        }();
+        if (skip_pad_zero && N == Npad && K % 128 == 0) {
+            return;
+        }
         char * y = ctx->act_cache_buf->get();
         CUDA_CHECK(cudaMemsetAsync(y + (size_t) (Npad - 128) * K, 0, (size_t) 128 * K, ctx->stream()));
         CUDA_CHECK(cudaMemsetAsync(y + (size_t) Npad * K, 0, bytes - (size_t) Npad * K, ctx->stream()));
@@ -5712,7 +5751,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             } else {
                 n_replay++;
             }
-            if ((n_eager + n_capture + n_replay) % 200 == 0) {
+            // T408: GGML_HIP_GRAPH_STATS=<n> prints every n computes for n >= 2; any other value keeps every 200 (T418)
+            static const int every = [] { const int v = atoi(getenv("GGML_HIP_GRAPH_STATS")); return v >= 2 ? v : 200; }();
+            if ((n_eager + n_capture + n_replay) % every == 0) {
                 fprintf(stderr, "[GRAPH_STATS] computes=%lld eager=%lld capture=%lld replay=%lld keys=%zu last_nodes=%d\n",
                         n_eager + n_capture + n_replay, n_eager, n_capture, n_replay, keys.size(), cgraph->n_nodes);
             }

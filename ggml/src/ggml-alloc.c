@@ -492,7 +492,16 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // T408: called once before an existing buffer is freed/replaced in reserve_n (NULL = none)
+    void (*pre_realloc_cb)(void * user_data);
+    void * pre_realloc_user_data;
 };
+
+void ggml_gallocr_set_pre_realloc_callback(ggml_gallocr_t galloc, void (*cb)(void * user_data), void * user_data) {
+    galloc->pre_realloc_cb        = cb;
+    galloc->pre_realloc_user_data = user_data;
+}
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
@@ -931,6 +940,10 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
+            if (galloc->buffers[i] != NULL && galloc->pre_realloc_cb != NULL) {
+                // the old buffer may still be in use by queued device work
+                galloc->pre_realloc_cb(galloc->pre_realloc_user_data);
+            }
             ggml_vbuffer_free(galloc->buffers[i]);
             if (no_alloc) {
                 galloc->buffers[i] = NULL;

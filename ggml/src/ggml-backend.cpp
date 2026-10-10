@@ -1575,13 +1575,56 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             }
         }
 
-        // the re-allocation may cause the split inputs to be moved to a different address
-        // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
-        for (int i = 0; i < sched->n_backends; i++) {
-            ggml_backend_synchronize(sched->backends[i]);
+        // [TAG_PREFILL_GAPS] T408: GGML_SCHED_DEFER_SYNC (default on, =0 restores the sync) defers this synchronization. Without it the host
+        // waits for the whole previous graph (a ~0.5 s prefill ubatch) and only then re-plans the allocation,
+        // allocates and fills the inputs while the device sits idle. Deferring is safe when:
+        //  - no buffer is freed while queued work may use it: the gallocr calls back (and we synchronize)
+        //    before it frees a buffer it has to grow;
+        //  - device work stays ordered: exactly one device backend (one stream), the rest are CPU backends,
+        //    which compute synchronously;
+        //  - user inputs live on the CPU backend (split_graph assigns GGML_TENSOR_FLAG_INPUT to the last
+        //    backend) and compute_splits synchronizes the device before every user-input copy (n_copies == 1,
+        //    no events), so moved input copies are never overwritten under a running graph.
+        // New tensor addresses inside the same device buffer are only touched by kernels queued after the
+        // previous graph on the same stream.
+        static const bool defer_sync = [] {
+            const char * e = getenv("GGML_SCHED_DEFER_SYNC"); // T408: default ON (=0 disables)
+            return e == nullptr || atoi(e) != 0;
+        }();
+        bool defer = defer_sync && sched->n_copies == 1;
+        if (defer) {
+            int n_dev = 0;
+            for (int i = 0; i < sched->n_backends && defer; i++) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[i]);
+                const enum ggml_backend_dev_type type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_ACCEL;
+                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    n_dev++;
+                } else if (type != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    defer = false;
+                }
+            }
+            defer = defer && n_dev == 1;
+        }
+
+        if (defer) {
+            ggml_gallocr_set_pre_realloc_callback(sched->galloc, [](void * ud) {
+                ggml_backend_sched_t s = (ggml_backend_sched_t) ud;
+                for (int i = 0; i < s->n_backends; i++) {
+                    ggml_backend_synchronize(s->backends[i]);
+                }
+            }, sched);
+        } else {
+            // the re-allocation may cause the split inputs to be moved to a different address
+            // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+            for (int i = 0; i < sched->n_backends; i++) {
+                ggml_backend_synchronize(sched->backends[i]);
+            }
         }
 
         ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        if (defer) {
+            ggml_gallocr_set_pre_realloc_callback(sched->galloc, nullptr, nullptr);
+        }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
@@ -1611,13 +1654,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                // T408 diagnostic: per-input sync wait and copy time (GGML_SCHED_T408_TIMING)
+                static const bool t408 = getenv("GGML_SCHED_T408_TIMING") != nullptr;
+                const int64_t t0 = t408 ? ggml_time_us() : 0;
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
+                const int64_t t1 = t408 ? ggml_time_us() : 0;
                 ggml_backend_tensor_copy(input, input_cpy);
+                if (t408) {
+                    fprintf(stderr, "[T408] input %s %zu B: sync %.3f ms copy %.3f ms\n", input->name, ggml_nbytes(input),
+                            (t1 - t0)/1e3, (ggml_time_us() - t1)/1e3);
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
