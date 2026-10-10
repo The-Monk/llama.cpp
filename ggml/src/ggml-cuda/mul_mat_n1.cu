@@ -88,7 +88,7 @@ struct n1_env {
         const char * m3s = getenv("GGML_N1_M3_SEGS");
         m3_segs = m3s && atoi(m3s) == 2 ? 2 : 1;
         const char * m3f = getenv("GGML_N1_M3_FEED");
-        m3_feed = m3f && (atoi(m3f) == 1 || atoi(m3f) == 2) ? atoi(m3f) : 0;
+        m3_feed = !m3f ? 1 : ((atoi(m3f) == 1 || atoi(m3f) == 2) ? atoi(m3f) : 0);   // T435: default 1 (64x64 wave tile), GGML_N1_M3_FEED=0 disables
         const char * fe = getenv("GGML_N1_M2BC_FLUSH");
         m2bc_flush = fe ? atoi(fe) : 8;
         dump = getenv("GGML_N1_DUMP");
