@@ -2117,7 +2117,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     constexpr bool pipe_possible = vt_possible && ncols1*ncols2 >= 32 && ncols2 > 1;
     static const int pipe_env = [] { // 1: prefetch next tile into registers; 2: ping-pong buffers only (loads right before the store)
         const char * e = getenv("GGML_HIP_FA_PIPE");
-        return e == nullptr ? 0 : atoi(e);
+        return e == nullptr ? 2 : atoi(e); // default 2 (GGML_HIP_FA_PIPE=0 disables)
     }();
     const bool use_pipe = pipe_possible && pipe_env != 0 && use_vt;
 
