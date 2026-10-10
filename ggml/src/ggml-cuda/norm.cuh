@@ -24,3 +24,7 @@ bool ggml_cuda_op_rms_norm_mul_silu_gate(ggml_backend_cuda_context & ctx, const 
 // T430 GGML_CUDA_FWHT_QUANT: decode RMS_NORM+MUL+MUL(signs)+FWHT1024+Q2_FIELD q8_1 in one launch (false = declined).
 bool ggml_cuda_op_rms_norm_mul_fwht_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * mul_w,
         const ggml_tensor * signs, ggml_tensor * norm_dst, ggml_tensor * fwht_dst, float eps, void * qy);
+
+// T439 GGML_CUDA_B2_GATENORM_FUSE: RMS_NORM + MUL(weight) + silu(z) * (.) over 128-wide rows in one launch (false = declined).
+bool ggml_cuda_op_rms_norm_mul_silu_gate_b2(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
+        const ggml_tensor * z, ggml_tensor * dst, float eps);

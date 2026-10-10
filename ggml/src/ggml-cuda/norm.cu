@@ -936,3 +936,58 @@ bool ggml_cuda_op_rms_norm_mul_silu_gate(ggml_backend_cuda_context & ctx, const 
         (const float *) z->data, (float *) mulg->data, eps);
     return true;
 }
+
+// T439 GGML_CUDA_B2_GATENORM_FUSE: RMS_NORM + MUL(weight) + silu(z) * (.) over 128-wide rows (the gated norm after the GDN recurrence) in
+// ONE launch. rms_norm_f32<256, true> runs one such row per 256-thread block with 128 threads idle; here a block takes TWO rows, one per
+// half, and keeps the reference's arithmetic: each element's square, each warp's total (the same warp_reduce_sum), and the final
+// 32-lane tree over [t0, t1, t2, t3, 0, ...] (the reference's lanes 4..7 hold the idle warps' zero totals) are the same operations on the
+// same values, so scale and the stored `scale * x * w` carry the reference's bits. The store multiplies by silu(z) like
+// unary_gated_op_kernel<op_silu>.
+static __global__ __launch_bounds__(256, 1) void rms_norm_mul_silu_gate_b2_f32(
+        const float * __restrict__ x, const float * __restrict__ mul, const float * __restrict__ z, float * __restrict__ dst,
+        const int64_t nrows, const float eps) {
+    const int tid  = threadIdx.x;
+    const int half = tid >> 7;                 // which of the block's two rows
+    const int col  = tid & 127;
+    const int lane = tid & 31;
+    const int64_t row = (int64_t) blockIdx.x * 2 + half;
+    const bool valid = row < nrows;
+    x   += row * 128;
+    z   += row * 128;
+    dst += row * 128;
+
+    float tmp = 0.0f;
+    float xi  = 0.0f;
+    if (valid) {
+        xi = x[col];
+        tmp += xi * xi;
+    }
+    tmp = block_reduce_policy<block_reduce_method::SUM, float>::reduce(tmp);
+    __shared__ float s_sum[8];
+    if (lane == 0) {
+        s_sum[tid >> 5] = tmp;
+    }
+    __syncthreads();
+    const float val   = lane < 4 ? s_sum[half * 4 + lane] : 0.0f;
+    const float total = block_reduce_policy<block_reduce_method::SUM, float>::reduce(val);
+    const float mean  = total / 128;
+    const float scale = rsqrtf(mean + eps);
+    if (valid) {
+        const float nv = scale * xi * mul[col];
+        dst[col] = ggml_cuda_op_silu_single(z[col]) * nv;
+    }
+}
+
+bool ggml_cuda_op_rms_norm_mul_silu_gate_b2(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
+        const ggml_tensor * z, ggml_tensor * dst, float eps) {
+    if (x->ne[0] != 128 || x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || z->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(x) || !ggml_is_contiguous(w) || !ggml_is_contiguous(z) || !ggml_is_contiguous(dst) ||
+        ggml_nelements(w) != 128 || ggml_nelements(z) != ggml_nelements(x) || ggml_nelements(dst) != ggml_nelements(x)) {
+        return false;
+    }
+    const int64_t nrows = ggml_nelements(x) / 128;
+    const ggml_cuda_kernel_launch_params lp{dim3((unsigned) ((nrows + 1) / 2), 1, 1), dim3(256, 1, 1), 0, ctx.stream()};
+    ggml_cuda_kernel_launch(rms_norm_mul_silu_gate_b2_f32, lp, (const float *) x->data, (const float *) w->data, (const float *) z->data,
+        (float *) dst->data, nrows, eps);
+    return true;
+}

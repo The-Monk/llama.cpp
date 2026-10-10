@@ -4373,6 +4373,14 @@ static int ggml_cuda_fwht_quant_mode() {   // bit 0: FWHT+q8_1 fusion, bit 1: + 
     return m;
 }
 // T439: fold the ssm_out tiled->grouped feature reorder (CONT) into the M3 FWHT producer (prefill). =1 on, default off.
+static bool ggml_cuda_b2_gatecont_fuse_enabled() {
+    static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_GATECONT_FUSE"); return v && atoi(v) != 0; }();
+    return on;
+}
+static bool ggml_cuda_b2_gatenorm_fuse_enabled() {
+    static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_GATENORM_FUSE"); return v && atoi(v) != 0; }();
+    return on;
+}
 static bool ggml_cuda_b2_addnorm_fuse_enabled() {
     static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_ADDNORM_FUSE"); return v && atoi(v) != 0; }();
     return on;
@@ -4603,6 +4611,60 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_node_get_use_count(cgraph, i) == 1 && !(glu->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_is_contiguous(glu);
         if (pattern_ok && ggml_cuda_m3_fwht_quant(cuda_ctx, cgraph, i, 1, glu->src[0], glu->src[1], signs, mm)) {
             return 3;
+        }
+    }
+
+    // T439 GGML_CUDA_B2_GATECONT_FUSE: attention output gate CONT(strided gate view) + UNARY(sigmoid) + MUL(cur) -> one launch
+    if (ggml_cuda_b2_gatecont_fuse_enabled() && node->op == GGML_OP_CONT && i + 2 < cgraph->n_nodes &&
+        cgraph->nodes[i + 1]->op == GGML_OP_UNARY && cgraph->nodes[i + 2]->op == GGML_OP_MUL) {
+        const ggml_tensor * sig = cgraph->nodes[i + 1];
+        ggml_tensor *       out = cgraph->nodes[i + 2];
+        const ggml_tensor * gv  = node->src[0];
+        const ggml_tensor * cur = out->src[0] == sig ? out->src[1] : out->src[0];
+        if (gv && gv->op == GGML_OP_VIEW && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && sig->src[0] == node &&
+            (out->src[0] == sig || out->src[1] == sig) && cur != node && cur != sig &&
+            ggml_node_get_use_count(cgraph, i) == 1 && ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+            !(node->flags & GGML_TENSOR_FLAG_OUTPUT) && !(sig->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            ggml_nelements(node) == ggml_nelements(gv) && ggml_are_same_shape(out, node) && ggml_are_same_shape(cur, node) &&
+            ggml_cuda_op_sigmoid_gate_strided(*cuda_ctx, gv, cur, out)) {
+            return 2;
+        }
+    }
+
+    // T439 GGML_CUDA_B2_GATENORM_FUSE: GDN gated norm RMS_NORM + MUL(weight) + RESHAPE(z, a view) + UNARY(silu) + MUL -> one launch
+    if (ggml_cuda_b2_gatenorm_fuse_enabled() && node->op == GGML_OP_RMS_NORM && node->ne[0] == 128 && i + 4 < cgraph->n_nodes &&
+        cgraph->nodes[i + 1]->op == GGML_OP_MUL && cgraph->nodes[i + 2]->op == GGML_OP_RESHAPE &&
+        cgraph->nodes[i + 3]->op == GGML_OP_UNARY && cgraph->nodes[i + 4]->op == GGML_OP_MUL) {
+        const ggml_tensor * mulw = cgraph->nodes[i + 1];
+        const ggml_tensor * zrsh = cgraph->nodes[i + 2];
+        const ggml_tensor * silu = cgraph->nodes[i + 3];
+        ggml_tensor *       out  = cgraph->nodes[i + 4];
+        const ggml_tensor * w    = mulw->src[0] == node ? mulw->src[1] : mulw->src[0];
+        float eps;
+        memcpy(&eps, node->op_params, sizeof(float));
+        if ((mulw->src[0] == node || mulw->src[1] == node) && silu->src[0] == zrsh && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU &&
+            ((out->src[0] == mulw && out->src[1] == silu) || (out->src[0] == silu && out->src[1] == mulw)) &&
+            ggml_node_get_use_count(cgraph, i) == 1 && ggml_node_get_use_count(cgraph, i + 1) == 1 && ggml_node_get_use_count(cgraph, i + 3) == 1 &&
+            ggml_node_get_use_count(cgraph, i + 2) == 1 &&
+            !(node->flags & GGML_TENSOR_FLAG_OUTPUT) && !(mulw->flags & GGML_TENSOR_FLAG_OUTPUT) && !(silu->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            ggml_are_same_shape(zrsh, node) && ggml_are_same_shape(out, node) &&
+            ggml_cuda_op_rms_norm_mul_silu_gate_b2(*cuda_ctx, node->src[0], w, zrsh, out, eps)) {
+            if (getenv("GGML_B2_GN_VERIFY")) {   // gate only: syncs (run with GGML_CUDA_DISABLE_GRAPHS=1)
+                ggml_cuda_pool_alloc<char> rn(cuda_ctx->pool(), ggml_nbytes(mulw)), ro(cuda_ctx->pool(), ggml_nbytes(out));
+                ggml_tensor tn = *mulw;
+                tn.data = rn.get();
+                ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, &tn);
+                ggml_tensor tm = *out;
+                tm.data = ro.get();
+                for (int k = 0; k < 2; ++k) { if (tm.src[k] == mulw) { tm.src[k] = &tn; } }
+                ggml_cuda_op_unary_mul(*cuda_ctx, const_cast<ggml_tensor *>(silu), &tm);
+                const int64_t d = ggml_cuda_act_count_diff(ro.get(), out->data, ggml_nbytes(out), cuda_ctx->stream());
+                struct totals { int64_t n = 0, d = 0, b = 0;
+                    ~totals() { fprintf(stderr, "gatenorm: VERIFY %lld launches, %lld/%lld bytes differ\n", (long long) n, (long long) d, (long long) b); } };
+                static totals t;
+                t.n++; t.d += d; t.b += (int64_t) ggml_nbytes(out);
+            }
+            return 4;
         }
     }
 

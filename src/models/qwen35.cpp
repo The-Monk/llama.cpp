@@ -281,7 +281,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
     // T439 GGML_CUDA_B2_ADDNORM_FUSE: emit the Hadamard-folded qkv/z matmul chains right behind the attn_norm that the layer loop
     // expanded. Without it a cold recurrent state (first ubatch of a prompt) gets build_rs's zero-clear and gather nodes between the
     // norm and its sign flip, which breaks the ADD+RMS_NORM+MUL+MUL+RESHAPE+MUL_MAT adjacency the CUDA producer fusion matches.
-    static const bool b2_order = [] { const char * e = getenv("GGML_CUDA_B2_ADDNORM_FUSE"); return e && atoi(e) != 0; }();
+    static const bool b2_order = [] {
+        const char * e = getenv("GGML_CUDA_B2_ADDNORM_FUSE"), * g = getenv("GGML_CUDA_B2_GATENORM_FUSE");
+        return (e && atoi(e) != 0) || (g && atoi(g) != 0);
+    }();
     const bool pin_order = hfuse_pin || (b2_order && ubatch.n_tokens > 1);
     if (pin_order) {
         ggml_build_forward_expand(gf, qkv_mixed);

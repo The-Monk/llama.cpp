@@ -627,6 +627,34 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
     }
 }
 
+/* T439 GGML_CUDA_B2_GATECONT_FUSE: attention output gate. sigmoid(gate) * cur where gate is a STRIDED [ne0, ne1, ntok] view of the
+   Q+gate projection (the model's ggml_cont_2d of it is folded into the read). Same expression as unary_gated_op_kernel<op_sigmoid>. */
+static __global__ void sigmoid_gate_strided_kernel(const float * __restrict__ g, const float * __restrict__ cur, float * __restrict__ dst,
+        const int64_t n, const int ne0, const int ne1, const int64_t s1, const int64_t s2) {
+    const int64_t i = (int64_t) blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const int64_t row = (int64_t) ne0 * ne1;
+    const int64_t t = i / row, r = i % row;
+    const int h = (int) (r / ne0), d = (int) (r % ne0);
+    dst[i] = op_sigmoid(g[t * s2 + (int64_t) h * s1 + d]) * cur[i];
+}
+
+bool ggml_cuda_op_sigmoid_gate_strided(ggml_backend_cuda_context & ctx, const ggml_tensor * gview, const ggml_tensor * cur, ggml_tensor * dst) {
+    if (gview->type != GGML_TYPE_F32 || cur->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || gview->ne[3] != 1 ||
+        gview->nb[0] != sizeof(float) || gview->nb[1] % sizeof(float) != 0 || gview->nb[2] % sizeof(float) != 0 ||
+        !ggml_is_contiguous(cur) || !ggml_is_contiguous(dst) || ggml_nelements(cur) != ggml_nelements(gview) || ggml_nelements(dst) != ggml_nelements(gview)) {
+        return false;
+    }
+    const int64_t n = ggml_nelements(gview);
+    const int64_t nb = (n + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params lp((dim3) nb, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(sigmoid_gate_strided_kernel, lp, (const float *) gview->data, (const float *) cur->data, (float *) dst->data, n,
+        (int) gview->ne[0], (int) gview->ne[1], (int64_t) (gview->nb[1] / sizeof(float)), (int64_t) (gview->nb[2] / sizeof(float)));
+    return true;
+}
+
 /* fused relu + sqr */
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {

@@ -112,3 +112,6 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_oai_single(float x, float g
     out_glu = out_glu * (1.0f + g);
     return out_glu;
 }
+
+// T439 GGML_CUDA_B2_GATECONT_FUSE: dst = sigmoid(gview) * cur, gview a strided [ne0, ne1, ntok] f32 view (false = declined).
+bool ggml_cuda_op_sigmoid_gate_strided(ggml_backend_cuda_context & ctx, const ggml_tensor * gview, const ggml_tensor * cur, ggml_tensor * dst);
