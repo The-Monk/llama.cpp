@@ -3996,6 +3996,9 @@ struct test_ssm_conv_update : public test_case {
     const int64_t d_inner;
     const int64_t n_s;
     const bool    apply_silu;
+    const int64_t n_t;
+    const bool    state_is_zero;
+    const int32_t l2_n;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4005,21 +4008,29 @@ struct test_ssm_conv_update : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(d_conv, d_inner, n_s, apply_silu);
+        if (n_t == 1) {
+            return VARS_TO_STR4(d_conv, d_inner, n_s, apply_silu);
+        }
+        return VARS_TO_STR7(d_conv, d_inner, n_s, apply_silu, n_t, state_is_zero, l2_n);
     }
 
-    test_ssm_conv_update(int64_t d_conv = 4, int64_t d_inner = 256, int64_t n_s = 1, bool apply_silu = true)
-        : d_conv(d_conv), d_inner(d_inner), n_s(n_s), apply_silu(apply_silu) {}
+    // n_t > 1, state_is_zero, l2_n: T409 multi-token form (ggml_ssm_conv_update_ext)
+    test_ssm_conv_update(int64_t d_conv = 4, int64_t d_inner = 256, int64_t n_s = 1, bool apply_silu = true,
+                         int64_t n_t = 1, bool state_is_zero = false, int32_t l2_n = 0)
+        : d_conv(d_conv), d_inner(d_inner), n_s(n_s), apply_silu(apply_silu),
+          n_t(n_t), state_is_zero(state_is_zero), l2_n(l2_n) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * s = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, d_inner, n_s);
-        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, 1, n_s);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
         ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, d_inner);
         ggml_set_name(s, "s");
         ggml_set_name(x, "x");
         ggml_set_name(c, "c");
 
-        ggml_tensor * y = ggml_ssm_conv_update(ctx, s, x, c, apply_silu);
+        ggml_tensor * y = n_t == 1 && !state_is_zero && l2_n == 0
+            ? ggml_ssm_conv_update(ctx, s, x, c, apply_silu)
+            : ggml_ssm_conv_update_ext(ctx, s, x, c, apply_silu, state_is_zero, l2_n, 1e-6f);
         ggml_set_name(y, "y");
 
         ggml_tensor * out = ggml_concat(ctx, ggml_reshape_1d(ctx, s, ggml_nelements(s)),
@@ -9019,6 +9030,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // T409: multi-token in-place conv (prefill GDN glue fusion), incl. n_t < d_conv-1, ragged tiles, fresh cells, q/k L2
+    for (int64_t d_conv : {3, 4, 9}) {
+        for (int64_t n_t : {2, 7, 33, 64, 100}) {
+            for (bool state_is_zero : {false, true}) {
+                test_cases.emplace_back(new test_ssm_conv_update(d_conv, 1024, 1, true, n_t, state_is_zero, 0));
+                test_cases.emplace_back(new test_ssm_conv_update(d_conv, 1024, 2, true, n_t, state_is_zero, 512));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_ssm_conv_update(4, 1024, 1, false, 64, false, 0));
+    test_cases.emplace_back(new test_ssm_conv_update(4, 10240, 1, true, 512, false, 4096)); // Qwen3.6-27B GDN prefill
+    test_cases.emplace_back(new test_ssm_conv_update(4, 10240, 1, true, 1024, true, 4096));
+
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
     for (int64_t d_conv : {3, 4, 9}) {
@@ -10442,6 +10466,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {937, 8192, 1, 1}, {4, 8192, 1, 1})); // prefill
     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1})); // generate
     test_cases.emplace_back(new test_ssm_conv_update(4, 10240, 1, true)); // T368, Qwen3.6-27B GDN conv, generate
+    test_cases.emplace_back(new test_ssm_conv_update(4, 10240, 1, true, 1024, false, 0));    // T409 prefill ub 1024
+    test_cases.emplace_back(new test_ssm_conv_update(4, 10240, 1, true, 1024, false, 4096)); // T409 + q/k L2
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {515, 3328, 1, 1}, {4, 3328, 1, 1}, true));  // prefill
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1}, true));  // generate
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 512, 1)); // prefill

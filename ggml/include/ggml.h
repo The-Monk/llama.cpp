@@ -2535,6 +2535,22 @@ extern "C" {
             struct ggml_tensor  * c,
             bool                  apply_silu);
 
+    // multi-token form of ggml_ssm_conv_update (T409, prefill GDN glue fusion):
+    //   x: {d_inner, n_t, n_s} new tokens in their native (token-major) layout, n_t >= 1
+    // returns {d_inner, n_t, n_s} = conv([s, x^T], c) (+ silu); s is overwritten with the last d_conv - 1
+    // window columns. state_is_zero: treat the incoming s as zeros (fresh recurrent cell) without reading it.
+    // l2_n > 0: additionally L2-normalize each group of 128 consecutive output channels in [0, l2_n) per token
+    // (the q/k rows of a gated delta net), same formula as ggml_l2_norm(eps). l2_n must be a multiple of 128.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_update_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            bool                  apply_silu,
+            bool                  state_is_zero,
+            int32_t               l2_n,
+            float                 l2_eps);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,

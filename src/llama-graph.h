@@ -277,6 +277,12 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // T409: set when the graph bakes an identity state gather (s_copy(0) == head) into a direct row view
+    // instead of reading s_copy, e.g. the GGML_GDN_GLUE_FUSE prefill path. (head, rs_z) alone does not
+    // imply it: a fresh cell and a seq_cp'd cell both give rs_z == head, but only the fresh one gathers
+    // from head. can_reuse() must then recheck the identity.
+    bool s_copy_identity = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

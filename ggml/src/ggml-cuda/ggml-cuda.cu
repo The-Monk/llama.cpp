@@ -6711,7 +6711,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
         case GGML_OP_SSM_CONV_UPDATE: {
             const int64_t nc = op->src[1]->ne[0];
-            return op->src[0]->ne[1] % 128 == 0 && (nc == 3 || nc == 4 || nc == 5 || nc == 9 || nc == 15);
+            // T409: the multi-token L2 epilogue reduces over wave32
+            const bool l2_ok = ggml_get_op_params_i32(op, 2) == 0 || ggml_cuda_info().devices[dev_ctx->device].warp_size == 32;
+            return op->src[0]->ne[1] % 128 == 0 && (nc == 3 || nc == 4 || nc == 5 || nc == 9 || nc == 15) && l2_ok;
         }
         case GGML_OP_CONT:
             return true;

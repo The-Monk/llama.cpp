@@ -500,9 +500,55 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         inp->mctx->get_n_rs() == 1 &&
         inp->mctx->get_rs_z() < 0;
 
+    // GGML_GDN_GLUE_FUSE (default ON, =0 disables; card T409, gated 2026-10-09: KLD = 1-ulp floor, seq_cp reuse matrix 14/14, +3% prefill): prefill counterpart of GGML_GDN_CONV_INPLACE.
+    // One multi-token ssm_conv_update reads the conv state row directly (or treats it as zeros on a fresh cell)
+    // and the new tokens in qkv_mixed's native layout, applies silu, and writes the new state back in place:
+    // removes build_rs's gather, the transposed concat (21 MB at ub 1024), the separate silu fusion and the
+    // write-back cpy. n_seq_tokens > 32 keeps every small batch (spec verify M=2..9) on the default path.
+    // Same direct-view validity rule as gdn_conv_inplace (single cell, no rollback slots), except a pending
+    // zero-clear of THAT cell (rs_z == head, the fresh first ubatch of a prompt) is folded into the kernel as
+    // state_is_zero instead of falling back. s_copy(0) == head checks that the gather is the identity.
+    // GGML_GDN_GLUE_L2=1 additionally folds the two q/k L2_NORM ops into the same kernel (producer side, not
+    // into the recurrence loop: T296).
+    const auto gdn_env_on = [](const char * name) {
+        const char * e = getenv(name);
+        return e != nullptr && strcmp(e, "1") == 0;
+    };
+    const int32_t rs_head_cell = (int32_t) inp->mctx->get_head();
+    const bool gdn_glue_fuse =
+        !gdn_conv_inplace &&
+        gdn_rung_default_on("GGML_GDN_GLUE_FUSE") &&
+        gdn_layer_on_cuda_like(model, il) &&
+        n_seq_tokens > 32 &&
+        cparams.n_rs_seq == 0 &&
+        n_seqs == 1 &&
+        inp->mctx->get_n_rs() == 1 &&
+        inp->mctx->s_copy(0) == rs_head_cell &&
+        (inp->mctx->get_rs_z() < 0 || inp->mctx->get_rs_z() == rs_head_cell) &&
+        conv_channels % 128 == 0;
+    const bool gdn_glue_l2 = gdn_glue_fuse && gdn_env_on("GGML_GDN_GLUE_L2") && head_k_dim == 128 &&
+                             !gdn_fused_l2norm;
+
     ggml_tensor * conv_input       = nullptr;
     ggml_tensor * conv_output_silu = nullptr;
-    if (gdn_conv_inplace) {
+    if (gdn_glue_fuse) {
+        // the kernel never reads s_copy: a reused graph must recheck s_copy(0) == head (seq_cp'd cell)
+        inp->s_copy_identity = true;
+        ggml_tensor * conv_state = build_rs_state_view(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+        conv_state = ggml_reshape_3d(ctx0, conv_state, conv_kernel_size - 1, conv_channels, n_seqs);
+        cb(conv_state, "conv_state_inplace_view", il);
+
+        const int32_t l2_n = gdn_glue_l2 ? (int32_t) (2 * head_k_dim * num_k_heads) : 0;
+        conv_output_silu = ggml_ssm_conv_update_ext(ctx0, conv_state, qkv_mixed, conv_kernel, true,
+                                                    inp->mctx->get_rs_z() >= 0, l2_n, hparams.f_norm_rms_eps);
+        cb(conv_output_silu, "conv_output_silu", il);
+        static bool logged[2] = { false, false }; // once per state_is_zero value
+        if (!logged[inp->mctx->get_rs_z() >= 0]) {
+            logged[inp->mctx->get_rs_z() >= 0] = true;
+            LLAMA_LOG_INFO("%s: T409 GDN glue fusion active (n_tokens=%d, state_is_zero=%d, l2=%d)\n", __func__,
+                           (int) n_seq_tokens, (int) (inp->mctx->get_rs_z() >= 0), (int) gdn_glue_l2);
+        }
+    } else if (gdn_conv_inplace) {
         ggml_tensor * conv_state = build_rs_state_view(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
         conv_state = ggml_reshape_3d(ctx0, conv_state, conv_kernel_size - 1, conv_channels, n_seqs);
         cb(conv_state, "conv_state_inplace_view", il);
@@ -551,7 +597,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         cb(state, "state_predelta", il);
     }
 
-    if (!gdn_conv_inplace) {
+    if (!gdn_conv_inplace && !gdn_glue_fuse) {
         ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
         cb(conv_output_proper, "conv_output_raw", il);
 
@@ -594,7 +640,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // q_conv/k_conv through -- the GDN kernel normalizes internally (see
     // ggml_gated_delta_net's l2norm_qk doc comment / gated_delta_net_cuda's
     // L2Norm template branch). When the flag is off, unchanged behavior.
-    if (!gdn_fused_l2norm) {
+    if (!gdn_fused_l2norm && !gdn_glue_l2) {
         q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
         k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
     }

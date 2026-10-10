@@ -9653,6 +9653,66 @@ static void ggml_compute_forward_ssm_conv_update_f32(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    const int n_t = (int) src2->ne[1];
+    if (n_t > 1) {
+        // T409 multi-token form: window = [s (or zeros), x_0 .. x_{n_t-1}] per channel, y_t = sum_i win[t+i]*c[i],
+        // new s = last nc-1 window columns; then silu and the optional per-128-channel L2 norm of [0, l2_n).
+        const bool  state_is_zero = ggml_get_op_params_i32(dst, 1) != 0;
+        const int   l2_n          = ggml_get_op_params_i32(dst, 2);
+        const float l2_eps        = ggml_get_op_params_f32(dst, 3);
+
+        for (int i3 = 0; i3 < n_s; ++i3) {
+            for (int i1 = ir0; i1 < ir1; ++i1) {
+                float       * s = (float *) ((char *) src0->data + i1*src0->nb[1] + i3*src0->nb[2]);
+                const float * c = (const float *) ((const char *) src1->data + i1*src1->nb[1]);
+                const char  * xb = (const char *) src2->data + i1*src2->nb[0] + i3*src2->nb[2];
+
+                float s_old[16];
+                for (int i0 = 0; i0 < nc - 1; ++i0) {
+                    s_old[i0] = state_is_zero ? 0.0f : s[i0];
+                }
+                auto win = [&](int p) -> float {
+                    return p < nc - 1 ? s_old[p] : *(const float *) (xb + (int64_t) (p - (nc - 1))*src2->nb[1]);
+                };
+                for (int t = 0; t < n_t; ++t) {
+                    float sumf = 0.0f;
+                    for (int i0 = 0; i0 < nc; ++i0) {
+                        sumf += win(t + i0) * c[i0];
+                    }
+                    *(float *) ((char *) dst->data + i1*dst->nb[0] + t*dst->nb[1] + i3*dst->nb[2]) = sumf;
+                }
+                for (int i0 = 0; i0 < nc - 1; ++i0) {
+                    s[i0] = win(n_t + i0);
+                }
+            }
+        }
+
+        if (apply_silu || l2_n > 0) {
+            ggml_barrier(params->threadpool);
+            const int n_rows = n_t*n_s;
+            const int dr_s = (n_rows + nth - 1)/nth;
+            const int is0  = dr_s*ith;
+            const int is1  = MIN(is0 + dr_s, n_rows);
+            for (int ir = is0; ir < is1; ++ir) {
+                float * y = (float *) ((char *) dst->data + (ir % n_t)*dst->nb[1] + (ir / n_t)*dst->nb[2]);
+                if (apply_silu) {
+                    ggml_vec_silu_f32(nr, y, y);
+                }
+                for (int g = 0; g < l2_n; g += 128) {
+                    ggml_float sum = 0.0;
+                    for (int i0 = 0; i0 < 128; ++i0) {
+                        sum += (ggml_float) (y[g + i0] * y[g + i0]);
+                    }
+                    const float scale = 1.0f/fmaxf(sqrtf(sum), l2_eps);
+                    for (int i0 = 0; i0 < 128; ++i0) {
+                        y[g + i0] *= scale;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     for (int i3 = 0; i3 < n_s; ++i3) {
         for (int i1 = ir0; i1 < ir1; ++i1) {
             float       * s = (float *) ((char *) src0->data + i1*src0->nb[1] + i3*src0->nb[2]);

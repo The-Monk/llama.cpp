@@ -356,6 +356,11 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
 
+    // T409: only set with n_rs_seq == 0 (fusion gate), where s_copy() has no side effects
+    if (res && s_copy_identity) {
+        res &= mctx->s_copy(0) == (int32_t) mctx->get_head();
+    }
+
     return res;
 }
 
@@ -1107,6 +1112,9 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    if (res && inp_rs->s_copy_identity) { // T409, see llm_graph_input_rs::can_reuse
+        res &= mctx->get_recr()->s_copy(0) == (int32_t) mctx->get_recr()->get_head();
+    }
 
     return res;
 }
@@ -1150,6 +1158,9 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    if (res && inp_rs->s_copy_identity) { // T409, see llm_graph_input_rs::can_reuse
+        res &= mctx->get_recr()->s_copy(0) == (int32_t) mctx->get_recr()->get_head();
+    }
 
     return res;
 }
@@ -1238,6 +1249,9 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    if (res && inp_rs->s_copy_identity) { // T409, see llm_graph_input_rs::can_reuse
+        res &= mctx->get_recr()->s_copy(0) == (int32_t) mctx->get_recr()->get_head();
+    }
 
     return res;
 }
