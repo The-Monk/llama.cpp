@@ -61,6 +61,11 @@ int main(int argc, char ** argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s model [N=64] [G=32]\n", argv[0]); return 2; }
     const int N = argc > 2 ? atoi(argv[2]) : 64;
     const int G = argc > 3 ? atoi(argv[3]) : 32;
+    // T483: ref_env (KEY=VAL) is set only for the reference context; "nocp" runs the X side as the plain
+    // reference scenario (no seq_cp), so X-vs-R then isolates the effect of ref_env alone (e.g. the fused-vs-unfused
+    // conv path, or GGML_GDN_PERTURB_ULP=1 for the 1-ulp chaos floor).
+    const std::string ref_env = argc > 4 ? argv[4] : "-";
+    const bool nocp = argc > 5 && std::string(argv[5]) == "nocp";
     llama_backend_init();
     auto mp = llama_model_default_params(); mp.n_gpu_layers = 999;
     llama_model * model = llama_model_load_from_file(argv[1], mp);
@@ -87,16 +92,21 @@ int main(int argc, char ** argv) {
     {
         llama_context * ctx = llama_init_from_model(model, cp);
         llama_memory_t mem = llama_get_memory(ctx);
+        const int xs = nocp ? 0 : 1;
         dec(ctx, A, 0, 0, "X1 seq0 A");
-        dec(ctx, B, 1, 0, "X2 seq1 B");
-        llama_memory_seq_rm(mem, 1, -1, -1);
-        llama_memory_seq_cp(mem, 0, 1, -1, -1);
-        dec(ctx, C, 1, N, "X4 seq1 C cp");
+        if (!nocp) {
+            dec(ctx, B, 1, 0, "X2 seq1 B");
+            llama_memory_seq_rm(mem, 1, -1, -1);
+            llama_memory_seq_cp(mem, 0, 1, -1, -1);
+        }
+        dec(ctx, C, xs, N, "X4 seq C");
         const float * l = llama_get_logits_ith(ctx, -1); LX.assign(l, l + nv);
-        TX = greedy(ctx, 1, 2 * N, G, nv, rX);
+        TX = greedy(ctx, xs, 2 * N, G, nv, rX);
         llama_free(ctx);
     }
     {
+        const size_t eq = ref_env.find('=');
+        if (eq != std::string::npos) setenv(ref_env.substr(0, eq).c_str(), ref_env.c_str() + eq + 1, 1);
         llama_context * ctx = llama_init_from_model(model, cp);
         dec(ctx, A, 0, 0, "R1 seq0 A");
         dec(ctx, C, 0, N, "R2 seq0 C");

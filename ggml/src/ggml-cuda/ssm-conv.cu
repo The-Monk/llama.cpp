@@ -214,14 +214,15 @@ static __global__ void ssm_conv_prefill_f32(float * __restrict__ state, const fl
     for (int64_t i = 0; i < local_n_t; i++) {
         float sumf;
         if constexpr (d_conv == 4) {
-            // Pin the tap order ssm_conv_long_token_f32<*, 128, 4, 32> compiles to under -funsafe-math (read off
-            // the gfx1201 ISA, T409; same order T368 found for ssm_conv_f32): fma(x3,w3,b) -> x1*w1 -> x2*w2 ->
-            // x0*w0. Without the pin the do_l2 instantiation reassociated to w0..w3 and was not bit-identical.
+            // T483: pin the tap order of ssm_conv_long_token_f32<*, 128, 4, 32> (the unfused n_t > 32 path), which
+            // is pinned to the same order below: fma(x0,w0,b) -> x1*w1 -> x2*w2 -> x3*w3. (T409 pinned the
+            // x3,x1,x2,x0 order of ssm_conv_f32's i == 0 iteration instead; ROCm 10.1 compiles long_token to the
+            // natural order, so fused and unfused prefill differed in the last ulp, amplified to dlogit up to 2.)
             const float * xs = smem + tid * n_cols + i;
-            sumf = fmaf(xs[3], w[3], b);
+            sumf = fmaf(xs[0], w[0], b);
             sumf = fmaf(xs[1], w[1], sumf);
             sumf = fmaf(xs[2], w[2], sumf);
-            sumf = fmaf(xs[0], w[0], sumf);
+            sumf = fmaf(xs[3], w[3], sumf);
         } else {
             sumf = 0.0f;
 #pragma unroll
@@ -319,12 +320,24 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
 
     // Compute from shared memory
     for (int64_t i = 0; i < local_n_t; i++) {
-        float sumf = 0.0f;
+        float sumf;
+        if constexpr (d_conv == 4) {
+            // T483: explicit tap order = what this loop compiles to (fma(x0,w0,b) -> x1 -> x2 -> x3, read off the
+            // gfx1201 ISA on ROCm 10.1); pinned so ssm_conv_prefill_f32 (T409 fused path) matches it bit for bit
+            // whatever the compiler does.
+            const float * xs = smem + tid * n_cols + i;
+            sumf = fmaf(xs[0], w[0], b);
+            sumf = fmaf(xs[1], w[1], sumf);
+            sumf = fmaf(xs[2], w[2], sumf);
+            sumf = fmaf(xs[3], w[3], sumf);
+        } else {
+            sumf = 0.0f;
 #pragma unroll
-        for (size_t j = 0; j < d_conv; j++) {
-            sumf += smem[tid * n_cols + i + j] * w[j];
+            for (size_t j = 0; j < d_conv; j++) {
+                sumf += smem[tid * n_cols + i + j] * w[j];
+            }
+            sumf += b;
         }
-        sumf += b;
         y_block[i * stride_y + tid] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
     }
 }
