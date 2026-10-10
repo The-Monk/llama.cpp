@@ -2070,6 +2070,8 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
     const void * gate = nullptr;
     void * split_dst = nullptr;   // [TAG_MMVQ_PAIR]
+    const void * pair_x = nullptr;   // T430 GGML_CUDA_MMVF_PAIR: second weight matrix of a mmvf pair (its output goes to split_dst)
+    int pair_rows = 0;                // rows of the first matrix of the pair
     const void * gate_bias = nullptr;
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;

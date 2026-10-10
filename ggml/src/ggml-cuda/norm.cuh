@@ -16,3 +16,7 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// T430 GGML_CUDA_FWHT_QUANT: decode RMS_NORM+MUL+MUL(signs)+FWHT1024+Q2_FIELD q8_1 in one launch (false = declined).
+bool ggml_cuda_op_rms_norm_mul_fwht_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * mul_w,
+        const ggml_tensor * signs, ggml_tensor * norm_dst, ggml_tensor * fwht_dst, float eps, void * qy);

@@ -1,5 +1,6 @@
 #include "norm.cuh"
 #include "quantize.cuh"
+#include "fwht-dev.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -809,4 +810,81 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+// T430 GGML_CUDA_FWHT_QUANT: decode RMS_NORM + MUL(weight) + MUL(signs) + FWHT(1024) + Q2_FIELD q8_1 in ONE launch.
+// Stage 1 is rms_norm_f32<1024, true> verbatim (same strided partial sums, same block_reduce, same scale), stage 2
+// gives each warp one 1024-chunk of the normalised row: it stores the norm output (dst_norm, the MUL node's value
+// -- other nodes may read it) and runs the signed transform + quantizer of fwht_q8_1_cuda on the same fp32 values.
+static __global__ __launch_bounds__(1024, 1) void rms_norm_mul_fwht_q8_1_f32(
+        const float * __restrict__ x, float * __restrict__ dst_norm, const int ncols, const float eps,
+        const float * __restrict__ mul, const float * __restrict__ signs, const float fscale,
+        float * __restrict__ dst_fwht, block_q8_1 * __restrict__ qy) {
+    ggml_cuda_pdl_lc();
+    const int tid = threadIdx.x;
+
+    float tmp = 0.0f;
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += 1024) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, 1024>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    const int warp = tid / QK8_1;
+    const int lane = tid % QK8_1;
+    if (warp >= ncols / 1024) {
+        return;
+    }
+    const int base = warp * 1024 + lane * QK8_1;
+    const float4 * x4 = (const float4 *) (x + base);
+    const float4 * m4 = (const float4 *) (mul + base);
+    const float4 * g4 = (const float4 *) (signs + base);
+    float4 *       n4 = (float4 *) (dst_norm + base);
+    float reg[QK8_1];
+#pragma unroll
+    for (int k = 0; k < QK8_1/4; ++k) {
+        const float4 xv = x4[k];
+        const float4 mv = m4[k];
+        const float4 gv = g4[k];
+        float4 nv;
+        nv.x = scale * xv.x * mv.x;
+        nv.y = scale * xv.y * mv.y;
+        nv.z = scale * xv.z * mv.z;
+        nv.w = scale * xv.w * mv.w;
+        n4[k] = nv;
+        reg[4*k + 0] = (nv.x * fscale) * gv.x;
+        reg[4*k + 1] = (nv.y * fscale) * gv.y;
+        reg[4*k + 2] = (nv.z * fscale) * gv.z;
+        reg[4*k + 3] = (nv.w * fscale) * gv.w;
+    }
+    ggml_cuda_fwht1024_q8_1_lane(reg, lane, dst_fwht + base, qy + warp * (1024 / QK8_1) + lane);
+}
+
+bool ggml_cuda_op_rms_norm_mul_fwht_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * mul_w,
+        const ggml_tensor * signs, ggml_tensor * norm_dst, ggml_tensor * fwht_dst, float eps, void * qy) {
+    const int64_t ncols = x->ne[0];
+    if (ncols % 1024 != 0 || ncols > 32768 || x->type != GGML_TYPE_F32 || mul_w->type != GGML_TYPE_F32 || signs->type != GGML_TYPE_F32 ||
+        norm_dst->type != GGML_TYPE_F32 || fwht_dst->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(x) || !ggml_is_contiguous(mul_w) || !ggml_is_contiguous(signs) ||
+        !ggml_is_contiguous(norm_dst) || !ggml_is_contiguous(fwht_dst) ||
+        mul_w->ne[0] != ncols || ggml_nelements(mul_w) != ncols || signs->ne[0] != ncols || ggml_nelements(signs) != ncols ||
+        ggml_nelements(x) != ncols || ggml_nelements(norm_dst) != ncols || ggml_nelements(fwht_dst) != ncols) {
+        return false;
+    }
+    if (((uintptr_t) x->data | (uintptr_t) mul_w->data | (uintptr_t) signs->data | (uintptr_t) norm_dst->data |
+         (uintptr_t) fwht_dst->data) % 16 != 0) {
+        return false;
+    }
+    const float fscale = 1 / sqrtf(1024.0f);
+    const ggml_cuda_kernel_launch_params launch_params{dim3(1, 1, 1), dim3(1024, 1, 1), 32 * sizeof(float), ctx.stream()};
+    ggml_cuda_kernel_launch(rms_norm_mul_fwht_q8_1_f32, launch_params, (const float *) x->data, (float *) norm_dst->data, (int) ncols, eps,
+        (const float *) mul_w->data, (const float *) signs->data, fscale, (float *) fwht_dst->data, (block_q8_1 *) qy);
+    return true;
 }

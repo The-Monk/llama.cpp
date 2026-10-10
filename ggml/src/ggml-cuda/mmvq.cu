@@ -78,6 +78,11 @@ static bool ggml_cuda_q2_field_act_enabled() {
 #endif
 }
 
+// T430: read-only views of the two knobs the decode activation-quant dedup keys on, for producers that
+// publish a pre-quantized activation (the FWHT+q8_1 fusion in ggml-cuda.cu).
+bool ggml_cuda_mmvq_q2_field_act_enabled() { return ggml_cuda_q2_field_act_enabled(); }
+bool ggml_cuda_mmvq_dedup_enabled()        { return ggml_cuda_dedup_mmvq_quant_enabled(); }
+
 // T362 GGML_Q1_FIELD_ACT=1 (default OFF): the same for Q1_0 MUL_MAT decode
 // (quantize_row_q8_1_q1_field_cuda + vec_dot_q1_0_q8_1_field).
 static bool ggml_cuda_q1_field_act_enabled() {

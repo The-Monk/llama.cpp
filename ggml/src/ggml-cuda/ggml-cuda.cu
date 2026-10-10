@@ -4222,6 +4222,51 @@ static int ggml_cuda_find_mmvq_group(const ggml_cgraph * cgraph, int i, int cc, 
     return g.n;
 }
 
+// T430 GGML_CUDA_MMVF_PAIR (default OFF): two ADJACENT single-token BF16 MUL_MATs reading the same activation with identical
+// weight geometry (Bonsai 2's ssm_beta / ssm_alpha, 48x5120 each: ~3.5 us launch-bound kernels the Q2_0 matrix-table group
+// cannot take) run as ONE mmvf launch over both row sets, same per-row arithmetic. Returns the partner node index or -1.
+static int ggml_cuda_find_mmvf_pair(const ggml_cgraph * cgraph, int i, int cc) {
+    static const bool enabled = getenv("GGML_CUDA_MMVF_PAIR") != nullptr && atoi(getenv("GGML_CUDA_MMVF_PAIR")) != 0;
+    if (!enabled) {
+        return -1;
+    }
+    const ggml_tensor * a = cgraph->nodes[i];
+    if (a->op != GGML_OP_MUL_MAT || a->src[2] != nullptr || (a->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return -1;
+    }
+    const ggml_tensor * wa  = a->src[0];
+    const ggml_tensor * act = a->src[1];
+    if (wa->type != GGML_TYPE_BF16 || act->type != GGML_TYPE_F32 || act->ne[1] != 1 || act->ne[2] != 1 || act->ne[3] != 1 ||
+        wa->ne[2] != 1 || wa->ne[3] != 1 || a->type != GGML_TYPE_F32 || !ggml_is_contiguous(a) || !ggml_is_contiguous(wa) ||
+        !ggml_is_contiguous(act) || wa->ne[0] % 2 != 0 || wa->nb[1] % 4 != 0 ||
+        !ggml_cuda_should_use_mmvf(wa->type, cc, wa->ne, wa->nb, act->ne[1])) {
+        return -1;
+    }
+    auto overlaps = [](const ggml_tensor * x, const ggml_tensor * y) {
+        if (!x || !y || !x->data || !y->data) return true;
+        const char * xs = (const char *) x->data;
+        const char * ys = (const char *) y->data;
+        return xs < ys + ggml_nbytes(y) && ys < xs + ggml_nbytes(x);
+    };
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * b = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(b)) {
+            continue;
+        }
+        if (b->op != GGML_OP_MUL_MAT || b->src[1] != act || b->src[2] != nullptr || (b->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return -1;
+        }
+        const ggml_tensor * wb = b->src[0];
+        if (wb == wa || wb->type != wa->type || !ggml_are_same_stride(wb, wa) || wb->ne[0] != wa->ne[0] || wb->ne[1] != wa->ne[1] ||
+            wb->ne[2] != 1 || wb->ne[3] != 1 || !ggml_is_contiguous(wb) || b->type != GGML_TYPE_F32 || !ggml_is_contiguous(b) ||
+            !ggml_are_same_shape(a, b) || overlaps(a, act) || overlaps(a, wb) || overlaps(a, b) || overlaps(b, act) || overlaps(b, wa)) {
+            return -1;
+        }
+        return j;
+    }
+    return -1;
+}
+
 // T399: run of consecutive MUL_MATs on single-copy (W2ONLY) weights that read the SAME activation with equal K,
 // starting at node i, up to SC_MAX_GROUP (views/no-ops may sit between them). Returns the run length (>= 1).
 // Same safety argument as T395: nothing runs between the members. Batches above the grouped kernels' range
@@ -4271,6 +4316,82 @@ static int ggml_cuda_find_sc_group(const ggml_cgraph * cgraph, int i, ggml_tenso
         fprintf(stderr, "\n");
     }
     return n;
+}
+
+
+static const ggml_tensor * ggml_cuda_act_first_consumer(const ggml_cgraph * cgraph, int i, const ggml_tensor * t);
+static int ggml_cuda_fwht_quant_mode() {   // bit 0: FWHT+q8_1 fusion, bit 1: + RMS_NORM fused in, bit 2: verify against the reference quantizer
+    static const int m = [] { const char * v = getenv("GGML_CUDA_FWHT_QUANT"); return v ? atoi(v) : 0; }();
+    return m;
+}
+static bool ggml_cuda_fwht_quant_enabled() { return (ggml_cuda_fwht_quant_mode() & 1) != 0; }
+
+// The consumer-visible view of the FWHT-hint matmul `mm` (nodes[i_mm + 1]) when its first reader is a single-token
+// Q2_0 g128 MMVQ matmul that would quantize it with the Q2_FIELD producer through the dedup cache; else nullptr.
+static const ggml_tensor * ggml_cuda_fwht_quant_view(const ggml_cgraph * cgraph, int i_mm, const ggml_tensor * mm) {
+    if (i_mm + 1 >= cgraph->n_nodes) {
+        return nullptr;
+    }
+    const ggml_tensor * view = cgraph->nodes[i_mm + 1];
+    if (view->op != GGML_OP_RESHAPE || view->src[0] != mm) {
+        return nullptr;
+    }
+    const ggml_tensor * mmc = ggml_cuda_act_first_consumer(cgraph, i_mm + 1, view);
+    const int64_t ne10 = view->ne[0];
+    if (mmc && mmc->src[0]->type == GGML_TYPE_Q2_0 && !ggml_cuda_q2_0_is_g64(mmc->src[0]) &&
+        (mmc->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_cuda_mmvq_q2_field_act_enabled() && ggml_cuda_mmvq_dedup_enabled() &&
+        mmc->src[1] == view && view->type == GGML_TYPE_F32 && view->ne[1] == 1 && view->ne[2] == 1 && view->ne[3] == 1 &&
+        ggml_is_contiguous(view) && ne10 % MATRIX_ROW_PADDING == 0 && mm->type == GGML_TYPE_F32) {
+        return view;
+    }
+    return nullptr;
+}
+
+// Publish the fused q8_1 activation in the MMVQ dedup cache (keyed like mmvq.cu keys its own entry). Mode 2 also
+// re-quantizes dst with the reference producer and counts differing bytes (printed at exit).
+static void ggml_cuda_fwht_quant_publish(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * view, const ggml_tensor * mm,
+        std::unique_ptr<ggml_cuda_pool_alloc<char>> buf, size_t bytes) {
+    cuda_ctx->mmvq_quant_cache_buf    = std::move(buf);
+    cuda_ctx->mmvq_quant_cache_tensor = view;
+    cuda_ctx->mmvq_quant_cache_fn     = (void *) quantize_row_q8_1_q2_field_cuda;
+    cuda_ctx->mmvq_quant_cache_bytes  = bytes;
+    if (ggml_cuda_fwht_quant_mode() & 4) {
+        const int64_t ne10 = view->ne[0];
+        ggml_cuda_pool_alloc<char> ref(cuda_ctx->pool(), bytes);
+        quantize_row_q8_1_q2_field_cuda((const float *) mm->data, nullptr, ref.get(), GGML_TYPE_Q2_0, ne10, ne10, ne10, ne10,
+            ne10, 1, 1, 1, cuda_ctx->stream());
+        const int64_t diff = ggml_cuda_act_count_diff(ref.get(), cuda_ctx->mmvq_quant_cache_buf->get(), bytes, cuda_ctx->stream());
+        struct totals { int64_t n = 0, d = 0, b = 0;
+            ~totals() { fprintf(stderr, "fwht-quant: VERIFY %lld fused rows, %lld/%lld bytes differ\n", (long long) n, (long long) d, (long long) b); } };
+        static totals t;
+        t.n++; t.d += diff; t.b += (int64_t) bytes;
+        static int shown = 0;
+        if (diff > 0 && shown < 6) {
+            std::vector<char> a(bytes), b(bytes);
+            std::vector<float> xf(ne10);
+            CUDA_CHECK(cudaMemcpyAsync(a.data(), ref.get(), bytes, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+            CUDA_CHECK(cudaMemcpyAsync(b.data(), cuda_ctx->mmvq_quant_cache_buf->get(), bytes, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+            CUDA_CHECK(cudaMemcpyAsync(xf.data(), mm->data, ne10*sizeof(float), cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+            for (size_t ib = 0; ib < bytes/sizeof(block_q8_1) && shown < 6; ++ib) {
+                const block_q8_1 * ra = (const block_q8_1 *) a.data() + ib;
+                const block_q8_1 * rb = (const block_q8_1 *) b.data() + ib;
+                if (memcmp(ra, rb, sizeof(block_q8_1)) != 0) {
+                    int nq = 0; for (int k = 0; k < 32; ++k) nq += ra->qs[k] != rb->qs[k];
+                    float amax = 0.f; for (int k = 0; k < 32; ++k) amax = fmaxf(amax, fabsf(xf[ib*32+k]));
+                    // host fp32 sums of the same 32 values: xor tree 16,8,4,2,1 / xor tree 1,2,4,8,16 / sequential
+                    volatile float v[32], w[32]; for (int k = 0; k < 32; ++k) { v[k] = xf[ib*32+k]; w[k] = v[k]; }
+                    for (int off = 16; off > 0; off >>= 1) { for (int k = 0; k < off; ++k) { v[k] = v[k] + v[k + off]; } }
+                    for (int off = 1; off < 32; off <<= 1) { for (int k = 0; k + off < 32; k += 2*off) { w[k] = w[k] + w[k + off]; } }
+                    volatile float sq = 0.f; for (int k = 0; k < 32; ++k) { sq = sq + xf[ib*32+k]; }
+                    fprintf(stderr, "fwht-quant: DIFF blk %zu/%zu ref d=%.9g s=%.9g | fused d=%.9g s=%.9g | qdiff=%d amax=%.9g | host tree16..1=%.9g tree1..16=%.9g seq=%.9g (as half: %.9g %.9g %.9g)\n", ib, bytes/sizeof(block_q8_1),
+                        (double) __half2float(ra->ds.x), (double) __half2float(ra->ds.y), (double) __half2float(rb->ds.x), (double) __half2float(rb->ds.y), nq, (double) amax,
+                        (double) v[0], (double) w[0], (double) sq, (double) __half2float(__float2half(v[0])), (double) __half2float(__float2half(w[0])), (double) __half2float(__float2half(sq)));
+                    ++shown;
+                }
+            }
+        }
+    }
 }
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
@@ -4372,6 +4493,67 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // T430 GGML_CUDA_FWHT_QUANT: RMS_NORM + MUL(weight) + MUL(signs) + RESHAPE + FWHT matmul (decode, one token) -> ONE launch
+    // that also leaves the Q2_FIELD q8_1 activation in the MMVQ dedup cache (see ggml_cuda_fwht_quant_view).
+    if ((ggml_cuda_fwht_quant_mode() & 3) == 3 && node->op == GGML_OP_RMS_NORM && i + 5 < cgraph->n_nodes &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 1, i + 4 })) {
+        ggml_tensor *       mulw  = cgraph->nodes[i + 1];
+        const ggml_tensor * muls  = cgraph->nodes[i + 2];
+        const ggml_tensor * resh  = cgraph->nodes[i + 3];
+        ggml_tensor *       mm    = cgraph->nodes[i + 4];
+        const ggml_tensor * x     = node->src[0];
+        const ggml_tensor * w     = mulw->src[0] == node ? mulw->src[1] : mulw->src[0];
+        const ggml_tensor * signs = muls->src[1];
+        float eps;
+        memcpy(&eps, node->op_params, sizeof(float));
+        if ((mulw->src[0] == node || mulw->src[1] == node) && muls->src[0] == mulw && resh->src[0] == muls && mm->src[1] == resh &&
+            ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD && mm->src[0]->ne[0] == 1024 &&
+            x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && w->ne[1] == 1 && signs->ne[1] == 1 && signs->ne[2] == 1 &&
+            signs->ne[3] == 1 && mulw->type == GGML_TYPE_F32 && muls->type == GGML_TYPE_F32) {
+            const ggml_tensor * view = ggml_cuda_fwht_quant_view(cgraph, i + 4, mm);
+            if (view) {
+                const size_t bytes = (size_t) (view->ne[0] / QK8_1) * sizeof(block_q8_1);
+                auto buf = std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool(), bytes);
+                if (ggml_cuda_op_rms_norm_mul_fwht_q8_1(*cuda_ctx, x, w, signs, mulw, mm, eps, buf->get())) {
+                    ggml_cuda_fwht_quant_publish(cuda_ctx, view, mm, std::move(buf), bytes);
+                    return 4;
+                }
+            }
+        }
+    }
+
+    // T430 GGML_CUDA_FWHT_QUANT: GDN output -> [reshape+permute view] CONT + RESHAPE + MUL(signs) + RESHAPE + FWHT matmul (ssm_out,
+    // decode): the tiled->grouped feature reorder (a full cpy kernel) is folded into the transform's load.
+    if (ggml_cuda_fwht_quant_enabled() && node->op == GGML_OP_CONT && i + 5 < cgraph->n_nodes &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 4 })) {
+        const ggml_tensor * perm  = node->src[0];
+        const ggml_tensor * rsh   = cgraph->nodes[i + 1];
+        const ggml_tensor * muls  = cgraph->nodes[i + 2];
+        const ggml_tensor * rsh2  = cgraph->nodes[i + 3];
+        ggml_tensor *       mm    = cgraph->nodes[i + 4];
+        const ggml_tensor * base  = perm && perm->op == GGML_OP_PERMUTE && perm->src[0] && perm->src[0]->op == GGML_OP_RESHAPE ? perm->src[0]->src[0] : nullptr;
+        if (base && rsh->src[0] == node && muls->src[0] == rsh && rsh2->src[0] == muls && mm->src[1] == rsh2 &&
+            ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD && mm->src[0]->ne[0] == 1024 &&
+            base->type == GGML_TYPE_F32 && ggml_is_contiguous(base) && node->type == GGML_TYPE_F32 &&
+            perm->ne[3] == 1 && perm->ne[0] * perm->ne[1] * perm->ne[2] == ggml_nelements(base) &&
+            perm->src[0]->ne[0] == perm->ne[0] && perm->src[0]->ne[1] == perm->ne[2] && perm->src[0]->ne[2] == perm->ne[1] &&
+            perm->nb[0] == sizeof(float) && perm->nb[1] == perm->ne[0] * perm->ne[2] * sizeof(float) &&
+            perm->nb[2] == perm->ne[0] * sizeof(float) &&
+            muls->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(muls->src[1]) && muls->src[1]->ne[1] == 1 &&
+            muls->src[1]->ne[0] == ggml_nelements(base) && muls->src[1]->ne[0] % 1024 == 0) {
+            const ggml_tensor * view = ggml_cuda_fwht_quant_view(cgraph, i + 4, mm);
+            if (view) {
+                const size_t bytes = (size_t) (view->ne[0] / QK8_1) * sizeof(block_q8_1);
+                auto buf = std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool(), bytes);
+                if (ggml_cuda_op_fwht_signed_q8_1_perm(*cuda_ctx, base, muls->src[1], mm, buf->get(),
+                        (int) perm->ne[0], (int) perm->ne[2], (int) perm->ne[1])) {
+                    ggml_cuda_fwht_quant_publish(cuda_ctx, view, mm, std::move(buf), bytes);
+                    return 4;
+                }
+            }
+        }
+    }
+
     // prism.hadamard sign flip + reshape + FWHT-hint matmul: apply the sign vector during
     // the transform's load instead of as a separate full pass over the activation. Saves a
     // kernel launch (~2.6 us on gfx1201) and a read/write round trip per folded matmul --
@@ -4394,6 +4576,35 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_is_contiguous(x) && ggml_is_contiguous(signs) &&
             signs->ne[0] == x->ne[0] && signs->ne[0] % mm->src[0]->ne[0] == 0;
 
+        // T430 GGML_CUDA_FWHT_QUANT (default OFF): decode (one token) activation of a Q2_0 g128 MMVQ consumer:
+        // quantize the rotated row to the Q2_FIELD q8_1 layout inside the FWHT kernel and publish it in the
+        // MMVQ dedup cache keyed on the consumer-visible reshape view, so quantize_q8_1 is never launched.
+        // dst stays written, and the bytes equal quantize_row_q8_1_q2_field_cuda reading it back.
+        if (pattern_ok && ggml_cuda_fwht_quant_enabled() && i + 3 < cgraph->n_nodes) {
+            const ggml_tensor * view = ggml_cuda_fwht_quant_view(cgraph, i + 2, mm);
+            if (view) {
+                const size_t bytes = (size_t) (view->ne[0] / QK8_1) * sizeof(block_q8_1);
+                auto buf = std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool(), bytes);
+                // verify mode: run the unfused kernel first (dst may alias x: the transform is in place per row)
+                ggml_cuda_pool_alloc<char> scratch(cuda_ctx->pool(), (ggml_cuda_fwht_quant_mode() & 4) ? ggml_nbytes(mm) : 0);
+                if (ggml_cuda_fwht_quant_mode() & 4) {
+                    ggml_tensor tmp = *mm;
+                    tmp.data = scratch.get();
+                    ggml_cuda_op_fwht_signed(*cuda_ctx, x, signs, &tmp);
+                }
+                if (ggml_cuda_op_fwht_signed_q8_1(*cuda_ctx, x, signs, mm, buf->get())) {
+                    if (ggml_cuda_fwht_quant_mode() & 4) {
+                        const int64_t diff = ggml_cuda_act_count_diff(scratch.get(), mm->data, ggml_nbytes(mm), cuda_ctx->stream());
+                        struct totals { int64_t n = 0, d = 0, b = 0;
+                            ~totals() { fprintf(stderr, "fwht-quant: VERIFY fwht %lld rows, %lld/%lld bytes differ\n", (long long) n, (long long) d, (long long) b); } };
+                        static totals t;
+                        t.n++; t.d += diff; t.b += (int64_t) ggml_nbytes(mm);
+                    }
+                    ggml_cuda_fwht_quant_publish(cuda_ctx, view, mm, std::move(buf), bytes);
+                    return 2;
+                }
+            }
+        }
         if (pattern_ok && ggml_cuda_op_fwht_signed(*cuda_ctx, x, signs, mm)) {
             return 2;
         }
@@ -5607,6 +5818,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         for (int k = 1; k < ng; ++k) {
                             mmvq_pair_done[gidx[k]] = true;
                         }
+                        try_launch_concurrent_event(node);
+                        continue;
+                    }
+                }
+
+                // T430 GGML_CUDA_MMVF_PAIR: two adjacent BF16 decode matmuls on one activation -> one launch
+                if (!is_concurrent_event_active) {
+                    const int fj = ggml_cuda_find_mmvf_pair(cgraph, i, ggml_cuda_info().devices[cuda_ctx->device].cc);
+                    if (fj > i) {
+                        ggml_cuda_mul_mat_vec_f(*cuda_ctx, node->src[0], node->src[1], nullptr, node, nullptr, cgraph->nodes[fj]->src[0], cgraph->nodes[fj]);
+                        mmvq_pair_done[fj] = true;
                         try_launch_concurrent_event(node);
                         continue;
                     }
