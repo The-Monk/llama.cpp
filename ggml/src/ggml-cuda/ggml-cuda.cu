@@ -4442,6 +4442,41 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // T486 (GGML_N1_GATEUP=1): FFN gate/up MUL_MATs on one activation + the SWIGLU that consumes both -> ONE merged-row one-GEMM
+    // whose epilogue writes silu(gate) * up (the GLU node's fp32 output); the gate/up outputs are never materialized
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_n1_gateup_enabled() && cuda_ctx->stream_context().concurrent_events.empty() &&
+        (node->flags & GGML_TENSOR_FLAG_COMPUTE) && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        int ju = -1, jg = -1;
+        for (int j = i + 1; j < cgraph->n_nodes && j <= i + 4; ++j) {
+            const ggml_tensor * nd = cgraph->nodes[j];
+            if (ggml_cuda_is_view_or_noop(nd)) {
+                continue;
+            }
+            if (ju < 0) {
+                if (nd->op != GGML_OP_MUL_MAT || nd->src[1] != node->src[1] || (nd->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                    break;
+                }
+                ju = j;
+            } else {
+                if (nd->op == GGML_OP_GLU && ggml_get_glu_op(nd) == GGML_GLU_OP_SWIGLU) {
+                    jg = j;
+                }
+                break;
+            }
+        }
+        if (jg > 0) {
+            ggml_tensor * glu = cgraph->nodes[jg];
+            ggml_tensor * other = cgraph->nodes[ju];
+            const bool node_is_gate = glu->src[0] == node && glu->src[1] == other;
+            const bool node_is_up   = glu->src[1] == node && glu->src[0] == other;
+            if ((node_is_gate || node_is_up) && ggml_node_get_use_count(cgraph, i) == 1 && ggml_node_get_use_count(cgraph, ju) == 1 &&
+                !(glu->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                ggml_cuda_n1_gateup(*cuda_ctx, node_is_gate ? node : other, node_is_gate ? other : node, glu)) {
+                return jg - i;
+            }
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;

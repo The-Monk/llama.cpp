@@ -41,3 +41,8 @@ void ggml_cuda_n1_act_ref_quant256(const float * x, int64_t s11, int64_t K, int6
 // layout (GGML_CUDA_ACT_LAYOUT_N1TOK: per-token scale) that the Hadamard FWHT producer can write for its src1.
 void ggml_cuda_n1_act_ref_quant_tok(const float * x, int64_t s11, int64_t K, int64_t N, void * y, cudaStream_t stream);
 bool ggml_cuda_n1_m3_ready(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+
+// T486 (GGML_N1_GATEUP=1, default off): the FFN gate/up MUL_MAT pair + SWIGLU as ONE merged-row one-GEMM that writes silu(gate) * up
+// (glu->data, fp32) from the epilogue. Returns true when it computed glu (the caller skips the three nodes).
+bool ggml_cuda_n1_gateup_enabled();
+bool ggml_cuda_n1_gateup(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * glu);

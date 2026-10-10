@@ -73,6 +73,7 @@ struct n1_env {
                             // quantised per TOKEN, folded int8 weights, ONE int32 accumulation over the whole K (no in-loop rescale)
     int     m3_segs = 1;
     int     m3_feed = 0;       // GGML_N1_M3_FEED (T435): 1 = wave tile 64 tok x 64 feat (W LDS reads per WMMA halved), 2 = 32 tok x 128 feat (X loads per WMMA halved), 3 = tile 1 + s_setprio 2 around each k-block's WMMA burst (T440); all on a 256 x 128 block
+    bool    gateup = false;    // GGML_N1_GATEUP=1 (T486, default OFF): merged gate/up one-GEMM with silu(gate)*up in the epilogue
     bool    m3_wide = false;   // GGML_N1_M3_WIDE=1: always the 256-token tile (A/B only)
     int     m2bc_flush = 8;
     bool    m2bc = false;   // GGML_N1_M2=2 (T424): M2 path + bias-carry rescale (one fmac per element per 256 K)
@@ -85,6 +86,8 @@ struct n1_env {
         const char * m3e = getenv("GGML_N1_M3");
         m3 = !(m3e && strcmp(m3e, "0") == 0);   // default ON (GGML_N1_M3=0 disables); engages only when src1 is a prism.hadamard FWHT node
         m3_wide = getenv("GGML_N1_M3_WIDE") != nullptr;
+        const char * gue = getenv("GGML_N1_GATEUP");
+        gateup = gue && strcmp(gue, "0") != 0;
         const char * m3s = getenv("GGML_N1_M3_SEGS");
         m3_segs = m3s && atoi(m3s) == 2 ? 2 : 1;
         const char * m3f = getenv("GGML_N1_M3_FEED");
@@ -132,12 +135,17 @@ struct n1_stats {
     std::atomic<uint64_t> act_glu{0}, act_norm{0};          // ... hits written by the GLU / norm producers
     std::atomic<uint64_t> mm_nk{0}, mm_transient{0}, dumped{0};
     std::atomic<uint64_t> mm_m2{0}, fl_m2{0}, conv_fold{0};  // T422: g128-arm calls on the fold+g256 kernel
+    std::atomic<uint64_t> mm_gu{0}, conv_gu{0}, bytes_gu{0}, fb_gu{0};   // T486: merged gate/up GEMM calls / merged weights / their bytes / refused
     std::atomic<uint64_t> mm_m3{0}, fl_m3{0}, m3_hit{0};      // T434: one-GEMM calls (m3_hit: activation from the FWHT producer)
     ~n1_stats() {
         if (!env().on || !env().stats) return;
         if (env().m3) {
             fprintf(stderr, "[N1] stats: m3 one-gemm %llu ops / %.3f TFLOP, activation from the fused FWHT producer %llu\n",
                     (unsigned long long) mm_m3.load(), fl_m3.load() * 1e-12, (unsigned long long) m3_hit.load());
+        }
+        if (env().gateup) {
+            fprintf(stderr, "[N1] stats: gate/up merged GEMM %llu ops, merged weights %llu (%.3f GB), refused %llu\n",
+                    (unsigned long long) mm_gu.load(), (unsigned long long) conv_gu.load(), bytes_gu.load() * 1e-9, (unsigned long long) fb_gu.load());
         }
         if (env().m2) {
             fprintf(stderr, "[N1] stats: m2 fold+g256 %llu ops / %.3f TFLOP, fold side-tables %llu\n",
@@ -389,6 +397,12 @@ std::unordered_set<const void *> g_refused;   // conversion refused (VRAM): stay
 size_t g_cache_bytes = 0;
 // T422 M2: ROW fold side-tables (w = mq int8 [S][F], sw = rowS fp32 [F]), keyed like g_cache
 std::unordered_map<const void *, n1_w> g_fold;
+// T486: merged gate/up weights (rows interleaved in 16-row blocks: 32q + 16s + r <- matrix s row 16q + r), keyed by the gate data
+// pointer: w = the usual mode-1 W2 stream + fp16 sw of the 2F-row matrix, fold = its M3 fold side-table
+struct n1_gu { n1_w w; n1_w fold; const void * up = nullptr; };
+std::unordered_map<const void *, n1_gu> g_gu;
+std::unordered_map<const void *, const void *> g_gu_of;   // gate / up data pointer -> g_gu key
+std::unordered_set<const void *> g_gu_refused;
 
 void n1_invalidate(const void * base, size_t size) {
     std::lock_guard<std::mutex> lk(g_mtx);
@@ -400,6 +414,20 @@ void n1_invalidate(const void * base, size_t size) {
             if (it->second.sw) (void) hipFree(it->second.sw);
             g_cache_bytes -= it->second.bytes;
             it = g_fold.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = g_gu.begin(); it != g_gu.end();) {   // T486: a merged weight dies with either of its sources
+        const char * k = (const char *) it->first, * ku = (const char *) it->second.up;
+        if ((k >= b && k < b + size) || (ku >= b && ku < b + size)) {
+            for (n1_w * x : {&it->second.w, &it->second.fold}) {
+                if (x->w)  (void) hipFree(x->w);
+                if (x->sw) (void) hipFree(x->sw);
+                g_cache_bytes -= x->bytes;
+            }
+            g_gu_of.erase(it->first); g_gu_of.erase(it->second.up);
+            it = g_gu.erase(it);
         } else {
             ++it;
         }
@@ -521,6 +549,11 @@ const n1_w * get_weight(const ggml_tensor * src0, int mode) {
     return &g_cache.emplace(src0->data, c).first->second;
 }
 
+bool n1_gu_member(const void * data) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    return g_gu_of.count(data) != 0;
+}
+
 bool n1_has_fold(const ggml_tensor * src0) {
     std::lock_guard<std::mutex> lk(g_mtx);
     return g_fold.count(src0->data) != 0;
@@ -548,6 +581,57 @@ const n1_w * get_fold(const ggml_tensor * src0, const void * W2, const void * SW
     return &g_fold.emplace(src0->data, c).first->second;
 }
 
+__global__ void k_n1_gather_gu(const char * __restrict__ a, const char * __restrict__ b, char * __restrict__ d, size_t rowb) {
+    const int m = blockIdx.x, q = m >> 5, sel = (m >> 4) & 1, r = m & 15;
+    const char * src = (sel ? b : a) + (size_t) (16 * q + r) * rowb;
+    for (size_t i = threadIdx.x; i < rowb; i += blockDim.x) d[(size_t) m * rowb + i] = src[i];
+}
+
+bool nk_dual_weight(const ggml_tensor * src0, const void ** w, const void ** sw);
+
+// T486: build (once) the merged gate/up weight of two same-shape Q2_0/Q1_0 tensors. nullptr = refused (stays unfused).
+const n1_gu * get_gu(const ggml_tensor * g, const ggml_tensor * u) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    auto it = g_gu.find(g->data);
+    if (it != g_gu.end()) return it->second.up == u->data ? &it->second : nullptr;
+    if (g_gu_refused.count(g->data) || g_gu_of.count(g->data) || g_gu_of.count(u->data)) return nullptr;
+    const int F = (int) g->ne[1], K = (int) g->ne[0], S = K / 128, F2 = 2 * F;
+    const size_t rowb = g->nb[1];
+    const size_t need = (size_t) F2 * rowb + (size_t) F2 * K / 4 + (size_t) S * F2 * sizeof(__half) + (size_t) S * F2 + (size_t) F2 * sizeof(float);
+    n1_gu c; c.up = u->data;
+    char * tmp = nullptr;
+    hipStream_t st = conv_stream();
+    bool ok = vram_ok(need) && hipMalloc(&tmp, (size_t) F2 * rowb) == hipSuccess;
+    if (ok) {
+        k_n1_gather_gu<<<F2, 256, 0, st>>>((const char *) g->data, (const char *) u->data, tmp, rowb);
+        ggml_tensor fake = *g;
+        fake.data = tmp; fake.ne[1] = F2;
+        fake.nb[2] = fake.nb[3] = rowb * (size_t) F2;
+        ok = g->type == GGML_TYPE_Q2_0 ? convert<GGML_TYPE_Q2_0>(&fake, 1, c.w) : convert<GGML_TYPE_Q1_0>(&fake, 1, c.w);
+        (void) hipStreamSynchronize(st);
+        (void) hipFree(tmp);
+    }
+    if (ok) {
+        const size_t mb = (size_t) S * F2, rb = (size_t) F2 * sizeof(float);
+        c.fold.mode = 3;
+        ok = hipMalloc(&c.fold.w, mb) == hipSuccess;
+        if (ok && hipMalloc(&c.fold.sw, rb) != hipSuccess) { (void) hipFree(c.fold.w); c.fold.w = nullptr; ok = false; }
+        if (ok) {
+            c.fold.bytes = mb + rb;
+            k_n1_fold_sw<<<F2, 256, 0, st>>>((const uint32_t *) c.w.w, (const __half *) c.w.sw, F2, K, (float *) c.fold.sw, (int8_t *) c.fold.w);
+            CUDA_CHECK(hipGetLastError());
+            CUDA_CHECK(hipStreamSynchronize(st));
+        } else if (c.w.w) {
+            (void) hipFree(c.w.w); (void) hipFree(c.w.sw);
+        }
+    }
+    if (!ok) { g_gu_refused.insert(g->data); g_stats.fb_gu++; return nullptr; }
+    g_cache_bytes += c.w.bytes + c.fold.bytes;
+    g_stats.conv_gu++; g_stats.bytes_gu += c.w.bytes + c.fold.bytes;
+    g_gu_of[g->data] = g->data; g_gu_of[u->data] = g->data;
+    return &g_gu.emplace(g->data, c).first->second;
+}
+
 // BC: 0 = exact sub + fmac rescale (GGML_N1_M2=1); else m2::BCARRY | (log2(flush groups) << 25)
 template <int KT, int BC>
 void launch_m2_kt(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
@@ -572,16 +656,22 @@ void launch_m2_bc(const void * X, const void * W, const n1_w * fo, const float *
 // counts: the 256-token tile would waste a whole half tile; 3% slower per FLOP in the standalone harness)
 // FEED: 0 = wave tile 32 tok x 64 feat; m2::FT4 = 64 x 64; m2::FF8 = 32 x 128 (T435). BT = 16 * FT * WTn tokens, BF = 16 * FF * WFn features per workgroup.
 template <int KT, int WTn, int WFn, int SEGS, int FEED>
-void launch_m3_kt(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
+void launch_m3_kt(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st, bool glu = false) {
     constexpr int FTv = (FEED & m2::FT4) ? 4 : 2, FFv = (FEED & m2::FF8) ? 8 : 4;
     constexpr int TPB = 16 * FTv * WTn / 128;   // 128-token tiles per workgroup
     const int ntile = Npad / 128;
     const dim3 grid((ntile + TPB - 1) / TPB, F / (16 * FFv * WFn));
+    if (glu) {   // T486: F is the merged 2F; Y rows are ldy = F / 2 apart; no K tag (one instantiation per tile variant)
+        m2::gemm_fold<WTn, WFn, SEGS, 1, m2::ONEACC | m2::GLUE | FEED><<<grid, WTn * WFn * 32, 0, st>>>((const uint4 *) X, (const uint4 *) W, (const int8_t *) fo->w,
+            (const float *) fo->sw, sx, Y, N, ntile, F, K, ldy);
+        return;
+    }
     m2::gemm_fold<WTn, WFn, SEGS, 1, KT | m2::ONEACC | FEED><<<grid, WTn * WFn * 32, 0, st>>>((const uint4 *) X, (const uint4 *) W, (const int8_t *) fo->w,
         (const float *) fo->sw, sx, Y, N, ntile, F, K, ldy);
 }
 template <int WTn, int WFn, int SEGS, int FEED>
-void launch_m3_s(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
+void launch_m3_s(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st, bool glu = false) {
+    if (glu) { launch_m3_kt<0, WTn, WFn, SEGS, FEED>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st, true); return; }
     switch (K) {
         case 5120:  launch_m3_kt<(5120 / 1024) << 3,  WTn, WFn, SEGS, FEED>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
         case 6144:  launch_m3_kt<(6144 / 1024) << 3,  WTn, WFn, SEGS, FEED>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
@@ -589,14 +679,14 @@ void launch_m3_s(const void * X, const void * W, const n1_w * fo, const float * 
         default:    launch_m3_kt<0,                   WTn, WFn, SEGS, FEED>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
     }
 }
-void launch_m3(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
+void launch_m3(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st, bool glu = false) {
     const bool odd = (Npad / 128) % 2 == 1 && !env().m3_wide;
-    if (odd) launch_m3_s<4, 2, 1, 0>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
-    else if (env().m3_feed == 1) launch_m3_s<4, 2, 1, m2::FT4>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
-    else if (env().m3_feed == 3) launch_m3_s<4, 2, 1, m2::FT4 | m2::PRW>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
-    else if (env().m3_feed == 2) launch_m3_s<8, 1, 1, m2::FF8>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
-    else if (env().m3_segs == 2 && (K / 128) % 2 == 0) launch_m3_s<8, 1, 2, 0>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
-    else launch_m3_s<8, 1, 1, 0>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
+    if (odd) launch_m3_s<4, 2, 1, 0>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st, glu);
+    else if (env().m3_feed == 1) launch_m3_s<4, 2, 1, m2::FT4>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st, glu);
+    else if (env().m3_feed == 3) launch_m3_s<4, 2, 1, m2::FT4 | m2::PRW>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st, glu);
+    else if (env().m3_feed == 2) launch_m3_s<8, 1, 1, m2::FF8>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st, glu);
+    else if (env().m3_segs == 2 && (K / 128) % 2 == 0) launch_m3_s<8, 1, 2, 0>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st, glu);
+    else launch_m3_s<8, 1, 1, 0>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st, glu);
 }
 
 void launch_m2(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
@@ -686,13 +776,69 @@ int n1_weight_state(const ggml_tensor * src0, int mode) {
 } // namespace
 
 bool ggml_cuda_n1_enabled() { return env().on; }
+bool ggml_cuda_n1_gateup_enabled() { return env().on && env().m3 && env().gateup; }
 
 // T434: this MUL_MAT will run the one-GEMM path (GGML_N1_M3) and read the N1TOK cache entry of its FWHT src1. Mirrors the
 // routing of n1_mul_mat_impl (weight already converted, so the fold side-table can be built from it).
 bool ggml_cuda_n1_m3_ready(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     return env().on && env().m3 && !env().act_tok && !env().transient && n1_hada_act(src1) &&
         (src0->type == GGML_TYPE_Q2_0 || src0->type == GGML_TYPE_Q1_0) && src1->ne[1] >= env().min_n &&
-        n1_shape_ok(src0, src1, dst) && !n1_use_row(src0) && n1_weight_state(src0, 1) == 1;
+        n1_shape_ok(src0, src1, dst) && !n1_use_row(src0) && (n1_weight_state(src0, 1) == 1 || (env().gateup && n1_gu_member(src0->data)));
+}
+
+// T486: the gate/up pair of an FFN folded into one GEMM (see get_gu). Called by the graph loop at the first of the two
+// MUL_MATs with the SWIGLU node that consumes both; computes glu->data = silu(gate) * up and returns true, in which case
+// the caller skips both MUL_MATs and the GLU. false = nothing was touched.
+bool ggml_cuda_n1_gateup(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * glu) {
+    if (!env().on || !env().m3 || !env().gateup || env().act_tok || env().transient) return false;
+    const ggml_tensor * g0 = gate->src[0], * u0 = up->src[0], * src1 = gate->src[1];
+    if (gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT || up->src[1] != src1 || g0->type != u0->type ||
+        (g0->type != GGML_TYPE_Q2_0 && g0->type != GGML_TYPE_Q1_0) || g0->ne[0] != u0->ne[0] || g0->ne[1] != u0->ne[1] ||
+        g0->nb[1] != u0->nb[1] || g0->data == u0->data || src1->ne[1] < env().min_n || !n1_hada_act(src1) ||
+        !n1_shape_ok(g0, src1, gate) || !n1_shape_ok(u0, src1, up) || n1_use_row(g0) || n1_use_row(u0)) {
+        return false;
+    }
+    const void * w = nullptr, * sw = nullptr;
+    if (nk_dual_weight(g0, &w, &sw) || nk_dual_weight(u0, &w, &sw)) return false;
+    const int F = (int) g0->ne[1], K = (int) g0->ne[0], N = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
+    if (glu->op != GGML_OP_GLU || glu->src[0] != gate || glu->src[1] != up || glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) ||
+        glu->ne[0] != F || ggml_nelements(glu) != (int64_t) F * N || gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const n1_gu * gu = get_gu(g0, u0);
+    if (!gu) return false;
+    const int Npad = (N + N1_BT - 1) / N1_BT * N1_BT;
+    hipStream_t st = ctx.stream();
+    const size_t nbytes   = n1_act_bytes(K, N);
+    const int    mask     = ggml_cuda_act_fuse_mask();
+    const ggml_tensor * hb = n1_hada_base(src1);   // the cache is keyed on the FWHT MUL_MAT node
+    const bool   act_hit  = mask && ctx.act_cache_tensor == hb && ctx.act_cache_buf &&
+        ctx.act_cache_layout == GGML_CUDA_ACT_LAYOUT_N1TOK && ctx.act_cache_bytes == nbytes;
+    const bool   act_cache = act_hit || (mask & GGML_ACT_FUSE_DEDUP);
+    GGML_ASSERT(ctx.act_pending != src1 && "N1 gateup: pending GLU consumer");
+    GGML_ASSERT((act_hit || ctx.act_nofp32 != hb) && "N1 gateup: FWHT fp32 output was skipped but the cache missed");
+    act_hit ? g_stats.act_hit++ : g_stats.act_miss++;
+    if (act_hit) g_stats.m3_hit++;
+    ggml_cuda_pool_alloc<char> local(ctx.pool(), act_cache ? 0 : nbytes);
+    if (act_cache && !act_hit) {
+        ctx.act_cache_buf.reset();
+        ctx.act_cache_buf    = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes);
+        ctx.act_cache_tensor = hb;
+        ctx.act_cache_layout = GGML_CUDA_ACT_LAYOUT_N1TOK;
+        ctx.act_cache_bytes  = nbytes;
+    }
+    char * buf = act_cache ? ctx.act_cache_buf->get() : local.get();
+    int8_t * X  = (int8_t *) buf;
+    float  * sx = (float *) (buf + (size_t) Npad * K);
+    if (!act_hit) {
+        k_n1_quant_act<<<dim3(1, Npad), 256, 0, st>>>((const char *) src1->data, src1->nb[1], N, K, K, Npad, X, sx);
+    }
+    launch_m3(X, gu->w.w, &gu->fold, sx, (float *) glu->data, N, Npad, 2 * F, K, F, st, true);
+    g_stats.mm_gu++;
+    g_stats.mm_n1 += 2; g_stats.fl_n1 += 2 * mm_flops(g0, src1);
+    g_stats.mm_m3 += 2; g_stats.fl_m3 += 2 * mm_flops(g0, src1);
+    CUDA_CHECK(hipGetLastError());
+    return true;
 }
 
 void ggml_cuda_n1_count(const ggml_tensor * src0, const ggml_tensor * src1) {
@@ -962,6 +1108,8 @@ void ggml_cuda_n1_act_ref_quant(const float * x, int64_t s11, int64_t K, int64_t
 
 bool ggml_cuda_n1_enabled() { return false; }
 bool ggml_cuda_n1_m3_ready(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }
+bool ggml_cuda_n1_gateup_enabled() { return false; }
+bool ggml_cuda_n1_gateup(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }
 void ggml_cuda_n1_count(const ggml_tensor *, const ggml_tensor *) {}
 bool ggml_cuda_n1_mul_mat(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { return false; }
 bool ggml_cuda_n1_mul_mat_w2only(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { return false; }

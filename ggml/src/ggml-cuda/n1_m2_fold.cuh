@@ -13,6 +13,7 @@
 // T422 M2: engine copy of native-kernels/dense_wmma/m2/m2_fold.cuh (gemm_fold); routed by GGML_N1_M2=1.
 #pragma once
 #include "n1_m2_gemm.cuh"
+#include "unary.cuh"
 
 // Expert scheduling mode (-mllvm -amdgpu-expert-scheduling-mode): the compiler emits s_wait_alu depctr waits for its
 // own instructions only; with inline-asm loads/stores every kernel lost exactness (M2 jobs 27, 36: a vm_vsrc wait after
@@ -45,6 +46,7 @@ constexpr int FF8 = 1 << 11, FT4 = 1 << 12;
 constexpr int ABCV = 1 << 13, ABCM = 1 << 14, ABCS = 1 << 15;   // commit sub-ablations: no widen VALU (raw dword splat), no m u8 loads, no ds_store (which also kills the widen)
 constexpr int LDSA = 1 << 28;  // T435: W fragments read by inline-asm ds_load_b128, ONE s_wait_dscnt per k-block (the compiler emits one per fragment)
 constexpr int PRW = 1 << 8;   // T440 (GGML_N1_M3_FEED=3): s_setprio 2 around each k-block's WMMA burst (the burst-issuing wave wins the SIMD; widen/loads of the sibling waves fill its gaps)
+constexpr int GLUE = 1 << 22;    // T486 (ONEACC only): merged gate/up weight rows (16-row gate block, then the matching 16-row up block); epilogue writes silu(gate) * up, F/2 features, ldy = the GLU row stride
 constexpr int ONEACC = 1 << 27;  // T434 variant bit: ONE int32 accumulation over the whole K (RS = 1), epilogue acc * sx[t] * S_f; no in-loop rescale
 constexpr int BCARRY = 1 << 24;   // T424 variant bit: bias-carry rescale (GGML_N1_M2=2); the low bits tag K (K / 1024 << 3)
 
@@ -78,6 +80,8 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
     static_assert(RS >= SEGS || RS == 1, "a stage may not split... RS < SEGS handled per segment");
     constexpr bool kLpf = V & LPF, kBc = V & BCARRY, kOne = V & ONEACC, kLa = V & LDSA;
     constexpr bool kPrw = V & PRW;
+    constexpr bool kGlu = V & GLUE;
+    static_assert(!kGlu || (kOne && FF % 2 == 0), "GLUE: ONEACC epilogue with gate/up block pairs");
     constexpr bool kAbX = V & ABX, kAbW = V & ABW, kAbC = V & ABC, kAbB = V & ABB, kAbCV = V & ABCV, kAbCM = V & ABCM, kAbCS = V & ABCS;
     static_assert(!kOne || RS == 1, "ONEACC: per-token scale, no rescale groups");
     constexpr int U = (RS > SEGS) ? RS / SEGS : 1;   // stages unrolled per loop iteration
@@ -341,6 +345,35 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
 #undef LDSLOAD
 
     if (!tok_ok) return;
+    if constexpr (kGlu) {
+        // T486: block pair (2jp, 2jp+1) = the same 16 features of gate and up (merged rows 32q + 16s + r); the outputs are
+        // computed with the unfused expressions ((acc * sx) * S_f per matrix, then the swiglu_split kernel's silu(g) * u)
+#pragma unroll
+        for (int jp = 0; jp < FF / 2; ++jp) {
+            const int fg = fea0 + 32 * jp + 8 * (lane >> 4);
+            const int fo = (fea0 >> 1) + 16 * jp + 8 * (lane >> 4);
+            const float4 g0 = *(const float4*)(rowS + fg), g1 = *(const float4*)(rowS + fg + 4);
+            const float4 u0 = *(const float4*)(rowS + fg + 16), u1 = *(const float4*)(rowS + fg + 20);
+            const float rg[8] = {g0.x, g0.y, g0.z, g0.w, g1.x, g1.y, g1.z, g1.w};
+            const float ru[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+#pragma unroll
+            for (int i = 0; i < FT; ++i) {
+                const int t = tok0 + i * 16 + (lane & 15);
+                if (t >= Ntok) continue;
+                float o[8];
+#pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    const float g = ((float) acc[i][2 * jp][l] * sxa[i]) * rg[l];
+                    const float u = ((float) acc[i][2 * jp + 1][l] * sxa[i]) * ru[l];
+                    o[l] = ggml_cuda_op_silu_single(g) * u;
+                }
+                float4* yp = (float4*)(Y + (size_t)t * ldy + fo);
+                yp[0] = make_float4(o[0], o[1], o[2], o[3]);
+                yp[1] = make_float4(o[4], o[5], o[6], o[7]);
+            }
+        }
+        return;
+    }
 #pragma unroll
     for (int j = 0; j < FF; ++j) {
         const int f0 = fea0 + 16 * j + 8 * (lane >> 4);
