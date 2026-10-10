@@ -10057,7 +10057,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
-    // T405 chunked prefill path (GGML_GDN_CHUNK=1: S_v=128, scalar gate, K=1, n_tokens >= 64)
+    // T405 chunked prefill path (default on, GGML_GDN_CHUNK=0 off: S_v=128, scalar gate, K=1, n_tokens >= 64)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,   64, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,   65, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  200, 2));

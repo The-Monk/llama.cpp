@@ -1,4 +1,4 @@
-// T405: chunked gated delta rule for prefill (GGML_GDN_CHUNK=1, default off).
+// T405: chunked gated delta rule for prefill (default on; GGML_GDN_CHUNK=0 disables).
 // Scalar gate, S_v == 128, RDNA4 WMMA. Writes the final state only; with K > 1 snapshots the caller runs
 // it over the first n_tokens - K tokens and the sequential kernel over the tail. Included by gated_delta_net.cu.
 //
@@ -507,11 +507,12 @@ gdn_chunk_scan(const float * q, const float * k, const float * v, const float * 
 #endif
 }
 
-// GGML_GDN_CHUNK=1 enables the chunked path for n_tokens >= GGML_GDN_CHUNK_MIN (default 64).
-// Read per call (a few dozen calls per ubatch) so a process can A/B both paths.
+// The chunked path is on by default (T405 phase 4) for n_tokens >= GGML_GDN_CHUNK_MIN (default 64);
+// GGML_GDN_CHUNK=0 restores the sequential kernel. Read per call (a few dozen calls per ubatch) so a
+// process can A/B both paths.
 static int gdn_chunk_min_tokens() {
     const char * e = getenv("GGML_GDN_CHUNK");
-    if (e == nullptr || atoi(e) == 0) {
+    if (e != nullptr && atoi(e) == 0) {
         return -1;
     }
     const char * m = getenv("GGML_GDN_CHUNK_MIN");

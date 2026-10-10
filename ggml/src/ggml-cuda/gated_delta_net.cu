@@ -438,7 +438,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
-    // T405: chunked WMMA prefill path (GGML_GDN_CHUNK=1, default off; scalar gate)
+    // T405: chunked WMMA prefill path (default on, GGML_GDN_CHUNK=0 disables; scalar gate)
     if (!kda && !keep_rs &&
             gdn_chunk_launch(ctx, stream, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_tokens, n_seqs, neqk1, rq3, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, scale,
