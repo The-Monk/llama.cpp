@@ -18,11 +18,14 @@ static __device__ __forceinline__ size_t n1_off(int r, int k, int S) {
 // multiply compiles the same way everywhere.
 static __device__ __forceinline__ float n1_scale(const float amax) { return amax * (1.0f / 127.0f); }
 
+// T434: the scalar quantizer behind n1_quant4, so a producer that holds one value per lane (fwht_quant_n1t) runs the very same
+// instructions as the 4-wide form (they differed in ~7e-7 of bytes when each kernel got its own roundf/reciprocal expansion)
+static __device__ __forceinline__ float n1_recip(const float d) { return 1.0f / d; }
+static __device__ __forceinline__ uint32_t n1_q1(const float v, const float id) { return (uint32_t) (uint8_t) (int8_t) (int) roundf(v * id); }
+
 static __device__ __forceinline__ uint32_t n1_quant4(const float4 v, const float d) {
-    const float id = 1.0f / d;
-    const int q0 = (int) roundf(v.x * id), q1 = (int) roundf(v.y * id), q2 = (int) roundf(v.z * id), q3 = (int) roundf(v.w * id);
-    return (uint32_t) (uint8_t) (int8_t) q0 | ((uint32_t) (uint8_t) (int8_t) q1 << 8) |
-           ((uint32_t) (uint8_t) (int8_t) q2 << 16) | ((uint32_t) (uint8_t) (int8_t) q3 << 24);
+    const float id = n1_recip(d);
+    return n1_q1(v.x, id) | (n1_q1(v.y, id) << 8) | (n1_q1(v.z, id) << 16) | (n1_q1(v.w, id) << 24);
 }
 
 static inline int64_t n1_npad(int64_t n) { return (n + 127) / 128 * 128; }

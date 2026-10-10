@@ -8,5 +8,6 @@ bool ggml_cuda_op_fwht_signed(ggml_backend_cuda_context & ctx, const ggml_tensor
 // T434 M3: the signed FWHT (1024 blocks) fused with the per-token int8 quantize of the N1 layout. `y` is the N1TOK act
 // buffer (int8 X tiles then fp32 sx[token]); `ntok` tokens of x->ne[0] columns. When write_fp32 is false dst is not
 // written. Returns false (nothing launched) for an unsupported shape.
-bool ggml_cuda_op_fwht_signed_quant_n1t(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
+// up != nullptr: the FWHT input is silu(src) * up (a swiglu_split node fused in; src = gate), rows 2D with their own strides.
+bool ggml_cuda_op_fwht_signed_quant_n1t(ggml_backend_cuda_context & ctx, const ggml_tensor * src, const ggml_tensor * up,
                                         const ggml_tensor * signs, ggml_tensor * dst, bool write_fp32, void * y);

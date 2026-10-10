@@ -2040,6 +2040,7 @@ struct ggml_backend_cuda_context {
     // T434: a Hadamard FWHT node whose fp32 output was NOT written (all its consumers are one-GEMM N1 matmuls reading the
     // N1TOK cache entry); a consumer that cannot take the cache must abort rather than read stale memory
     const ggml_tensor * act_nofp32 = nullptr;
+    uint64_t act_eval_gen = 0;   // bumped at the start of every graph evaluation (per-evaluation caches key on it)
     int64_t act_stat_hit = 0, act_stat_miss = 0, act_stat_glu = 0, act_stat_norm = 0, act_stat_norm_add = 0;
     int64_t act_stat_verify_bytes = 0, act_stat_verify_diff = 0;
 

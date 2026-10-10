@@ -1,9 +1,46 @@
 #include "common.cuh"
 #include "fwht.cuh"
 #include "n1_act.cuh"
+#include "unary.cuh"
 
 #include <climits>
 #include <cstdlib>
+
+// The butterfly network, shared by fwht_cuda and fwht_quant_n1t (T434). Under -funsafe-math-optimizations the compiler may
+// reassociate or contract these adds differently in every kernel it is inlined into (the fused producer's rotated fp32
+// differed from the standalone kernel's in ~13% of bytes); one strict-IEEE body makes both produce the same values.
+template <int N, int WS>
+static __device__ __forceinline__ void fwht_net(float (&reg)[N / WS], const int lane) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+    constexpr int el_w = N / WS;
+#pragma unroll
+    for (int h = 1; h < WS; h *= 2) {
+#pragma unroll
+        for (int j = 0; j < el_w; j++) {
+            const float val  = reg[j];
+            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, WS);
+
+            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+        }
+    }
+
+#pragma unroll
+    for (int h = WS; h < N; h *= 2) {
+        const int step = h / WS;
+#pragma unroll
+        for (int j = 0; j < el_w; j += 2 * step) {
+#pragma unroll
+            for (int k = 0; k < step; k++) {
+                const float x = reg[j + k];
+                const float y = reg[j + k + step];
+
+                reg[j + k]        = x + y;
+                reg[j + k + step] = x - y;
+            }
+        }
+    }
+}
 
 template <int N, bool has_signs = false>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
@@ -40,32 +77,7 @@ __global__ void fwht_cuda(const float * src, float * dst, const int64_t n_rows, 
         reg[i] = v;
     }
 
-#pragma unroll
-    for (int h = 1; h < warp_size; h *= 2) {
-#pragma unroll
-        for (int j = 0; j < el_w; j++) {
-            const float val  = reg[j];
-            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
-
-            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
-        }
-    }
-
-#pragma unroll
-    for (int h = warp_size; h < N; h *= 2) {
-        const int step = h / warp_size;
-#pragma unroll
-        for (int j = 0; j < el_w; j += 2 * step) {
-#pragma unroll
-            for (int k = 0; k < step; k++) {
-                const float x = reg[j + k];
-                const float y = reg[j + k + step];
-
-                reg[j + k]        = x + y;
-                reg[j + k + step] = x - y;
-            }
-        }
-    }
+    fwht_net<N, warp_size>(reg, lane);
 
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
@@ -78,9 +90,12 @@ __global__ void fwht_cuda(const float * src, float * dst, const int64_t n_rows, 
 // registers until the token's amax (block reduce) is known, then are quantized exactly like k_n1_quant_act (G = K): d =
 // amax/127, q = roundf(v / d); sx[token] = d. The int8 bytes are staged through LDS so every lane stores 4 contiguous
 // bytes (u32) at n1_off. write_fp32: also store the rotated fp32 (the unfused FWHT output) for consumers that need it.
-template <bool write_fp32>
+// glu: the FWHT input is silu(src) * up (a swiglu_split node whose only consumer is this transform), read straight from the
+// gate (src) and up tensors with row strides s_src / s_up (elements); the same float expression as the GLU producers.
+template <bool write_fp32, bool glu>
 __launch_bounds__(1024, 1)
-__global__ void fwht_quant_n1t(const float * __restrict__ src, float * __restrict__ dst, const float scale,
+__global__ void fwht_quant_n1t(const float * __restrict__ src, const float * __restrict__ up, const int64_t s_src, const int64_t s_up,
+                               float * __restrict__ dst, const float scale,
                                const float * __restrict__ signs, int8_t * __restrict__ X, float * __restrict__ sx,
                                const int S) {
     constexpr int N = 1024, warp_size = 32, el_w = N / warp_size;
@@ -90,40 +105,24 @@ __global__ void fwht_quant_n1t(const float * __restrict__ src, float * __restric
     float  * red = (float *) smem;
     int8_t * qs  = (int8_t *) (smem + 128);
 
-    const float * s  = src + (size_t) tok * K + (size_t) w * N;
+    const float * s  = src + (size_t) tok * s_src + (size_t) w * N;
+    const float * u  = glu ? up + (size_t) tok * s_up + (size_t) w * N : nullptr;
     const float * sg = signs + (size_t) w * N;
     float reg[el_w];
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
         const int idx = i * warp_size + lane;
-        float v = s[idx] * scale;
+        float v = glu ? ggml_cuda_op_silu_single(s[idx]) * u[idx] : s[idx];
+        v *= scale;
         v *= sg[idx];
         reg[i] = v;
     }
+    fwht_net<N, warp_size>(reg, lane);
 #pragma unroll
-    for (int h = 1; h < warp_size; h *= 2) {
-#pragma unroll
-        for (int j = 0; j < el_w; j++) {
-            const float val  = reg[j];
-            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
-            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
-        }
+    for (int i = 0; i < el_w; ++i) {
+        asm volatile("" : "+v"(reg[i]));   // the rotated value is a rounded fp32 from here on (as when the unfused kernel stores it)
     }
-#pragma unroll
-    for (int h = warp_size; h < N; h *= 2) {
-        const int step = h / warp_size;
-#pragma unroll
-        for (int j = 0; j < el_w; j += 2 * step) {
-#pragma unroll
-            for (int k = 0; k < step; k++) {
-                const float x = reg[j + k];
-                const float y = reg[j + k + step];
-                reg[j + k]        = x + y;
-                reg[j + k + step] = x - y;
-            }
-        }
-    }
-    if (write_fp32) {
+    if (write_fp32) {   // dst is the FWHT node: contiguous rows of K
         float * d = dst + (size_t) tok * K + (size_t) w * N;
 #pragma unroll
         for (int i = 0; i < el_w; ++i) {
@@ -148,13 +147,13 @@ __global__ void fwht_quant_n1t(const float * __restrict__ src, float * __restric
         amax = fmaxf(amax, red[i]);
     }
     const float d  = n1_scale(amax);
-    const float id = d > 0.f ? 1.0f / d : 0.f;
+    const float id = n1_recip(d);   // d == 0 (an all-zero token): the quantized bytes are forced to 0 below
     if (w == 0 && lane == 0) {
         sx[tok] = d;
     }
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
-        qs[w * N + i * warp_size + lane] = (int8_t) (d > 0.f ? (int) roundf(reg[i] * id) : 0);
+        qs[w * N + i * warp_size + lane] = (int8_t) (d > 0.f ? (uint8_t) n1_q1(reg[i], id) : 0);
     }
     __syncthreads();
 #pragma unroll
@@ -276,10 +275,17 @@ bool ggml_cuda_op_fwht_signed(ggml_backend_cuda_context & ctx, const ggml_tensor
     return fwht_dispatch(ctx, src, dst, signs);
 }
 
-bool ggml_cuda_op_fwht_signed_quant_n1t(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
+bool ggml_cuda_op_fwht_signed_quant_n1t(ggml_backend_cuda_context & ctx, const ggml_tensor * src, const ggml_tensor * up,
                                         const ggml_tensor * signs, ggml_tensor * dst, bool write_fp32, void * y) {
-    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || !ggml_is_contiguous(signs) ||
+    const bool glu = up != nullptr;
+    if (!ggml_is_contiguous(dst) || !ggml_is_contiguous(signs) ||
         src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || signs->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (glu ? (!ggml_is_contiguous_1(src) || !ggml_is_contiguous_1(up) || up->type != GGML_TYPE_F32 ||
+               src->nb[0] != sizeof(float) || up->nb[0] != sizeof(float) || !ggml_are_same_shape(src, up) ||
+               ggml_nrows(src) != src->ne[1])
+            : !ggml_is_contiguous(src)) {
         return false;
     }
     const int64_t K = src->ne[0];
@@ -290,6 +296,8 @@ bool ggml_cuda_op_fwht_signed_quant_n1t(ggml_backend_cuda_context & ctx, const g
     if (ggml_nelements(dst) != ntok * K || ntok > (1 << 20)) {
         return false;
     }
+    const int64_t s_src = glu ? (int64_t) (src->nb[1] / sizeof(float)) : K;
+    const int64_t s_up  = glu ? (int64_t) (up->nb[1] / sizeof(float)) : K;
     const int nblk = (int) (K / 1024);
     const int64_t Npad = n1_npad(ntok);
     int8_t * X  = (int8_t *) y;
@@ -299,12 +307,17 @@ bool ggml_cuda_op_fwht_signed_quant_n1t(ggml_backend_cuda_context & ctx, const g
     const size_t shmem = 128 + (size_t) nblk * 1024;
     const ggml_cuda_kernel_launch_params lp(grid, block, shmem, ctx.stream());
     const float scale = 1 / sqrtf(1024.f);
-    if (write_fp32) {
-        ggml_cuda_kernel_launch(fwht_quant_n1t<true>, lp, (const float *) src->data, (float *) dst->data, scale,
-                                (const float *) signs->data, X, sx, (int) (K / 128));
+    const float * a = (const float *) src->data;
+    const float * b = glu ? (const float *) up->data : a;
+    float *       d = (float *) dst->data;
+    const float * g = (const float *) signs->data;
+    const int     S = (int) (K / 128);
+#define FQ(WF, GL) ggml_cuda_kernel_launch(fwht_quant_n1t<WF, GL>, lp, a, b, s_src, s_up, d, scale, g, X, sx, S)
+    if (glu) {
+        if (write_fp32) FQ(true, true); else FQ(false, true);
     } else {
-        ggml_cuda_kernel_launch(fwht_quant_n1t<false>, lp, (const float *) src->data, (float *) dst->data, scale,
-                                (const float *) signs->data, X, sx, (int) (K / 128));
+        if (write_fp32) FQ(true, false); else FQ(false, false);
     }
+#undef FQ
     return true;
 }

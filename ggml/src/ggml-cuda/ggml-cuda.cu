@@ -31,6 +31,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include <chrono>
 #include "ggml-cuda/act-fuse.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvf_qk.cuh"
@@ -4274,8 +4275,8 @@ static int ggml_cuda_find_sc_group(const ggml_cgraph * cgraph, int i, ggml_tenso
 }
 
 // T434 M3: defined with the act-fuse helpers below
-static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i,
-        const ggml_tensor * x, const ggml_tensor * signs, ggml_tensor * mm);
+static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, int off,
+        const ggml_tensor * x, const ggml_tensor * up, const ggml_tensor * signs, ggml_tensor * mm);
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4376,6 +4377,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // T434 M3: swiglu_split -> sign flip -> reshape -> FWHT-hint matmul (the ffn_down input of a Hadamard model): the GLU is
+    // evaluated inside the transform's load (its fp32 output has no other consumer and is never written)
+    if (ggml_cuda_n1_enabled() && cgraph->nodes[i]->op == GGML_OP_GLU && ggml_get_glu_op(cgraph->nodes[i]) == GGML_GLU_OP_SWIGLU &&
+        i + 3 < cgraph->n_nodes &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 3 })) {
+        const ggml_tensor * glu     = cgraph->nodes[i];
+        const ggml_tensor * mul     = cgraph->nodes[i + 1];
+        const ggml_tensor * reshape = cgraph->nodes[i + 2];
+        ggml_tensor *       mm      = cgraph->nodes[i + 3];
+        const ggml_tensor * signs   = mul->src[1];
+        const bool pattern_ok = glu->src[1] && ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+            mm->src[1] == reshape && reshape->src[0] == mul && mul->src[0] == glu &&
+            signs->ne[1] == 1 && signs->ne[2] == 1 && signs->ne[3] == 1 && signs->type == GGML_TYPE_F32 &&
+            glu->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && ggml_is_contiguous(signs) &&
+            signs->ne[0] == glu->ne[0] && signs->ne[0] % mm->src[0]->ne[0] == 0 &&
+            ggml_node_get_use_count(cgraph, i) == 1 && !(glu->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_is_contiguous(glu);
+        if (pattern_ok && ggml_cuda_m3_fwht_quant(cuda_ctx, cgraph, i, 1, glu->src[0], glu->src[1], signs, mm)) {
+            return 3;
+        }
+    }
+
     // prism.hadamard sign flip + reshape + FWHT-hint matmul: apply the sign vector during
     // the transform's load instead of as a separate full pass over the activation. Saves a
     // kernel launch (~2.6 us on gfx1201) and a read/write round trip per folded matmul --
@@ -4399,7 +4421,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             signs->ne[0] == x->ne[0] && signs->ne[0] % mm->src[0]->ne[0] == 0;
 
         // T434: GGML_N1_M3 consumers read the FWHT output through the per-token int8 N1 layout: quantize in the same kernel
-        if (pattern_ok && ggml_cuda_m3_fwht_quant(cuda_ctx, cgraph, i, x, signs, mm)) {
+        if (pattern_ok && ggml_cuda_m3_fwht_quant(cuda_ctx, cgraph, i, 0, x, nullptr, signs, mm)) {
             return 2;
         }
         if (pattern_ok && ggml_cuda_op_fwht_signed(*cuda_ctx, x, signs, mm)) {
@@ -5178,6 +5200,11 @@ static void ggml_cuda_act_cache_set(ggml_backend_cuda_context * ctx, const ggml_
     if (n1) {
         // producers write rows < N only: zero the last (padded) token tile of X and all of sx, as the N1
         // quantizer does (padded rows never reach dst, this keeps the buffer equal to the unfused one)
+        if (layout == GGML_CUDA_ACT_LAYOUT_N1TOK) {
+            // T434: the one-GEMM kernel never stores the padded token rows (t >= N), so their X bytes and scales are never read
+            // into a result: no pad zeroing (2 memset launches per FWHT producer)
+            return;
+        }
         const int64_t K = t->ne[0], N = ggml_nrows(t), Npad = (N + 127) / 128 * 128;
         // [TAG_PREFILL_GAPS] T408: with N % 128 == 0 (and K % 128 == 0, required by the N1 layout) there is no
         // padding: the producer writes every X byte and every sx[s*Npad + t], so both memsets are dead stores.
@@ -5396,8 +5423,9 @@ static int ggml_cuda_act_try_fuse(ggml_backend_cuda_context * ctx, ggml_cgraph *
 // matmuls through a RESHAPE view `rs`. Run the signed FWHT fused with the per-token quantize into the N1TOK act cache (keyed
 // on `mm`). The fp32 FWHT output is skipped only when EVERY use of the activation is a one-GEMM matmul that reads the cache
 // and those matmuls directly follow the producer (the cache is a single slot); otherwise it is written as before.
-static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i,
-        const ggml_tensor * x, const ggml_tensor * signs, ggml_tensor * mm) {
+// off = 1 with `up` set: the pattern starts one node earlier with the swiglu_split GLU (x = gate, up = up).
+static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, int off,
+        const ggml_tensor * x, const ggml_tensor * up, const ggml_tensor * signs, ggml_tensor * mm) {
     static const bool fuse_on = [] {
         const char * m3 = getenv("GGML_N1_M3"), * e = getenv("GGML_N1_M3_FUSE");
         return m3 && strcmp(m3, "1") == 0 && !(e && atoi(e) == 0);
@@ -5406,26 +5434,50 @@ static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph
         (mm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return false;
     }
-    const int n = cgraph->n_nodes;
+    // use lists of this graph evaluation (tensor -> indices of the nodes that read it, one entry per src slot), built once per
+    // evaluation: the per-site forward scans cost ~10 ms of host time per 1024-token graph at 257 sites
+    static thread_local struct { uint64_t gen = ~0ull; const ggml_cgraph * cg = nullptr; std::unordered_map<const ggml_tensor *, std::vector<int>> users; } ug;
+    if (ug.gen != ctx->act_eval_gen || ug.cg != cgraph) {
+        ug.gen = ctx->act_eval_gen; ug.cg = cgraph; ug.users.clear();
+        ug.users.reserve(cgraph->n_nodes * 2);
+        for (int j = 0; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * nd = cgraph->nodes[j];
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                if (nd->src[k]) {
+                    ug.users[nd->src[k]].push_back(j);
+                }
+            }
+        }
+    }
+    const auto find_users = [&](const ggml_tensor * t) -> const std::vector<int> & {
+        static const std::vector<int> none;
+        const auto it = ug.users.find(t);
+        return it == ug.users.end() ? none : it->second;
+    };
+    const std::vector<int> & mm_users = find_users(mm);
     int jrs = -1;
-    for (int j = i + 3; j < n; ++j) {
+    for (const int j : mm_users) {
         const ggml_tensor * nd = cgraph->nodes[j];
-        if (nd->op == GGML_OP_RESHAPE && nd->src[0] == mm) { jrs = j; break; }
+        if (j >= i + 3 + off && nd->op == GGML_OP_RESHAPE && nd->src[0] == mm) { jrs = j; break; }
     }
     if (jrs < 0) {
         return false;
     }
     const ggml_tensor * rs = cgraph->nodes[jrs];
     int n_ready = 0, n_rs_uses = 0, n_mm_other = 0, last_ready = -1;
-    for (int j = i + 3; j < n; ++j) {
-        const ggml_tensor * nd = cgraph->nodes[j];
-        for (int k = 0; k < GGML_MAX_SRC; ++k) {
-            if (nd->src[k] == rs) {
-                n_rs_uses++;
-            } else if (nd->src[k] == mm && nd != rs) {
-                n_mm_other++;
-            }
+    for (const int j : mm_users) {
+        if (j != jrs) {
+            n_mm_other++;
         }
+    }
+    int prev_j = -1;
+    for (const int j : find_users(rs)) {
+        n_rs_uses++;
+        if (j == prev_j) {
+            continue;   // the same node reading rs through two src slots
+        }
+        prev_j = j;
+        const ggml_tensor * nd = cgraph->nodes[j];
         if (nd->op == GGML_OP_MUL_MAT && nd->src[1] == rs && (nd->flags & GGML_TENSOR_FLAG_COMPUTE) &&
             ggml_cuda_n1_m3_ready(nd->src[0], rs, nd)) {
             n_ready++;
@@ -5437,50 +5489,103 @@ static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph
     }
     // no fp32 needed iff every use is a one-GEMM consumer and they run back to back (views and those matmuls only)
     bool skip_fp32 = n_ready == n_rs_uses && n_mm_other == 0 && !(rs->flags & GGML_TENSOR_FLAG_OUTPUT);
-    for (int j = i + 3; skip_fp32 && j <= last_ready; ++j) {
+    for (int j = i + 3 + off; skip_fp32 && j <= last_ready; ++j) {
         const ggml_tensor * nd = cgraph->nodes[j];
         if (!ggml_cuda_is_view_or_noop(nd) && !(nd->op == GGML_OP_MUL_MAT && nd->src[1] == rs)) {
             skip_fp32 = false;
         }
     }
+    struct glu_stats {
+        int64_t fused = 0, rejected = 0;
+        ~glu_stats() { if (getenv("GGML_N1_STATS") && (fused || rejected)) fprintf(stderr, "[N1] stats: m3 glu-fused FWHT producers %lld, rejected for gate/up aliasing %lld\n", (long long) fused, (long long) rejected); }
+    };
+    static glu_stats gs;
+    static const bool glu_on = [] { const char * e = getenv("GGML_N1_M3_GLU"); return !(e && atoi(e) == 0); }();   // A/B: 0 keeps the GLU a separate node
+    if (up && !glu_on) {
+        return false;
+    }
+    if (up && !skip_fp32 && (ggml_cuda_act_overlaps(mm, x) || ggml_cuda_act_overlaps(mm, up))) {
+        // GLU variant: the allocator may have placed the FWHT output over the (dead) gate/up buffers, which the unfused graph
+        // had already consumed; the fused kernel would write fp32 rows while other tokens' gate/up rows are still to be read
+        gs.rejected++;
+        return false;
+    }
+    if (up) gs.fused++;
     const int cc = ggml_cuda_info().devices[ctx->device].cc;
     ggml_cuda_act_cache_set(ctx, rs, GGML_CUDA_ACT_LAYOUT_N1TOK, cc);
     static const bool verify = getenv("GGML_N1_M3_VERIFY") != nullptr;   // gate only: syncs (run with GGML_CUDA_DISABLE_GRAPHS=1)
-    if (!ggml_cuda_op_fwht_signed_quant_n1t(*ctx, x, signs, mm, verify || !skip_fp32, ctx->act_cache_buf->get())) {
+    // VERIFY reference, computed BEFORE the fused kernel (mm may alias the transform's input in the graph allocator): the
+    // unfused swiglu (GLU variant) -> signed FWHT kernel -> per-token quantizer, all into scratch buffers
+    const size_t nbf = ggml_nbytes(mm), bytes = ctx->act_cache_bytes;
+    ggml_cuda_pool_alloc<char> reff(ctx->pool()), ref(ctx->pool()), ref2(ctx->pool()), glub(ctx->pool());
+    if (verify) {
+        reff.alloc(nbf); ref.alloc(bytes); ref2.alloc(bytes);
+        ggml_tensor tmp = *mm;
+        tmp.data = reff.get();
+        const ggml_tensor * xr = x;
+        ggml_tensor glut;
+        if (up) {
+            glut = *cgraph->nodes[i];
+            glub.alloc(ggml_nbytes(&glut));
+            glut.data = glub.get();
+            ggml_cuda_op_swiglu(*ctx, &glut);
+            xr = &glut;
+        }
+        ggml_cuda_op_fwht_signed(*ctx, xr, signs, &tmp);
+        CUDA_CHECK(cudaMemsetAsync(ref.get(), 0, bytes, ctx->stream()));
+        CUDA_CHECK(cudaMemsetAsync(ref2.get(), 0, bytes, ctx->stream()));
+        ggml_cuda_n1_act_ref_quant_tok((const float *) reff.get(), rs->ne[0], rs->ne[0], ggml_nrows(rs), ref.get(), ctx->stream());
+    }
+    // the GLU variant under VERIFY keeps its fp32 output off (mm may alias gate/up): only its int8 bytes are compared
+    const bool write_fp32 = !skip_fp32 || (verify && !up);
+    if (!ggml_cuda_op_fwht_signed_quant_n1t(*ctx, x, up, signs, mm, write_fp32, ctx->act_cache_buf->get())) {
         ctx->act_cache_tensor = nullptr;
         ctx->act_cache_buf.reset();
         return false;
     }
     CUDA_CHECK(cudaGetLastError());
     if (verify) {
-        // (a) the fused kernel's fp32 rotation vs the unfused FWHT kernel, (b) its int8 bytes vs the unfused per-token quantizer
-        // run on the UNFUSED kernel's fp32, (c) the same quantizer run on the fused kernel's own fp32 (isolates the quantize)
+        // (a) the fused kernel's fp32 rotation vs the unfused FWHT kernel (not for the GLU variant), (b) its int8 bytes vs the unfused
+        // per-token quantizer run on the UNFUSED kernel's fp32, (c) the same quantizer run on the fused kernel's own fp32 (isolates
+        // the quantize; not for the GLU variant)
         struct totals {
-            int64_t n = 0, df = 0, bf = 0, dq = 0, dq2 = 0, bq = 0;
+            int64_t n = 0, ng = 0, df = 0, bf = 0, dq = 0, dqg = 0, dq2 = 0, bq = 0, bqg = 0;
             ~totals() {
-                fprintf(stderr, "[N1] M3 VERIFY: %lld fused producers; fp32 FWHT bytes differ %lld / %lld; int8+scale bytes differ vs unfused-fp32 quantize %lld, "
-                        "vs quantize of the fused kernel's own fp32 %lld (of %lld)\n", (long long) n, (long long) df, (long long) bf, (long long) dq,
-                        (long long) dq2, (long long) bq);
+                fprintf(stderr, "[N1] M3 VERIFY: %lld plain producers: fp32 FWHT bytes differ %lld / %lld, int8+scale bytes differ vs unfused %lld / %lld, vs quantize of "
+                        "the fused kernel's own fp32 %lld; %lld GLU-fused producers: int8+scale bytes differ vs unfused swiglu+FWHT+quantize %lld / %lld\n",
+                        (long long) n, (long long) df, (long long) bf, (long long) dq, (long long) bq, (long long) dq2, (long long) ng, (long long) dqg,
+                        (long long) bqg);
             }
         };
         static totals t;
-        const size_t nbf = ggml_nbytes(mm), bytes = ctx->act_cache_bytes;
-        ggml_cuda_pool_alloc<char> reff(ctx->pool(), nbf), ref(ctx->pool(), bytes), ref2(ctx->pool(), bytes);
-        ggml_tensor tmp = *mm;
-        tmp.data = reff.get();
-        ggml_cuda_op_fwht_signed(*ctx, x, signs, &tmp);   // the unfused reference fp32 into a scratch buffer
-        CUDA_CHECK(cudaMemsetAsync(ref.get(), 0, bytes, ctx->stream()));
-        CUDA_CHECK(cudaMemsetAsync(ref2.get(), 0, bytes, ctx->stream()));
-        ggml_cuda_n1_act_ref_quant_tok((const float *) reff.get(), rs->ne[0], rs->ne[0], ggml_nrows(rs), ref.get(), ctx->stream());
-        ggml_cuda_n1_act_ref_quant_tok((const float *) mm->data, rs->ne[0], rs->ne[0], ggml_nrows(rs), ref2.get(), ctx->stream());
-        t.df += ggml_cuda_act_count_diff(reff.get(), mm->data, nbf, ctx->stream());
-        t.dq += ggml_cuda_act_count_diff(ref.get(), ctx->act_cache_buf->get(), bytes, ctx->stream());
-        t.dq2 += ggml_cuda_act_count_diff(ref2.get(), ctx->act_cache_buf->get(), bytes, ctx->stream());
-        t.bf += (int64_t) nbf; t.bq += (int64_t) bytes; t.n++;
+        if (!up) {
+            ggml_cuda_n1_act_ref_quant_tok((const float *) mm->data, rs->ne[0], rs->ne[0], ggml_nrows(rs), ref2.get(), ctx->stream());
+            t.df += ggml_cuda_act_count_diff(reff.get(), mm->data, nbf, ctx->stream());
+            t.dq += ggml_cuda_act_count_diff(ref.get(), ctx->act_cache_buf->get(), bytes, ctx->stream());
+            t.dq2 += ggml_cuda_act_count_diff(ref2.get(), ctx->act_cache_buf->get(), bytes, ctx->stream());
+            t.bf += (int64_t) nbf; t.bq += (int64_t) bytes; t.n++;
+        } else {
+            t.dqg += ggml_cuda_act_count_diff(ref.get(), ctx->act_cache_buf->get(), bytes, ctx->stream());
+            t.bqg += (int64_t) bytes; t.ng++;
+        }
     }
     ctx->act_cache_tensor = mm;   // the consumers key on the FWHT MUL_MAT node (their src1 is its RESHAPE view)
     ctx->act_nofp32       = skip_fp32 ? mm : nullptr;
     return true;
+}
+
+static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, int off,
+        const ggml_tensor * x, const ggml_tensor * up, const ggml_tensor * signs, ggml_tensor * mm) {
+    struct host_time {
+        double us = 0; int64_t calls = 0;
+        ~host_time() { if (getenv("GGML_N1_STATS") && calls) fprintf(stderr, "[N1] stats: m3 FWHT-producer host time %.1f ms over %lld calls\n", us * 1e-3, (long long) calls); }
+    };
+    static host_time ht;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool r = ggml_cuda_m3_fwht_quant_impl(ctx, cgraph, i, off, x, up, signs, mm);
+    ht.us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    ht.calls++;
+    return r;
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
@@ -5830,6 +5935,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->act_cache_tensor = nullptr;
     cuda_ctx->act_cache_buf.reset();
     cuda_ctx->act_nofp32 = nullptr;
+    cuda_ctx->act_eval_gen++;
     GGML_ASSERT(cuda_ctx->act_pending == nullptr);
 
     bool use_cuda_graph             = false;
