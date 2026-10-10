@@ -5739,22 +5739,41 @@ struct ggml_tensor * ggml_ssm_conv_update(
         struct ggml_tensor  * x,
         struct ggml_tensor  * c,
         bool                  apply_silu) {
+    GGML_ASSERT(x->ne[1] == 1);
+    return ggml_ssm_conv_update_ext(ctx, s, x, c, apply_silu, false, 0, 0.0f);
+}
+
+struct ggml_tensor * ggml_ssm_conv_update_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * c,
+        bool                  apply_silu,
+        bool                  state_is_zero,
+        int32_t               l2_n,
+        float                 l2_eps) {
     GGML_ASSERT(ggml_is_3d(s));
     GGML_ASSERT(ggml_is_matrix(c));
 
     const int64_t d_conv  = c->ne[0];
     const int64_t d_inner = c->ne[1];
     const int64_t n_s     = s->ne[2];
+    const int64_t n_t     = x->ne[1];
 
     GGML_ASSERT(s->ne[0] == d_conv - 1);
     GGML_ASSERT(s->ne[1] == d_inner);
-    GGML_ASSERT(x->ne[0] == d_inner && x->ne[1] == 1 && x->ne[2] == n_s && x->ne[3] == 1);
+    GGML_ASSERT(x->ne[0] == d_inner && n_t >= 1 && x->ne[2] == n_s && x->ne[3] == 1);
     GGML_ASSERT(s->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && c->type == GGML_TYPE_F32);
     GGML_ASSERT(s->nb[0] == sizeof(float) && x->nb[0] == sizeof(float) && c->nb[0] == sizeof(float));
+    GGML_ASSERT(l2_n >= 0 && l2_n % 128 == 0 && l2_n <= d_inner);
+    GGML_ASSERT(n_t > 1 || (!state_is_zero && l2_n == 0)); // the single-token kernel (T368) has neither option
 
-    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, 1, n_s);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
 
     ggml_set_op_params_i32(result, 0, apply_silu ? 1 : 0);
+    ggml_set_op_params_i32(result, 1, state_is_zero ? 1 : 0);
+    ggml_set_op_params_i32(result, 2, l2_n);
+    ggml_set_op_params_f32(result, 3, l2_eps);
 
     result->op     = GGML_OP_SSM_CONV_UPDATE;
     result->src[0] = s;

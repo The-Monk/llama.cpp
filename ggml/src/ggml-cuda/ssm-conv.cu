@@ -123,6 +123,134 @@ static __global__ void ssm_conv_update_f32(float * state_ptr, const float * x_pt
     }
 }
 
+// T409: keeps the compiler from reassociating a float sum across this point (same trick as gated_delta_net.cu's
+// gdn_opaque, T361); ggml-hip builds with -funsafe-math-optimizations.
+static __device__ __forceinline__ float ssm_conv_opaque(float x) {
+#if defined(GGML_USE_HIP)
+    asm volatile("" : "+v"(x));
+#endif
+    return x;
+}
+
+// T409: multi-token conv for prefill with the conv state read from and written back to the recurrent cache row in
+// place. Replaces the graph's get_rows gather + concat([state | x^T]) + ssm_conv(+silu) + write-back cpy, and
+// optionally the two L2_NORM ops on the q/k rows. Structure and compute loop are ssm_conv_long_token_f32's (grid z
+// over split_n_t-token tiles, a [split_d_inner][d_conv-1+split_n_t] smem window); only the smem load differs: the
+// window is read straight from the state row (tile 0's halo) and from x in its native token-major layout
+// (128 consecutive channels per token = coalesced) instead of from a materialized transposed concat.
+// State write-back: the new state is the last d_conv-1 window columns, which come from x (an input) or, when
+// n_t < d_conv-1, from the old state. Only tile bidz == 0 reads the old state and only it writes the new one, and
+// each thread reads and writes only its own channel row, so there is no race.
+// L2 (l2_n > 0): blocks whose 128 channels lie in [0, l2_n) are one q or k head; their outputs go through smem and
+// each wave normalizes whole tokens with norm.cu l2_norm_f32<32>'s exact arithmetic (lane l accumulates channels
+// l, l+32, l+64, l+96 in that order, warp_reduce_sum, scale = rsqrtf(fmaxf(sum, eps^2)), out = scale * y).
+template <bool apply_silu, bool do_l2, size_t split_d_inner, size_t d_conv, int64_t split_n_t>
+static __global__ void ssm_conv_prefill_f32(float * __restrict__ state, const float * __restrict__ x,
+                                            const float * __restrict__ src1, const float * __restrict__ bias,
+                                            const int state_nb1, const int state_nb2, const int x_nb1,
+                                            const int x_nb2, const int src1_nb1, float * __restrict__ dst,
+                                            const int dst_nb1, const int dst_nb2, const int64_t n_t,
+                                            const int state_is_zero, const int l2_n, const float l2_eps) {
+    const int tid  = threadIdx.x;
+    const int bidx = blockIdx.x;
+    const int bidy = blockIdx.y;
+    const int bidz = blockIdx.z;
+
+    const int ch = bidy * split_d_inner + tid;
+
+    const float * w_block = (const float *) ((const char *) src1 + bidy * split_d_inner * src1_nb1);
+    float *       y_block =
+        (float *) ((char *) dst + bidx * dst_nb2 + bidz * split_n_t * dst_nb1 + bidy * split_d_inner * sizeof(float));
+    const float * x_seq = (const float *) ((const char *) x + bidx * x_nb2);
+    float *       s_row = (float *) ((char *) state + bidx * state_nb2 + ch * state_nb1);
+
+    const int stride_w = src1_nb1 / sizeof(float);
+    const int stride_y = dst_nb1 / sizeof(float);
+    const int stride_x = x_nb1 / sizeof(float);
+
+    const int64_t local_n_t = min(split_n_t, n_t - bidz * split_n_t);
+    const int     n_cols    = d_conv - 1 + split_n_t;
+
+    extern __shared__ float smem[];
+
+    // window column p of this tile = global window position gp = bidz*split_n_t + p; positions < d_conv-1 are
+    // the old state (only tile 0 has them), position d_conv-1+t is token t (zero past the last token, never used)
+#pragma unroll
+    for (int p = 0; p < (int) (d_conv - 1 + split_n_t); p++) {
+        const int64_t gp = bidz * split_n_t + p;
+        float v;
+        if (gp < (int64_t) (d_conv - 1)) {
+            v = state_is_zero ? 0.0f : s_row[gp];
+        } else {
+            const int64_t t = gp - (int64_t) (d_conv - 1);
+            v = t < n_t ? x_seq[t * stride_x + ch] : 0.0f;
+        }
+        smem[tid * n_cols + p] = v;
+    }
+    __syncthreads();
+
+    if (bidz == 0) {
+        // new state = window positions n_t .. n_t+d_conv-2 (own row; the old values were read above)
+#pragma unroll
+        for (int j = 0; j < (int) (d_conv - 1); j++) {
+            const int64_t gp = n_t + j;
+            s_row[j] = gp < (int64_t) (d_conv - 1) ? smem[tid * n_cols + gp] : x_seq[(gp - (int64_t) (d_conv - 1)) * stride_x + ch];
+        }
+    }
+
+    // Load weights into registers (done once, small)
+    float w[d_conv] = { 0.0f };
+#pragma unroll
+    for (size_t j = 0; j < d_conv; j++) {
+        w[j] = w_block[tid * stride_w + j];
+    }
+
+    float b = bias != nullptr ? bias[bidy * split_d_inner + tid] : 0.0f;
+
+    const bool l2_block = do_l2 && (int) ((bidy + 1) * split_d_inner) <= l2_n;
+    float * ys = smem + split_d_inner * n_cols; // [split_n_t][split_d_inner], do_l2 only
+
+    // Compute from shared memory (verbatim ssm_conv_long_token_f32)
+    for (int64_t i = 0; i < local_n_t; i++) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (size_t j = 0; j < d_conv; j++) {
+            sumf += smem[tid * n_cols + i + j] * w[j];
+        }
+        sumf += b;
+        const float yv = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+        if (l2_block) {
+            ys[i * split_d_inner + tid] = yv;
+        } else {
+            y_block[i * stride_y + tid] = yv;
+        }
+    }
+
+    if constexpr (do_l2) {
+        static_assert(split_d_inner == 128, "L2 epilogue assumes one 128-wide head per block");
+        if (l2_block) {
+            constexpr int ws = 32;
+            __syncthreads();
+            const int wave = tid / ws;
+            const int lane = tid % ws;
+            for (int64_t i = wave; i < local_n_t; i += split_d_inner / ws) {
+                const float * yr = ys + i * split_d_inner;
+                float acc = 0.0f;
+#pragma unroll
+                for (int r = 0; r < (int) split_d_inner / ws; r++) {
+                    acc = ssm_conv_opaque(acc + yr[r * ws + lane] * yr[r * ws + lane]);
+                }
+                const float sum   = warp_reduce_sum<ws>(acc);
+                const float scale = rsqrtf(fmaxf(sum, l2_eps * l2_eps));
+#pragma unroll
+                for (int r = 0; r < (int) split_d_inner / ws; r++) {
+                    y_block[i * stride_y + r * ws + lane] = scale * yr[r * ws + lane];
+                }
+            }
+        }
+    }
+}
+
 template <bool apply_silu, size_t split_d_inner, size_t d_conv, int64_t split_n_t>
 static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, const float * __restrict__ src1,
                                                const float * __restrict__ bias,
@@ -271,6 +399,63 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     }
 }
 
+// T409 host side of ssm_conv_prefill_f32 (multi-token GGML_OP_SSM_CONV_UPDATE).
+static void ssm_conv_prefill_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const bool apply_silu) {
+    ggml_tensor *              state = dst->src[0];
+    const struct ggml_tensor * w     = dst->src[1];
+    const struct ggml_tensor * x     = dst->src[2];
+
+    const bool  state_is_zero = ggml_get_op_params_i32(dst, 1) != 0;
+    const int   l2_n          = ggml_get_op_params_i32(dst, 2);
+    const float l2_eps        = ggml_get_op_params_f32(dst, 3);
+
+    const int64_t nc  = w->ne[0];
+    const int64_t nr  = state->ne[1];
+    const int64_t n_s = state->ne[2];
+    const int64_t n_t = x->ne[1];
+
+    GGML_ASSERT(state->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->ne[0] == nc - 1);
+    GGML_ASSERT(state->nb[0] == sizeof(float) && x->nb[0] == sizeof(float) && w->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->ne[0] == nr && dst->ne[1] == n_t && dst->nb[0] == sizeof(float));
+
+    const int threads = 128;
+    GGML_ASSERT(nr % threads == 0);
+    GGML_ASSERT(l2_n % threads == 0 && l2_n <= nr);
+    GGML_ASSERT(l2_n == 0 || ggml_cuda_info().devices[ctx.device].warp_size == 32);
+
+    const int64_t split_n_t = 32;
+    const dim3    blocks(n_s, nr / threads, (n_t + split_n_t - 1) / split_n_t);
+    cudaStream_t  stream = ctx.stream();
+
+    auto launch_kernel = [&](auto NC) {
+        constexpr int kNC = decltype(NC)::value;
+        const size_t smem_win = threads * (kNC - 1 + split_n_t) * sizeof(float);
+        const size_t smem_l2  = threads * split_n_t * sizeof(float);
+#define T409_LAUNCH(SILU, L2)                                                                                    \
+        ssm_conv_prefill_f32<SILU, L2, threads, kNC, split_n_t><<<blocks, threads, smem_win + ((L2) ? smem_l2 : 0), stream>>>( \
+            (float *) state->data, (const float *) x->data, (const float *) w->data, (const float *) nullptr,     \
+            (int) state->nb[1], (int) state->nb[2], (int) x->nb[1], (int) x->nb[2], (int) w->nb[1],                \
+            (float *) dst->data, (int) dst->nb[1], (int) dst->nb[2], n_t, state_is_zero ? 1 : 0, l2_n, l2_eps)
+        if (apply_silu) {
+            if (l2_n > 0) { T409_LAUNCH(true, true); } else { T409_LAUNCH(true, false); }
+        } else {
+            if (l2_n > 0) { T409_LAUNCH(false, true); } else { T409_LAUNCH(false, false); }
+        }
+#undef T409_LAUNCH
+    };
+
+    switch (nc) {
+        case 3:  launch_kernel(std::integral_constant<int, 3 >{}); break;
+        case 4:  launch_kernel(std::integral_constant<int, 4 >{}); break;
+        case 5:  launch_kernel(std::integral_constant<int, 5 >{}); break;
+        case 9:  launch_kernel(std::integral_constant<int, 9 >{}); break;
+        case 15: launch_kernel(std::integral_constant<int, 15>{}); break;
+        default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 9, 15 right now.");
+    }
+}
+
 void ggml_cuda_op_ssm_conv_update(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor *              state = dst->src[0];  // conv state view, updated in place
     const struct ggml_tensor * w     = dst->src[1];  // conv1d.weight
@@ -281,6 +466,11 @@ void ggml_cuda_op_ssm_conv_update(ggml_backend_cuda_context & ctx, ggml_tensor *
     const int64_t nc  = w->ne[0];       // d_conv
     const int64_t nr  = state->ne[1];   // d_inner
     const int64_t n_s = state->ne[2];
+
+    if (x->ne[1] > 1) {
+        ssm_conv_prefill_cuda(ctx, dst, apply_silu);
+        return;
+    }
 
     GGML_ASSERT(state->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
