@@ -24,6 +24,9 @@
 //                          W2 stream + fp16 sw, for cached and native weights alike) x per-256 activation scales (T402
 //                          g256) on gemm_fold<8,1,1,2> (n1_m2_fold.cuh: 256 tok x 64 feat, rescale every 256 K with one
 //                          pairable sub + fmac). The activation is quantized here (no act-fuse producer for g256 yet).
+//   GGML_N1_M2=2           T424 (default OFF, DIFFERENT MATH again, KLD-gated): the M2 path with the bias carried through the
+//                          rescale fma (one fmac per element per 256 K instead of sub + fmac; BIASF * sx removed every 8
+//                          groups and in the epilogue). Rounding noise ~5e-4 of the output rms at K = 17408 (standalone).
 //
 // T400 N4: weights loaded from a native dual-blob GGUF (llama-model-loader, GGML_TYPE_NK_*_W2) arrive as a compact
 // Q2_0/Q1_0 view whose view_src is the dual tensor; its W2 region and its companion's sw are used in place (no
@@ -66,11 +69,13 @@ struct n1_env {
     bool    transient = false;
     bool    m1 = true;
     bool    m2 = false;
+    bool    m2bc = false;   // GGML_N1_M2=2 (T424): M2 path + bias-carry rescale (one fmac per element per 256 K)
     n1_env() {
         const char * m1e = getenv("GGML_N1_M1");
         m1 = !(m1e && strcmp(m1e, "0") == 0);
         const char * m2e = getenv("GGML_N1_M2");
-        m2 = m2e && strcmp(m2e, "1") == 0;
+        m2 = m2e && (strcmp(m2e, "1") == 0 || strcmp(m2e, "2") == 0);
+        m2bc = m2e && strcmp(m2e, "2") == 0;
         dump = getenv("GGML_N1_DUMP");
         const char * tr = getenv("GGML_N1_TRANSIENT");
         transient = tr && strcmp(tr, "1") == 0;
@@ -523,22 +528,27 @@ const n1_w * get_fold(const ggml_tensor * src0, const void * W2, const void * SW
     return &g_fold.emplace(src0->data, c).first->second;
 }
 
-template <int KT>
+template <int KT, bool BC>
 void launch_m2_kt(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
     const int ntile = Npad / 128;
     const dim3 grid((ntile + 1) / 2, F / 64);
-    m2::gemm_fold<8, 1, 1, 2, KT><<<grid, 256, 0, st>>>((const uint4 *) X, (const uint4 *) W, (const int8_t *) fo->w,
+    m2::gemm_fold<8, 1, 1, 2, KT | (BC ? m2::BCARRY : 0)><<<grid, 256, 0, st>>>((const uint4 *) X, (const uint4 *) W, (const int8_t *) fo->w,
         (const float *) fo->sw, sx, Y, N, ntile, F, K, ldy);
 }
-void launch_m2(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
-    // the last template slot of gemm_fold is its variant mask (bit LPF = 4); KT tags K in the kernel name for
-    // rocprofv3 with values that never set bit 2 (K / 1024 << 3)
+template <bool BC>
+void launch_m2_bc(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
+    // the last template slot of gemm_fold is its variant mask (bit LPF = 4, BCARRY = 1 << 24); KT tags K in the kernel name
+    // for rocprofv3 with values that never set bit 2 (K / 1024 << 3)
     switch (K) {
-        case 5120:  launch_m2_kt<(5120 / 1024) << 3 >(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
-        case 6144:  launch_m2_kt<(6144 / 1024) << 3 >(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
-        case 17408: launch_m2_kt<(17408 / 1024) << 3>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
-        default:    launch_m2_kt<0                  >(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+        case 5120:  launch_m2_kt<(5120 / 1024) << 3,  BC>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+        case 6144:  launch_m2_kt<(6144 / 1024) << 3,  BC>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+        case 17408: launch_m2_kt<(17408 / 1024) << 3, BC>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+        default:    launch_m2_kt<0,                   BC>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
     }
+}
+void launch_m2(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
+    if (env().m2bc) launch_m2_bc<true >(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
+    else            launch_m2_bc<false>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
 }
 
 // ---------------- GEMM launch ----------------

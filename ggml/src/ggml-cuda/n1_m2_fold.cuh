@@ -38,6 +38,8 @@
 
 namespace m2 {
 
+constexpr int BCARRY = 1 << 24;   // T424 variant bit: bias-carry rescale (GGML_N1_M2=2); the low bits tag K (K / 1024 << 3)
+
 __device__ __forceinline__ uint32_t fold_lut(uint32_t mb) {   // mb = m as a zero-extended byte; LUT bytes {-m,0,m,2m}
     return ((0u - mb) & 0xFFu) | ((mb & 0xFFu) << 16) | (((mb << 1) & 0xFFu) << 24);
 }
@@ -63,7 +65,7 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
     static_assert(RS == 1 || RS == 2, "RS");
     static_assert(SEGS == 1 || SEGS == 2, "SEGS");
     static_assert(RS >= SEGS || RS == 1, "a stage may not split... RS < SEGS handled per segment");
-    constexpr bool kLpf = V & LPF;
+    constexpr bool kLpf = V & LPF, kBc = V & BCARRY;
     constexpr int U = (RS > SEGS) ? RS / SEGS : 1;   // stages unrolled per loop iteration
     constexpr int P0N = SEGS * (1 + DWN);
     constexpr int WSTAGE = SEGS * WSEG;
@@ -110,8 +112,11 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
     u32x4 xr[KBN][FT];
     uint32_t rw[SEGS][DWN], rm[SEGS][DWN];
     float sxa[FT];
+    float sxs[FT] = {0.f, 0.f};   // BC (T424): running sum of the group scales; BIASF * sxs is subtracted every BC_FLUSH groups and in the epilogue
+    int nres = 0;
+    constexpr int BC_FLUSH = 8;   // power of two
 
-#define XLOAD(G, kb)                                                                                         \
+#define XLOAD(G, kb)                                                                                       \
     { const char* xb_ = xg + (size_t)(G) * XB;                                                                \
       _Pragma("unroll") for (int i = 0; i < FT; ++i)                                                           \
           { M2_EPRE asm volatile("global_load_b128 %0, %1, %2 offset:%3" : "=v"(xr[kb][i]) : "v"(xvoff), "s"(xb_), "i"((i * KBN + (kb)) * 512) : "memory"); M2_EPOST } }
@@ -156,7 +161,7 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
         if (waitsel == 0) asm volatile("s_wait_loadcnt %0" :: "i"(4 * FT * RS) : "memory");
         else asm volatile("s_wait_loadcnt %0" :: "i"(4 * FT * RS + P0N) : "memory");
 #pragma unroll
-        for (int i = 0; i < FT; ++i) asm volatile("" : "+v"(sxa[i]));
+        for (int i = 0; i < FT; ++i) { asm volatile("" : "+v"(sxa[i])); if constexpr (kBc) sxs[i] += sxa[i]; }
 #pragma unroll
         for (int i = 0; i < FT; ++i)
 #pragma unroll
@@ -164,13 +169,31 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
                 asm volatile("" : "+v"(acc[i][j]));
 #pragma unroll
                 for (int l = 0; l < 8; ++l) {
-                    float x = __int_as_float(acc[i][j][l]) - BIASF;
-                    asm volatile("" : "+v"(x));
-                    accf[i][j][l] = __builtin_fmaf(x, sxa[i], accf[i][j][l]);
+                    if constexpr (kBc) {
+                        // one fmac per element per group: BIASF * sx rides in accf and is removed by the flush / epilogue
+                        accf[i][j][l] = __builtin_fmaf(__int_as_float(acc[i][j][l]), sxa[i], accf[i][j][l]);
+                    } else {
+                        float x = __int_as_float(acc[i][j][l]) - BIASF;
+                        asm volatile("" : "+v"(x));
+                        accf[i][j][l] = __builtin_fmaf(x, sxa[i], accf[i][j][l]);
+                    }
                 }
 #pragma unroll
                 for (int l = 0; l < 8; ++l) asm volatile("" : "+v"(accf[i][j][l]));
             }
+        if constexpr (kBc) {
+            // every BC_FLUSH groups remove the carried bias so the fp32 accumulator stays below ~BC_FLUSH * BIASF * sx
+            if ((++nres & (BC_FLUSH - 1)) == 0) {
+#pragma unroll
+                for (int i = 0; i < FT; ++i) {
+#pragma unroll
+                    for (int j = 0; j < FF; ++j)
+#pragma unroll
+                        for (int l = 0; l < 8; ++l) accf[i][j][l] = __builtin_fmaf(-BIASF, sxs[i], accf[i][j][l]);
+                    sxs[i] = 0.f;
+                }
+            }
+        }
     };
 
     for (int s2 = 0; s2 < NST; s2 += U) {
@@ -263,7 +286,7 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
             if (t >= Ntok) continue;
             float o[8];
 #pragma unroll
-            for (int l = 0; l < 8; ++l) o[l] = accf[i][j][l] * rs[l];
+            for (int l = 0; l < 8; ++l) o[l] = (kBc ? __builtin_fmaf(-BIASF, sxs[i], accf[i][j][l]) : accf[i][j][l]) * rs[l];
             float4* yp = (float4*)(Y + (size_t)t * ldy + f0);
             yp[0] = make_float4(o[0], o[1], o[2], o[3]);
             yp[1] = make_float4(o[4], o[5], o[6], o[7]);
