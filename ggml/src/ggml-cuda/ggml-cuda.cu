@@ -3310,6 +3310,21 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
+
+    // T433: graphs only for small batches (decode, speculative verify). A prefill ubatch is captured on its 2nd
+    // same-shape call and then only replayed if the next prompt has the same shape, which in serving it rarely does;
+    // the capture + hipGraphExecUpdate is pure overhead (ROCm 10.1: one update = 190 ms vs 75 ms on 7.14, the whole
+    // first-run pp512 loss), and eager prefill measured as fast or faster. GGML_CUDA_GRAPH_MAX_TOKENS=<n> (default 32;
+    // 0 = no limit, the old behaviour): skip graphs when any MUL_MAT's activation has more than n columns.
+    static const int max_tokens = [] { const char * v = getenv("GGML_CUDA_GRAPH_MAX_TOKENS"); return v ? atoi(v) : 32; }();
+    if (max_tokens > 0) {
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_MUL_MAT && node->src[1] && node->src[1]->ne[1] * node->src[1]->ne[2] * node->src[1]->ne[3] > max_tokens) {
+                return false;
+            }
+        }
+    }
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
