@@ -422,7 +422,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // depth-first walk from the output, which otherwise puts z's quantize+GEMM BETWEEN the gated norm's RMS_NORM/MUL and its
     // SILU(z)*normed; hoisting makes RMS_NORM, MUL, SILU, MUL adjacent so the CUDA backend can run them as one kernel. Same
     // values, different (still valid) topological order; prefill-sized ubatches only.
-    if (n_seq_tokens > 1) {
+    if (n_seq_tokens > 32) {   // prefill-sized only: spec-verify batches keep the existing graph and fusions
         const char * gn = getenv("GGML_GDN_GATED_NORM");   // default ON, =0 disables
         if (gn == nullptr || atoi(gn) != 0) {
             ggml_build_forward_expand(gf, z);
@@ -454,9 +454,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // carry a GGML_ASSERT that would catch it if that assumption ever broke).
     // GGML_GDN_FUSED_L2NORM_PF (T447, default off): the same fold for prefill-sized ubatches. The chunked GDN kernel's prep stage already
     // takes raw q/k and derives the per-token L2 scale itself (same lane order and rsqrt as l2_norm_f32<32>), so the two L2_NORM
-    // launches (and their 8 MB-per-tensor round trip) disappear. n_seq_tokens > 32 keeps spec-verify batches on the unfused path.
+    // launches (and their 8 MB-per-tensor round trip) disappear. n_seq_tokens >= 64 is the chunk kernel's own threshold
+    // (GGML_GDN_CHUNK_MIN): below it the sequential kernel runs, whose multi-token L2 mode was never gated, and spec-verify batches stay unfused.
     const bool gdn_fused_l2norm_pf = []() { const char * e = getenv("GGML_GDN_FUSED_L2NORM_PF"); return e == nullptr || atoi(e) != 0; }() &&   // default ON, =0 disables
-                                     gdn_layer_on_cuda_like(model, il) && n_seq_tokens > 32 && cparams.n_rs_seq == 0 &&
+                                     gdn_layer_on_cuda_like(model, il) && n_seq_tokens >= 64 && cparams.n_rs_seq == 0 &&
                                      hparams.ssm_d_state == 128;
     const bool gdn_fused_l2norm = (gdn_rung_default_on("GGML_GDN_FUSED_L2NORM") && gdn_layer_on_cuda_like(model, il) &&
                                    n_seq_tokens == 1 && cparams.n_rs_seq == 0) || gdn_fused_l2norm_pf;

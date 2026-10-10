@@ -5320,7 +5320,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // T447 GGML_GDN_GATED_NORM: Qwen3.5 GDN gated norm RMS_NORM + MUL(w) + SILU(z) + MUL in one launch (the graph builder
     // hoists z so the four nodes are adjacent). Prefill-sized inputs only; decode keeps the existing two fusions.
-    if (node->op == GGML_OP_RMS_NORM && i + 3 < cgraph->n_nodes && node->ne[0] == 128 && ggml_nrows(node) >= 64) {
+    if (node->op == GGML_OP_RMS_NORM && i + 3 < cgraph->n_nodes && node->ne[0] == 128 && node->ne[2] > 32) {   // [128, heads, n_seq_tokens, n_seqs]
         static const bool gated_norm = getenv("GGML_GDN_GATED_NORM") == nullptr || atoi(getenv("GGML_GDN_GATED_NORM")) == 1;   // default ON, =0 disables, 2 = hoist z only (debug)
         // the z view (RESHAPE) is a graph node of its own between the weight MUL and the SILU
         // (ggml_can_fuse_subgraph rejects it: the view's source z is produced outside the span, so the span is validated by hand:
