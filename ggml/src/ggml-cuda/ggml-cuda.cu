@@ -4514,7 +4514,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (view) {
                 const size_t bytes = (size_t) (view->ne[0] / QK8_1) * sizeof(block_q8_1);
                 auto buf = std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool(), bytes);
+                // verify mode: the unfused chain (rms_norm_mul kernel, then the signed FWHT kernel on its output) into scratch first
+                const bool vfy = (ggml_cuda_fwht_quant_mode() & 4) != 0;
+                ggml_cuda_pool_alloc<char> ref_norm(cuda_ctx->pool(), vfy ? ggml_nbytes(mulw) : 0);
+                ggml_cuda_pool_alloc<char> ref_fwht(cuda_ctx->pool(), vfy ? ggml_nbytes(mm) : 0);
+                if (vfy) {
+                    ggml_tensor tn = *mulw;
+                    tn.data = ref_norm.get();
+                    ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, &tn);
+                    ggml_tensor tm = *mm;
+                    tm.data = ref_fwht.get();
+                    ggml_cuda_op_fwht_signed(*cuda_ctx, &tn, signs, &tm);
+                }
                 if (ggml_cuda_op_rms_norm_mul_fwht_q8_1(*cuda_ctx, x, w, signs, mulw, mm, eps, buf->get())) {
+                    if (vfy) {
+                        const int64_t dn = ggml_cuda_act_count_diff(ref_norm.get(), mulw->data, ggml_nbytes(mulw), cuda_ctx->stream());
+                        const int64_t df = ggml_cuda_act_count_diff(ref_fwht.get(), mm->data, ggml_nbytes(mm), cuda_ctx->stream());
+                        struct totals { int64_t n = 0, dn = 0, bn = 0, df = 0, bf = 0;
+                            ~totals() { fprintf(stderr, "fwht-quant: VERIFY norm-fused %lld rows: norm %lld/%lld bytes differ, fwht %lld/%lld bytes differ\n",
+                                (long long) n, (long long) dn, (long long) bn, (long long) df, (long long) bf); } };
+                        static totals t;
+                        t.n++; t.dn += dn; t.bn += (int64_t) ggml_nbytes(mulw); t.df += df; t.bf += (int64_t) ggml_nbytes(mm);
+                    }
                     ggml_cuda_fwht_quant_publish(cuda_ctx, view, mm, std::move(buf), bytes);
                     return 4;
                 }
