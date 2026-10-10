@@ -2,6 +2,7 @@
 #include "fwht.cuh"
 #include "n1_act.cuh"
 #include "unary.cuh"
+#include "fwht-dev.cuh"
 
 #include <climits>
 #include <cstdlib>
@@ -163,8 +164,55 @@ __global__ void fwht_quant_n1t(const float * __restrict__ src, const float * __r
     }
 }
 
+// T430 GGML_CUDA_FWHT_QUANT: N=1024 signed transform that also emits the Q2_FIELD-layout q8_1 form of its output
+// (the MMVQ decode activation for Q2_0 g128 weights; the bytes quantize_q8_1<Q8_1_LAYOUT_Q2_FIELD> writes reading
+// dst back). Lane j holds the 32 contiguous elements j*32..j*32+31 = exactly one q8_1 block, so the quantizer is
+// in-lane (no shuffles). The butterfly network is the one fwht_cuda runs, stage for stage (h = 1, 2, 4, ...); only
+// the element->thread mapping differs (low 5 index bits in registers, high 5 across lanes), so dst is
+// bit-identical, and the in-lane sum uses warp_reduce_sum's xor-tree association so ds.y is too.
+__launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
+__global__ void fwht_q8_1_cuda(const float * src, float * dst, const int64_t n_rows, const float scale,
+                               const float * signs, const int n_blk, block_q8_1 * qy,
+                               const int perm_hd, const int perm_nk, const int perm_rep) {
+    constexpr int N = 1024;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    static_assert(warp_size == QK8_1 && N == warp_size*QK8_1, "one q8_1 block per lane");
+
+    const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
+    if (r >= n_rows) {
+        return;
+    }
+    const int lane = threadIdx.x;
+
+    // perm_rep > 0: src is the TILED [hd, nk, rep] layout of the GDN output and the transform input is the grouped
+    // [hd, rep, nk] reorder (build_lora_mm's reshape/permute/cont, folded into this load). 32 contiguous output
+    // elements stay inside one hd-run (32 | hd), so the gather is still one contiguous 32-float read per lane.
+    int64_t so = r * N + lane * QK8_1;
+    if (perm_rep > 0) {
+        const int64_t a0 = so % perm_hd, t = so / perm_hd;
+        so = a0 + (int64_t) perm_hd * (t / perm_rep + (int64_t) perm_nk * (t % perm_rep));
+    }
+    const float4 * s4 = (const float4 *) (src + so);
+    const float4 * g4 = (const float4 *) (signs + (r % n_blk) * N + lane * QK8_1);
+    float reg[QK8_1];
+
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for (int k = 0; k < QK8_1/4; ++k) {
+        const float4 v = s4[k];
+        const float4 g = g4[k];
+        reg[4*k + 0] = (v.x * scale) * g.x;
+        reg[4*k + 1] = (v.y * scale) * g.y;
+        reg[4*k + 2] = (v.z * scale) * g.z;
+        reg[4*k + 3] = (v.w * scale) * g.w;
+    }
+
+    ggml_cuda_fwht1024_q8_1_lane(reg, lane, dst + r * N + lane * QK8_1, qy + r * (N / QK8_1) + lane);
+}
+
 static bool fwht_dispatch(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst,
-                          const ggml_tensor * signs_t) {
+                          const ggml_tensor * signs_t, block_q8_1 * qy = nullptr,
+                          const int perm_hd = 0, const int perm_nk = 0, const int perm_rep = 0) {
     if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
         return false;
     }
@@ -189,6 +237,14 @@ static bool fwht_dispatch(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
     const float * src_d = (const float *) src->data;
     float *       dst_d = (float *) dst->data;
+
+    if (qy && (n != 1024 || n % QK8_1 != 0)) {
+        return false;
+    }
+    if (perm_rep > 0 && (!qy || perm_hd % QK8_1 != 0 || (int64_t) perm_hd * perm_nk * perm_rep != ggml_nelements(dst) ||
+                         ggml_nelements(src) != ggml_nelements(dst))) {
+        return false;   // the gather form is single-token decode only (one run of hd*nk*rep elements)
+    }
 
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int rows_per_block = 4;
@@ -247,6 +303,13 @@ static bool fwht_dispatch(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         // these the whole transform falls back to a dense NxN f16 GEMM -- which is what
         // block_size=1024 models (Ternary-Bonsai-2-27B) hit: 54.7 -> 33.9 t/s.
         case 1024:
+            if (qy) {
+                if (!signs_d || ((uintptr_t) src_d | (uintptr_t) dst_d | (uintptr_t) signs_d) % 16 != 0) {
+                    return false;
+                }
+                ggml_cuda_kernel_launch(fwht_q8_1_cuda, launch_params, src_d, dst_d, rows, scale, signs_d, n_blk, qy, perm_hd, perm_nk, perm_rep);
+                return true;
+            }
             if (signs_d) {
                 ggml_cuda_kernel_launch(fwht_cuda<1024, true>,  launch_params, src_d, dst_d, rows, scale, signs_d, n_blk);
             } else {
@@ -320,4 +383,15 @@ bool ggml_cuda_op_fwht_signed_quant_n1t(ggml_backend_cuda_context & ctx, const g
     }
 #undef FQ
     return true;
+}
+
+bool ggml_cuda_op_fwht_signed_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
+                                   const ggml_tensor * signs, ggml_tensor * dst, void * qy) {
+    return fwht_dispatch(ctx, src, dst, signs, (block_q8_1 *) qy);
+}
+
+bool ggml_cuda_op_fwht_signed_q8_1_perm(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
+                                        const ggml_tensor * signs, ggml_tensor * dst, void * qy,
+                                        int perm_hd, int perm_nk, int perm_rep) {
+    return fwht_dispatch(ctx, src, dst, signs, (block_q8_1 *) qy, perm_hd, perm_nk, perm_rep);
 }

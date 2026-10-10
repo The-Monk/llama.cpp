@@ -15,7 +15,15 @@ static __global__ void mul_mat_vec_f(
     const float   * GGML_CUDA_RESTRICT y   = y_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
     float         * GGML_CUDA_RESTRICT dst = dst_ptr;
-    const int row         = blockIdx.x;
+    int row               = blockIdx.x;
+    // T430 GGML_CUDA_MMVF_PAIR: the grid covers two shape-identical matrices that share y; rows >= pair_rows belong to the second
+    if constexpr (!has_fusion) {
+        if (fusion.pair_x != nullptr && row >= fusion.pair_rows) {
+            x   = (const T *) fusion.pair_x;
+            dst = (float *) fusion.split_dst;
+            row -= fusion.pair_rows;
+        }
+    }
     // for MUL_MAT_ID - blockIdx.y = n_expert_used, blockIdx.z = ncols_dst (tokens)
     const int channel_dst = blockIdx.y;
     const int tid         = threadIdx.x;
@@ -627,7 +635,7 @@ static void mul_mat_vec_f_cuda(
 }
 
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-    const ggml_cuda_mm_fusion_args_host * fusion) {
+    const ggml_cuda_mm_fusion_args_host * fusion, const ggml_tensor * pair_src0, ggml_tensor * pair_dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
     GGML_ASSERT(         dst->type == GGML_TYPE_F32);
@@ -676,6 +684,16 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         }
         fusion_local.glu_op = fusion->glu_op;
     }
+    // T430 GGML_CUDA_MMVF_PAIR: second weight matrix (same type/shape/strides) sharing src1; its result goes to pair_dst
+    int64_t nrows_launch = ne01;
+    if (pair_src0 != nullptr) {
+        GGML_ASSERT(!fusion && !ids && pair_dst != nullptr && pair_src0->type == src0->type && ggml_are_same_stride(pair_src0, src0) &&
+                    pair_src0->ne[1] == ne01 && dst->ne[1] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1);
+        fusion_local.pair_x    = pair_src0->data;
+        fusion_local.split_dst = pair_dst->data;
+        fusion_local.pair_rows = (int) ne01;
+        nrows_launch           = 2*ne01;
+    }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = src1->nb[1] / ts_src1;
@@ -701,19 +719,19 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     switch (src0->type) {
         case GGML_TYPE_F32: {
             const float * src0_d = (const float *) src0->data;
-            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, nrows_launch, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
                 ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
         } break;
         case GGML_TYPE_F16: {
             const half * src0_d = (const half *) src0->data;
-            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, nrows_launch, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
                 ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
         } break;
         case GGML_TYPE_BF16: {
             const nv_bfloat16 * src0_d = (const nv_bfloat16 *) src0->data;
-            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, nrows_launch, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
                 ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
         } break;
