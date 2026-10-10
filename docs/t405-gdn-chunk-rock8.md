@@ -21,7 +21,7 @@ NMSE 2.8e-12 vs sequential, sequential-vs-sequential control exactly 0.
 | Q2_0 | 7 | 0.000710 | 0.000696 | 0.98x | 98.71 / 98.63% |
 | Q1_0 | 0 | 0.000505 | 0.000513 | 1.02x | 98.74 / 98.82% |
 | Q1_0 | 7 | 0.000505 | 0.000515 | 1.02x | 98.74 / 98.79% |
-| Q2_0 nksc | 0 / 7 | same as Q2_0 (bit-identical logits) | | | |
+| Q2_0 nksc | 0 / 7 | same as Q2_0 to all printed digits (bit-identical logits INFERRED from T399) | | | |
 Release HEAD binary vs port default: KLD 0, same-top 100% (all models). Control max KLD 6e-5 (run-to-run, not GDN).
 
 ## (d) llama-bench -ub 1024 -fa 1 q8_0 KV, 4 interleaved rounds (zorin job 547), t/s and % of 7,200
@@ -39,7 +39,9 @@ DFlash qwen3.6-27b drafter, k=6, n_rs_seq=6 (912 split calls/run): prefill 3.6K-
 Default and chunk each reproduce themselves 4/4 over 3 rounds. Chunk vs default: p3 identical; p0 diverges at token 5
 (the 1-ulp arm diverges at the same token, same pair), p1 token 27 (re-query margin 0.0004), p2 token 0 (3-way near-tie
 198/695/1084 within 0.005 nats; the ulp arm flips p2 the same way under -np 2 concurrency). Acceptance 123/1511 vs
-110/1584: per-prompt shift is p2 (56 -> 41), whose text differs from token 0 (INFERRED: text, not drafter breakage).
+110/1584: per-prompt shift is p2 (56 -> 41), whose text differs from token 0. On p3 (text identical to default) chunk's
+draft counts (457,18) equal the 1-ulp control's exactly, vs default (451,19): ulp-class drift in the drafter's injected
+features plus text divergence (INFERRED), not drafter breakage.
 -np 2 no drafter: release = default 4/4 (sequential and 2 concurrent clients); default concurrent pair reproduces 4/4;
 chunk diverges 2/4 sequential (tokens 4, 0; margins 0.009, 0.005), 1-ulp arm 2/4 (tokens 9, 48; 0.001, 0.017).
 
@@ -48,4 +50,5 @@ llama-rs-reuse-check (chunk+glue tree, glue flag off unless noted), N 64/128/256
 chunk / chunk_nocg / chunk_noreuse / chunk+glue: all VERDICT MATCH, max |dlogit| 0.0000, chunk path fired (240 calls),
 graph reused at X4 (after seq_cp) with chunk on; 31/31 decode reuse. llama-parallel (shared system prompt, 12 wikitext
 prompts, np 1/4): chunk == chunk_nocg on every common input; np4 default is not self-reproducible (as T409 found);
-chunk trace lines were not printed there, so firing is unverified in that tool.
+the trace was not printed at the default log level. Follow-up (job 551, flipped build, -lv 4, np 1): chunk path
+fires 576 times (prompts 416-492 tokens, n_seqs=1), GGML_GDN_CHUNK=0 gives 0.
