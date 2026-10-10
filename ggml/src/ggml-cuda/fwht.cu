@@ -177,6 +177,101 @@ __global__ void fwht_quant_n1t(const float * __restrict__ src, const float * __r
     }
 }
 
+// T439 GGML_CUDA_B2_GLUPF: fwht_quant_n1t<write_fp32, glu> as a persistent kernel. One block per token leaves the memory pipe idle while
+// the block transforms and quantizes (the producer reads 2 x K floats per token, mostly from DRAM); here a block walks the tokens
+// tok, tok + gridDim.x, ... and issues the next token's gate/up loads before it rotates the current one. Same arithmetic as
+// fwht_quant_n1t, so the output bytes are identical.
+template <bool write_fp32>
+__launch_bounds__(1024, 1)
+__global__ void fwht_quant_n1t_glu_pf(const float * __restrict__ src, const float * __restrict__ up, const int64_t s_src, const int64_t s_up,
+                                      float * __restrict__ dst, const float scale,
+                                      const float * __restrict__ signs, int8_t * __restrict__ X, float * __restrict__ sx,
+                                      const int S, const int ntok) {
+    constexpr int N = 1024, warp_size = 32, el_w = N / warp_size;
+    const int w = threadIdx.y, lane = threadIdx.x;
+    const int K = blockDim.y * N;
+    extern __shared__ __align__(16) char smem[];
+    float  * red = (float *) smem;
+    int8_t * qs  = (int8_t *) (smem + 128);
+    const float * sg = signs + (size_t) w * N;
+
+    float cs[el_w], cu[el_w];
+    int tok = blockIdx.x;
+    if (tok < ntok) {
+        const float * s = src + (size_t) tok * s_src + (size_t) w * N;
+        const float * u = up + (size_t) tok * s_up + (size_t) w * N;
+#pragma unroll
+        for (int i = 0; i < el_w; ++i) {
+            cs[i] = s[i * warp_size + lane];
+            cu[i] = u[i * warp_size + lane];
+        }
+    }
+    for (; tok < ntok; tok += gridDim.x) {
+        float reg[el_w];
+#pragma unroll
+        for (int i = 0; i < el_w; ++i) {
+            float v = ggml_cuda_op_silu_single(cs[i]) * cu[i];
+            v *= scale;
+            v *= sg[i * warp_size + lane];
+            reg[i] = v;
+        }
+        const int tn = tok + gridDim.x;
+        if (tn < ntok) {
+            const float * s = src + (size_t) tn * s_src + (size_t) w * N;
+            const float * u = up + (size_t) tn * s_up + (size_t) w * N;
+#pragma unroll
+            for (int i = 0; i < el_w; ++i) {
+                cs[i] = s[i * warp_size + lane];
+                cu[i] = u[i * warp_size + lane];
+            }
+        }
+        fwht_net<N, warp_size>(reg, lane);
+#pragma unroll
+        for (int i = 0; i < el_w; ++i) {
+            asm volatile("" : "+v"(reg[i]));
+        }
+        if (write_fp32) {
+            float * d = dst + (size_t) tok * K + (size_t) w * N;
+#pragma unroll
+            for (int i = 0; i < el_w; ++i) {
+                d[i * warp_size + lane] = reg[i];
+            }
+        }
+        float amax = 0.f;
+#pragma unroll
+        for (int i = 0; i < el_w; ++i) {
+            amax = fmaxf(amax, fabsf(reg[i]));
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, o, 32));
+        }
+        if (lane == 0) {
+            red[w] = amax;
+        }
+        __syncthreads();
+        amax = 0.f;
+        for (int i = 0; i < (int) blockDim.y; ++i) {
+            amax = fmaxf(amax, red[i]);
+        }
+        const float d  = n1_scale(amax);
+        const float id = n1_recip(d);
+        if (w == 0 && lane == 0) {
+            sx[tok] = d;
+        }
+#pragma unroll
+        for (int i = 0; i < el_w; ++i) {
+            qs[w * N + i * warp_size + lane] = (int8_t) (d > 0.f ? (uint8_t) n1_q1(reg[i], id) : 0);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int m = 0; m < N / 4 / warp_size; ++m) {
+            const int j = lane + warp_size * m;
+            *(uint32_t *) (X + n1_off(tok, w * N + 4 * j, S)) = *(const uint32_t *) (qs + w * N + 4 * j);
+        }
+    }
+}
+
 // T439 GGML_CUDA_B2_ADDNORM_FUSE: the residual ADD + RMS_NORM + MUL(weight) in front of a Hadamard-folded matmul fused with the
 // M3 producer: one launch per token instead of k_bin_bcast add, rms_norm_f32<1024,true> and fwht_quant_n1t. Stage 1 is
 // rms_norm_f32<1024, true> verbatim (strided partial sums over the same columns in the same order, the same block_reduce, the
@@ -551,7 +646,18 @@ bool ggml_cuda_op_fwht_signed_quant_n1t(ggml_backend_cuda_context & ctx, const g
     const int     S = (int) (K / 128);
 #define FQ(WF, GL) ggml_cuda_kernel_launch(fwht_quant_n1t<WF, GL>, lp, a, b, s_src, s_up, d, scale, g, X, sx, S, 0, 0, 0)
 #define FQP(WF) ggml_cuda_kernel_launch(fwht_quant_n1t<WF, false, true>, lp, a, b, s_src, s_up, d, scale, g, X, sx, S, perm_hd, perm_nk, perm_rep)
-    if (perm) {
+    static const bool glu_pf = [] { const char * v = getenv("GGML_CUDA_B2_GLUPF"); return v && atoi(v) != 0; }();
+    if (glu && glu_pf) {
+        static const int pf_bps = [] { const char * v = getenv("GGML_CUDA_B2_GLUPF_BPS"); return v ? atoi(v) : 2; }();
+        const int sms = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+        const dim3 pgrid((unsigned) std::min<int64_t>(ntok, (int64_t) sms * pf_bps), 1, 1);
+        const ggml_cuda_kernel_launch_params plp(pgrid, block, shmem, ctx.stream());
+        if (write_fp32) {
+            ggml_cuda_kernel_launch(fwht_quant_n1t_glu_pf<true>, plp, a, b, s_src, s_up, d, scale, g, X, sx, S, (int) ntok);
+        } else {
+            ggml_cuda_kernel_launch(fwht_quant_n1t_glu_pf<false>, plp, a, b, s_src, s_up, d, scale, g, X, sx, S, (int) ntok);
+        }
+    } else if (perm) {
         if (write_fp32) FQP(true); else FQP(false);
     } else if (glu) {
         if (write_fp32) FQ(true, true); else FQ(false, true);
