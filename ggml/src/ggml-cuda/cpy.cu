@@ -195,6 +195,41 @@ static __global__ void cpy_q_f32(const char * cx, char * cdst, const int64_t ne,
     cpy_blck(cx + x_offset, cdst + dst_offset);
 }
 
+// T447 GGML_CUDA_CPY_VEC: F32 -> F32 where the destination is contiguous and the source rows are 16-byte aligned runs
+// (nb00 == 4, ne00 % 4 == 0): one float4 per thread. The scalar kernel above decomposes every element's index with
+// 64-bit divisions and 4-byte loads; on the [128,3,16,1024] head-regroup CONT (25 MB) that is 2.4x off the copy roofline.
+static __global__ void cpy_f32_vec4(const char * cx, char * cdst, const int n4,
+        const int ne00_4, const int ne01, const int ne02, const int64_t nb01, const int64_t nb02, const int64_t nb03) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;   // destination float4 index
+    if (j >= n4) {
+        return;
+    }
+    const int r   = j / ne00_4;
+    const int c4  = j - r * ne00_4;
+    const int i03 = r / (ne01 * ne02);
+    const int rr  = r - i03 * ne01 * ne02;
+    const int i02 = rr / ne01;
+    const int i01 = rr - i02 * ne01;
+    ggml_cuda_pdl_sync();
+    const float4 v = *(const float4 *) (cx + i01 * nb01 + i02 * nb02 + i03 * nb03 + (int64_t) c4 * 16);
+    ((float4 *) cdst)[j] = v;
+}
+
+static bool ggml_cpy_f32_vec4_cuda(const ggml_tensor * src0, const ggml_tensor * src1, cudaStream_t stream) {
+    static const bool enabled = getenv("GGML_CUDA_CPY_VEC") != nullptr && atoi(getenv("GGML_CUDA_CPY_VEC")) != 0;
+    if (!enabled || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) ||
+            src0->nb[0] != 4 || src0->ne[0] % 4 != 0 || src0->nb[1] % 16 || src0->nb[2] % 16 || src0->nb[3] % 16 ||
+            ((uintptr_t) src0->data) % 16 || ((uintptr_t) src1->data) % 16 || ggml_nelements(src0) >= (int64_t) INT_MAX) {
+        return false;
+    }
+    const int n4 = (int) (ggml_nelements(src0) / 4);
+    const int nb = 256;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)((n4 + nb - 1) / nb), nb, 0, stream);
+    ggml_cuda_kernel_launch(cpy_f32_vec4, launch_params, (const char *) src0->data, (char *) src1->data, n4,
+        (int) (src0->ne[0] / 4), (int) src0->ne[1], (int) src0->ne[2], src0->nb[1], src0->nb[2], src0->nb[3]);
+    return true;
+}
+
 template<typename src_t, typename dst_t>
 static __global__ void cpy_scalar_contiguous(const char * cx, char * cdst, const int64_t ne) {
     const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
@@ -518,6 +553,9 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
+    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && !can_be_transposed &&
+               ggml_cpy_f32_vec4_cuda(src0, src1, main_stream)) {
+        // T447: vectorized strided F32 copy (GGML_CUDA_CPY_VEC)
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>

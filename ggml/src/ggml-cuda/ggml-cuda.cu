@@ -1545,7 +1545,26 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src0_ptr = src0_alloc.get();
     }
 
-    if (src1->type == compute_type) {
+    // T447 GGML_CUDA_BF16_SHARE: the Qwen3.5 GDN layer runs two sibling BF16 GEMMs (ssm_beta, ssm_alpha) on the same F32 activation.
+    // The graph loop marks the pair (ggml_cuda_find_bf16_sibling); the first call converts the activation into a context-held buffer
+    // and the second consumes it instead of converting again (same bytes: the conversion is deterministic).
+    std::unique_ptr<ggml_cuda_pool_alloc<char>> shared_hold;
+    if (compute_type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 && ctx.bf16_share_src1 == src1 &&
+            ctx.bf16_share_data == src1->data && ggml_is_contiguously_allocated(src1) && src1->ne[2] == 1 && src1->ne[3] == 1) {
+        const size_t bytes = ggml_nelements(src1) * sizeof(cuda_t);
+        if (ctx.bf16_share_buf == nullptr) {
+            ctx.bf16_share_buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), bytes);
+            const auto convert_func = traits::convert(src1->type);
+            GGML_ASSERT(convert_func != nullptr);
+            convert_func(src1->data, (cuda_t *) ctx.bf16_share_buf->get(), ggml_nelements(src1), main_stream);
+        }
+        src1_ptr = (const cuda_t *) ctx.bf16_share_buf->get();
+        if (--ctx.bf16_share_uses <= 0) {
+            shared_hold = std::move(ctx.bf16_share_buf);   // freed at the end of this call, after the GEMM is enqueued
+            ctx.bf16_share_src1 = nullptr;
+            ctx.bf16_share_data = nullptr;
+        }
+    } else if (src1->type == compute_type) {
         src1_ptr = (const cuda_t *) src1->data;
     } else {
         src1_alloc.alloc(ggml_nelements(src1));
@@ -5299,6 +5318,60 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // T447 GGML_GDN_GATED_NORM: Qwen3.5 GDN gated norm RMS_NORM + MUL(w) + SILU(z) + MUL in one launch (the graph builder
+    // hoists z so the four nodes are adjacent). Prefill-sized inputs only; decode keeps the existing two fusions.
+    if (node->op == GGML_OP_RMS_NORM && i + 3 < cgraph->n_nodes && node->ne[0] == 128 && ggml_nrows(node) >= 64) {
+        static const bool gated_norm = getenv("GGML_GDN_GATED_NORM") != nullptr && atoi(getenv("GGML_GDN_GATED_NORM")) == 1;   // 2 = hoist z only (debug)
+        // the z view (RESHAPE) is a graph node of its own between the weight MUL and the SILU
+        // (ggml_can_fuse_subgraph rejects it: the view's source z is produced outside the span, so the span is validated by hand:
+        // ops in order, each intermediate used exactly once, not a graph output)
+        if (gated_norm && i + 4 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL && cgraph->nodes[i + 2]->op == GGML_OP_RESHAPE &&
+                cgraph->nodes[i + 3]->op == GGML_OP_UNARY && cgraph->nodes[i + 4]->op == GGML_OP_MUL &&
+                ggml_node_get_use_count(cgraph, i) == 1 && ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+                ggml_node_get_use_count(cgraph, i + 2) == 1 && ggml_node_get_use_count(cgraph, i + 3) == 1 &&
+                !(node->flags & GGML_TENSOR_FLAG_OUTPUT) && !(cgraph->nodes[i + 1]->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                !(cgraph->nodes[i + 3]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            const ggml_tensor * mulw = cgraph->nodes[i + 1];
+            const ggml_tensor * rsh  = cgraph->nodes[i + 2];
+            const ggml_tensor * un   = cgraph->nodes[i + 3];
+            const ggml_tensor * mulg = cgraph->nodes[i + 4];
+            if (ggml_get_unary_op(un) == GGML_UNARY_OP_SILU && (mulw->src[0] == node || mulw->src[1] == node) &&
+                un->src[0] == rsh && rsh->src[0] != mulw && rsh->src[0] != node &&
+                ((mulg->src[0] == mulw && mulg->src[1] == un) || (mulg->src[1] == mulw && mulg->src[0] == un))) {
+                // GGML_GDN_GATED_NORM_VERIFY=1: run the unfused chain first and count the bytes the fused kernel changes
+                static const bool vfy = getenv("GGML_GDN_GATED_NORM_VERIFY") != nullptr && atoi(getenv("GGML_GDN_GATED_NORM_VERIFY")) != 0;
+                ggml_cuda_pool_alloc<char> ref(cuda_ctx->pool(), vfy ? ggml_nbytes(mulg) : 0);
+                if (vfy) {
+                    ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, const_cast<ggml_tensor *>(mulw));
+                    ggml_cuda_op_unary_mul(*cuda_ctx, const_cast<ggml_tensor *>(un), const_cast<ggml_tensor *>(mulg));
+                    CUDA_CHECK(cudaMemcpyAsync(ref.get(), mulg->data, ggml_nbytes(mulg), cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+                }
+                if (ggml_cuda_op_rms_norm_mul_silu_gate(*cuda_ctx, node, mulw, un, mulg)) {
+                    if (vfy) {
+                        const int64_t d = ggml_cuda_act_count_diff(ref.get(), mulg->data, ggml_nbytes(mulg), cuda_ctx->stream());
+                        struct totals { int64_t n = 0, d = 0, b = 0;
+                            ~totals() { fprintf(stderr, "gated-norm: VERIFY %lld launches: %lld/%lld bytes differ from the unfused chain\n",
+                                (long long) n, (long long) d, (long long) b); } };
+                        static totals t;
+                        t.n++; t.d += d; t.b += (int64_t) ggml_nbytes(mulg);
+                    }
+                    return 4;
+                }
+            }
+        }
+        if (gated_norm && ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL }, { i + 3 })) {
+            const ggml_tensor * mulw = cgraph->nodes[i + 1];
+            const ggml_tensor * un   = cgraph->nodes[i + 2];
+            const ggml_tensor * mulg = cgraph->nodes[i + 3];
+            if (ggml_get_unary_op(un) == GGML_UNARY_OP_SILU && (mulw->src[0] == node || mulw->src[1] == node) &&
+                un->src[0] != mulw && un->src[0] != node &&
+                ((mulg->src[0] == mulw && mulg->src[1] == un) || (mulg->src[1] == mulw && mulg->src[0] == un)) &&
+                ggml_cuda_op_rms_norm_mul_silu_gate(*cuda_ctx, node, mulw, un, mulg)) {
+                return 3;
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
@@ -5835,7 +5908,49 @@ static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph
     return r;
 }
 
+// T447 GGML_CUDA_BF16_SHARE: before a BF16-weight MUL_MAT on an F32 activation, look a few nodes ahead for a sibling MUL_MAT on the SAME
+// activation tensor (GDN ssm_beta / ssm_alpha) and arm the context so the pair converts the activation to bf16 once. Nothing between the
+// two may write into the activation's memory. Prefill-sized activations only (>= 64 rows), which never run under a captured CUDA graph.
+static void ggml_cuda_bf16_share_arm(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool enabled = getenv("GGML_CUDA_BF16_SHARE") != nullptr && atoi(getenv("GGML_CUDA_BF16_SHARE")) != 0;
+    if (!enabled) {
+        return;
+    }
+    if (ctx.bf16_share_src1 != nullptr && i > ctx.bf16_share_end) {
+        ctx.bf16_share_buf.reset();
+        ctx.bf16_share_src1 = nullptr;
+        ctx.bf16_share_data = nullptr;
+    }
+    const ggml_tensor * node = cgraph->nodes[i];
+    const ggml_tensor * x    = node->src[1];
+    if (ctx.bf16_share_src1 != nullptr || node->src[0]->type != GGML_TYPE_BF16 || x->type != GGML_TYPE_F32 ||
+            x->ne[1] < 64 || x->ne[2] != 1 || x->ne[3] != 1 || !ggml_is_contiguously_allocated(x)) {
+        return;
+    }
+    const char * lo = (const char *) x->data;
+    const char * hi = lo + ggml_nbytes(x);
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 8; j++) {
+        const ggml_tensor * n2 = cgraph->nodes[j];
+        if (n2->op == GGML_OP_MUL_MAT && n2->src[1] == x && n2->src[0]->type == GGML_TYPE_BF16) {
+            ctx.bf16_share_src1 = x;
+            ctx.bf16_share_data = x->data;
+            ctx.bf16_share_uses = 2;
+            ctx.bf16_share_end  = j;
+            return;
+        }
+        const bool pure_view = n2->op == GGML_OP_NONE || n2->op == GGML_OP_RESHAPE || n2->op == GGML_OP_VIEW ||
+                               n2->op == GGML_OP_PERMUTE || n2->op == GGML_OP_TRANSPOSE;
+        if (!pure_view && n2->data != nullptr && (const char *) n2->data >= lo && (const char *) n2->data < hi) {
+            return;   // an op (possibly in place) writes into the activation before the sibling reads it
+        }
+    }
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+    // T447: never carry a shared bf16 conversion across graph evaluations (the activation buffer is rewritten each ubatch)
+    cuda_ctx->bf16_share_buf.reset();
+    cuda_ctx->bf16_share_src1 = nullptr;
+    cuda_ctx->bf16_share_data = nullptr;
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -6113,6 +6228,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }();
                 if (skip_rms_norm && node->op == GGML_OP_RMS_NORM) {
                     continue;
+                }
+
+                if (node->op == GGML_OP_MUL_MAT) {
+                    ggml_cuda_bf16_share_arm(*cuda_ctx, cgraph, i);
                 }
 
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);

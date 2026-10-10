@@ -2011,6 +2011,14 @@ struct ggml_backend_cuda_context {
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
 
+    // T447 GGML_CUDA_BF16_SHARE: sibling BF16 GEMMs on one F32 activation share one bf16 conversion (set by the graph loop,
+    // consumed in ggml_cuda_mul_mat_cublas_impl). Declared AFTER pools[] like the cache below.
+    const ggml_tensor * bf16_share_src1 = nullptr;
+    const void *        bf16_share_data = nullptr;
+    int                 bf16_share_uses = 0;
+    int                 bf16_share_end  = -1;   // graph node index of the sibling; state is dropped once the loop passes it
+    std::unique_ptr<ggml_cuda_pool_alloc<char>> bf16_share_buf;
+
     // T180 diagnostic (see mmvq.cu): keyed cache buffer for the quant-dedup
     // experiment. Declared AFTER pools[] (destroyed before it -- reverse
     // declaration order).

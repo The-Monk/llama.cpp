@@ -1,6 +1,7 @@
 #include "norm.cuh"
 #include "quantize.cuh"
 #include "fwht-dev.cuh"
+#include "unary.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -886,5 +887,52 @@ bool ggml_cuda_op_rms_norm_mul_fwht_q8_1(ggml_backend_cuda_context & ctx, const 
     const ggml_cuda_kernel_launch_params launch_params{dim3(1, 1, 1), dim3(1024, 1, 1), 32 * sizeof(float), ctx.stream()};
     ggml_cuda_kernel_launch(rms_norm_mul_fwht_q8_1_f32, launch_params, (const float *) x->data, (float *) norm_dst->data, (int) ncols, eps,
         (const float *) mul_w->data, (const float *) signs->data, fscale, (float *) fwht_dst->data, (block_q8_1 *) qy);
+    return true;
+}
+
+// T447 GGML_GDN_GATED_NORM: Qwen3.5 GDN output gate, RMS_NORM + MUL(weight) + SILU(z) + MUL in ONE launch (ncols == 128, one
+// 128-thread block per row). Arithmetic and reduction tree are those of the unfused chain: rms_norm_f32<256, true> runs 256 threads
+// over 128 columns, i.e. four live warps whose partials meet in a second butterfly with zeros in lanes 4..7; block_reduce<SUM, 128>
+// reads lanes 0..3 and zeros elsewhere, the same sums in the same order. The normed intermediate is never written.
+template <int ncols>
+static __global__ void __launch_bounds__(ncols) rms_norm_mul_silu_gate_f32(
+        const float * x, const float * w, const float * z, float * dst, const float eps) {
+    __shared__ float s_sum[32];
+    const int64_t row = blockIdx.x;
+    const int     tid = threadIdx.x;
+    ggml_cuda_pdl_sync();
+    const float xi = x[row * ncols + tid];
+    float tmp = xi * xi;
+    asm volatile("" : "+v"(tmp));   // round x*x before the butterfly: otherwise it contracts into fma(x, x, partner) (rms_norm_f32 sums rounded squares)
+    tmp = block_reduce<block_reduce_method::SUM, ncols>(tmp, s_sum);
+    const float mean   = tmp / ncols;
+    const float scale  = rsqrtf(mean + eps);
+    // rms_norm_f32<256, true> compiles to (scale * x) * w and stores it; -ffast-math would re-associate this to (x * w) * scale, so pin
+    // the order and the fp32 rounding at the memory boundary the unfused chain has. The gate multiply is left as written: the unfused
+    // unary_gated_op_kernel compiles silu(z) * normed to (z * normed) * rcp(1 + exp), and so does this one.
+    float normed = scale * xi;
+    asm volatile("" : "+v"(normed));
+    normed = normed * w[tid];
+    asm volatile("" : "+v"(normed));
+    dst[row * ncols + tid] = ggml_cuda_op_silu_single(z[row * ncols + tid]) * normed;
+}
+
+bool ggml_cuda_op_rms_norm_mul_silu_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * mulw,
+        const ggml_tensor * silu, const ggml_tensor * mulg) {
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * w = mulw->src[0] == rms ? mulw->src[1] : mulw->src[0];
+    const ggml_tensor * z = silu->src[0];
+    float eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    if (x->ne[0] != 128 || x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || z->type != GGML_TYPE_F32 ||
+        mulg->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(z) || !ggml_is_contiguous(mulg) ||
+        !ggml_is_contiguous(w) || ggml_nelements(w) != 128 || ggml_nelements(z) != ggml_nelements(x) ||
+        ggml_nelements(mulg) != ggml_nelements(x) || ggml_nrows(x) > INT_MAX ||
+        ((uintptr_t) x->data | (uintptr_t) w->data | (uintptr_t) z->data | (uintptr_t) mulg->data) % 4 != 0) {
+        return false;
+    }
+    const ggml_cuda_kernel_launch_params launch_params{dim3((unsigned) ggml_nrows(x), 1, 1), dim3(128, 1, 1), 0, ctx.stream()};
+    ggml_cuda_kernel_launch(rms_norm_mul_silu_gate_f32<128>, launch_params, (const float *) x->data, (const float *) w->data,
+        (const float *) z->data, (float *) mulg->data, eps);
     return true;
 }
