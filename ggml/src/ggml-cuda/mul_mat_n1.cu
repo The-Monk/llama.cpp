@@ -72,6 +72,7 @@ struct n1_env {
     bool    m3 = false;     // GGML_N1_M3=1 (T434, default OFF, DIFFERENT MATH, KLD-gated): Hadamard-model activations (src1 = FWHT node)
                             // quantised per TOKEN, folded int8 weights, ONE int32 accumulation over the whole K (no in-loop rescale)
     int     m3_segs = 1;
+    int     m3_feed = 0;       // GGML_N1_M3_FEED (T435): 1 = wave tile 64 tok x 64 feat (W LDS reads per WMMA halved), 2 = 32 tok x 128 feat (X loads per WMMA halved); both on a 256 x 128 block
     bool    m3_wide = false;   // GGML_N1_M3_WIDE=1: always the 256-token tile (A/B only)
     int     m2bc_flush = 8;
     bool    m2bc = false;   // GGML_N1_M2=2 (T424): M2 path + bias-carry rescale (one fmac per element per 256 K)
@@ -86,6 +87,8 @@ struct n1_env {
         m3_wide = getenv("GGML_N1_M3_WIDE") != nullptr;
         const char * m3s = getenv("GGML_N1_M3_SEGS");
         m3_segs = m3s && atoi(m3s) == 2 ? 2 : 1;
+        const char * m3f = getenv("GGML_N1_M3_FEED");
+        m3_feed = m3f && (atoi(m3f) == 1 || atoi(m3f) == 2) ? atoi(m3f) : 0;
         const char * fe = getenv("GGML_N1_M2BC_FLUSH");
         m2bc_flush = fe ? atoi(fe) : 8;
         dump = getenv("GGML_N1_DUMP");
@@ -567,27 +570,32 @@ void launch_m2_bc(const void * X, const void * W, const n1_w * fo, const float *
 // T434 M3: ONE int32 accumulation over all of K (gemm_fold<ONEACC>, RS = 1), per-token scale sx[t], epilogue (acc * sx) * S_f
 // WTn = 8: 256 tokens x 64 features per workgroup (the fast tile); WTn = 4, WFn = 2: 128 tokens x 128 features (odd token-tile
 // counts: the 256-token tile would waste a whole half tile; 3% slower per FLOP in the standalone harness)
-template <int KT, int WTn, int WFn, int SEGS>
+// FEED: 0 = wave tile 32 tok x 64 feat; m2::FT4 = 64 x 64; m2::FF8 = 32 x 128 (T435). BT = 16 * FT * WTn tokens, BF = 16 * FF * WFn features per workgroup.
+template <int KT, int WTn, int WFn, int SEGS, int FEED>
 void launch_m3_kt(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
-    constexpr int TPB = WTn / 4;   // 128-token tiles per workgroup
+    constexpr int FTv = (FEED & m2::FT4) ? 4 : 2, FFv = (FEED & m2::FF8) ? 8 : 4;
+    constexpr int TPB = 16 * FTv * WTn / 128;   // 128-token tiles per workgroup
     const int ntile = Npad / 128;
-    const dim3 grid((ntile + TPB - 1) / TPB, F / (64 * WFn));
-    m2::gemm_fold<WTn, WFn, SEGS, 1, KT | m2::ONEACC><<<grid, WTn * WFn * 32, 0, st>>>((const uint4 *) X, (const uint4 *) W, (const int8_t *) fo->w,
+    const dim3 grid((ntile + TPB - 1) / TPB, F / (16 * FFv * WFn));
+    m2::gemm_fold<WTn, WFn, SEGS, 1, KT | m2::ONEACC | FEED><<<grid, WTn * WFn * 32, 0, st>>>((const uint4 *) X, (const uint4 *) W, (const int8_t *) fo->w,
         (const float *) fo->sw, sx, Y, N, ntile, F, K, ldy);
 }
-template <int WTn, int WFn, int SEGS>
+template <int WTn, int WFn, int SEGS, int FEED>
 void launch_m3_s(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
     switch (K) {
-        case 5120:  launch_m3_kt<(5120 / 1024) << 3,  WTn, WFn, SEGS>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
-        case 6144:  launch_m3_kt<(6144 / 1024) << 3,  WTn, WFn, SEGS>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
-        case 17408: launch_m3_kt<(17408 / 1024) << 3, WTn, WFn, SEGS>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
-        default:    launch_m3_kt<0,                   WTn, WFn, SEGS>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+        case 5120:  launch_m3_kt<(5120 / 1024) << 3,  WTn, WFn, SEGS, FEED>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+        case 6144:  launch_m3_kt<(6144 / 1024) << 3,  WTn, WFn, SEGS, FEED>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+        case 17408: launch_m3_kt<(17408 / 1024) << 3, WTn, WFn, SEGS, FEED>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+        default:    launch_m3_kt<0,                   WTn, WFn, SEGS, FEED>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
     }
 }
 void launch_m3(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
-    if ((Npad / 128) % 2 == 1 && !env().m3_wide) launch_m3_s<4, 2, 1>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
-    else if (env().m3_segs == 2 && (K / 128) % 2 == 0) launch_m3_s<8, 1, 2>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
-    else launch_m3_s<8, 1, 1>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
+    const bool odd = (Npad / 128) % 2 == 1 && !env().m3_wide;
+    if (odd) launch_m3_s<4, 2, 1, 0>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
+    else if (env().m3_feed == 1) launch_m3_s<4, 2, 1, m2::FT4>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
+    else if (env().m3_feed == 2) launch_m3_s<8, 1, 1, m2::FF8>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
+    else if (env().m3_segs == 2 && (K / 128) % 2 == 0) launch_m3_s<8, 1, 2, 0>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
+    else launch_m3_s<8, 1, 1, 0>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
 }
 
 void launch_m2(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
