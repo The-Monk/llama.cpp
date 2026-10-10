@@ -87,7 +87,7 @@ struct n1_env {
         m3 = !(m3e && strcmp(m3e, "0") == 0);   // default ON (GGML_N1_M3=0 disables); engages only when src1 is a prism.hadamard FWHT node
         m3_wide = getenv("GGML_N1_M3_WIDE") != nullptr;
         const char * gue = getenv("GGML_N1_GATEUP");
-        gateup = gue && strcmp(gue, "0") != 0;
+        gateup = !(gue && strcmp(gue, "0") == 0);   // default ON (GGML_N1_GATEUP=0 disables)
         const char * m3s = getenv("GGML_N1_M3_SEGS");
         m3_segs = m3s && atoi(m3s) == 2 ? 2 : 1;
         const char * m3f = getenv("GGML_N1_M3_FEED");
