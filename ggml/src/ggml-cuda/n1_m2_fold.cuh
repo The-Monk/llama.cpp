@@ -44,6 +44,7 @@ constexpr int ABX = 1 << 29, ABW = 1 << 30, ABC = 1 << 9, ABB = 1 << 10;
 constexpr int FF8 = 1 << 11, FT4 = 1 << 12;
 constexpr int ABCV = 1 << 13, ABCM = 1 << 14, ABCS = 1 << 15;   // commit sub-ablations: no widen VALU (raw dword splat), no m u8 loads, no ds_store (which also kills the widen)
 constexpr int LDSA = 1 << 28;  // T435: W fragments read by inline-asm ds_load_b128, ONE s_wait_dscnt per k-block (the compiler emits one per fragment)
+constexpr int PRW = 1 << 8;   // T440 (GGML_N1_M3_FEED=3): s_setprio 2 around each k-block's WMMA burst (the burst-issuing wave wins the SIMD; widen/loads of the sibling waves fill its gaps)
 constexpr int ONEACC = 1 << 27;  // T434 variant bit: ONE int32 accumulation over the whole K (RS = 1), epilogue acc * sx[t] * S_f; no in-loop rescale
 constexpr int BCARRY = 1 << 24;   // T424 variant bit: bias-carry rescale (GGML_N1_M2=2); the low bits tag K (K / 1024 << 3)
 
@@ -76,6 +77,7 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
     static_assert(SEGS == 1 || SEGS == 2, "SEGS");
     static_assert(RS >= SEGS || RS == 1, "a stage may not split... RS < SEGS handled per segment");
     constexpr bool kLpf = V & LPF, kBc = V & BCARRY, kOne = V & ONEACC, kLa = V & LDSA;
+    constexpr bool kPrw = V & PRW;
     constexpr bool kAbX = V & ABX, kAbW = V & ABW, kAbC = V & ABC, kAbB = V & ABB, kAbCV = V & ABCV, kAbCM = V & ABCM, kAbCS = V & ABCS;
     static_assert(!kOne || RS == 1, "ONEACC: per-token scale, no rescale groups");
     constexpr int U = (RS > SEGS) ? RS / SEGS : 1;   // stages unrolled per loop iteration
@@ -293,6 +295,7 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
                     else asm volatile("s_wait_loadcnt %0" :: "i"(3 * FT) : "memory");
 #pragma unroll
                     for (int i = 0; i < FT; ++i) asm volatile("" : "+v"(xr[kb][i]));
+                    if constexpr (kPrw) asm volatile("s_setprio 2" ::: "memory");
 #pragma unroll
                     for (int i = 0; i < FT; ++i)
 #pragma unroll
@@ -304,6 +307,7 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
                             acc[i][j] = wmma_iu8(w1, x1, c0);
                         }
                     __builtin_amdgcn_sched_barrier(0);
+                    if constexpr (kPrw) asm volatile("s_setprio 0" ::: "memory");
                     if constexpr (!kAbX) XLOAD(Gn, kb)
                 }
                 const bool resc = (p == RS - 1);

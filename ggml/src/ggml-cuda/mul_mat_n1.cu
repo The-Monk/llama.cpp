@@ -72,7 +72,7 @@ struct n1_env {
     bool    m3 = false;     // GGML_N1_M3=1 (T434, default OFF, DIFFERENT MATH, KLD-gated): Hadamard-model activations (src1 = FWHT node)
                             // quantised per TOKEN, folded int8 weights, ONE int32 accumulation over the whole K (no in-loop rescale)
     int     m3_segs = 1;
-    int     m3_feed = 0;       // GGML_N1_M3_FEED (T435): 1 = wave tile 64 tok x 64 feat (W LDS reads per WMMA halved), 2 = 32 tok x 128 feat (X loads per WMMA halved); both on a 256 x 128 block
+    int     m3_feed = 0;       // GGML_N1_M3_FEED (T435): 1 = wave tile 64 tok x 64 feat (W LDS reads per WMMA halved), 2 = 32 tok x 128 feat (X loads per WMMA halved), 3 = tile 1 + s_setprio 2 around each k-block's WMMA burst (T440); all on a 256 x 128 block
     bool    m3_wide = false;   // GGML_N1_M3_WIDE=1: always the 256-token tile (A/B only)
     int     m2bc_flush = 8;
     bool    m2bc = false;   // GGML_N1_M2=2 (T424): M2 path + bias-carry rescale (one fmac per element per 256 K)
@@ -88,7 +88,7 @@ struct n1_env {
         const char * m3s = getenv("GGML_N1_M3_SEGS");
         m3_segs = m3s && atoi(m3s) == 2 ? 2 : 1;
         const char * m3f = getenv("GGML_N1_M3_FEED");
-        m3_feed = m3f && (atoi(m3f) == 1 || atoi(m3f) == 2) ? atoi(m3f) : 0;
+        m3_feed = m3f && atoi(m3f) >= 1 && atoi(m3f) <= 3 ? atoi(m3f) : 0;
         const char * fe = getenv("GGML_N1_M2BC_FLUSH");
         m2bc_flush = fe ? atoi(fe) : 8;
         dump = getenv("GGML_N1_DUMP");
@@ -593,6 +593,7 @@ void launch_m3(const void * X, const void * W, const n1_w * fo, const float * sx
     const bool odd = (Npad / 128) % 2 == 1 && !env().m3_wide;
     if (odd) launch_m3_s<4, 2, 1, 0>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
     else if (env().m3_feed == 1) launch_m3_s<4, 2, 1, m2::FT4>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
+    else if (env().m3_feed == 3) launch_m3_s<4, 2, 1, m2::FT4 | m2::PRW>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
     else if (env().m3_feed == 2) launch_m3_s<8, 1, 1, m2::FF8>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
     else if (env().m3_segs == 2 && (K / 128) % 2 == 0) launch_m3_s<8, 1, 2, 0>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
     else launch_m3_s<8, 1, 1, 0>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
