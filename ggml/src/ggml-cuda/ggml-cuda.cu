@@ -4227,7 +4227,7 @@ static int ggml_cuda_find_mmvq_group(const ggml_cgraph * cgraph, int i, int cc, 
 // weight geometry (Bonsai 2's ssm_beta / ssm_alpha, 48x5120 each: ~3.5 us launch-bound kernels the Q2_0 matrix-table group
 // cannot take) run as ONE mmvf launch over both row sets, same per-row arithmetic. Returns the partner node index or -1.
 static int ggml_cuda_find_mmvf_pair(const ggml_cgraph * cgraph, int i, int cc) {
-    static const bool enabled = getenv("GGML_CUDA_MMVF_PAIR") != nullptr && atoi(getenv("GGML_CUDA_MMVF_PAIR")) != 0;
+    static const bool enabled = getenv("GGML_CUDA_MMVF_PAIR") == nullptr || atoi(getenv("GGML_CUDA_MMVF_PAIR")) != 0;   // default ON, =0 disables
     if (!enabled) {
         return -1;
     }
@@ -4326,7 +4326,7 @@ static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph
 
 static const ggml_tensor * ggml_cuda_act_first_consumer(const ggml_cgraph * cgraph, int i, const ggml_tensor * t);
 static int ggml_cuda_fwht_quant_mode() {   // bit 0: FWHT+q8_1 fusion, bit 1: + RMS_NORM fused in, bit 2: verify against the reference quantizer
-    static const int m = [] { const char * v = getenv("GGML_CUDA_FWHT_QUANT"); return v ? atoi(v) : 0; }();
+    static const int m = [] { const char * v = getenv("GGML_CUDA_FWHT_QUANT"); return v ? atoi(v) : 3; }();   // default ON (3), =0 disables
     return m;
 }
 static bool ggml_cuda_fwht_quant_enabled() { return (ggml_cuda_fwht_quant_mode() & 1) != 0; }
