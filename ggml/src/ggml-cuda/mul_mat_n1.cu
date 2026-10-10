@@ -69,6 +69,7 @@ struct n1_env {
     bool    transient = false;
     bool    m1 = true;
     bool    m2 = false;
+    int     m2bc_flush = 8;
     bool    m2bc = false;   // GGML_N1_M2=2 (T424): M2 path + bias-carry rescale (one fmac per element per 256 K)
     n1_env() {
         const char * m1e = getenv("GGML_N1_M1");
@@ -76,6 +77,8 @@ struct n1_env {
         const char * m2e = getenv("GGML_N1_M2");
         m2 = m2e && (strcmp(m2e, "1") == 0 || strcmp(m2e, "2") == 0);
         m2bc = m2e && strcmp(m2e, "2") == 0;
+        const char * fe = getenv("GGML_N1_M2BC_FLUSH");
+        m2bc_flush = fe ? atoi(fe) : 8;
         dump = getenv("GGML_N1_DUMP");
         const char * tr = getenv("GGML_N1_TRANSIENT");
         transient = tr && strcmp(tr, "1") == 0;
@@ -528,14 +531,15 @@ const n1_w * get_fold(const ggml_tensor * src0, const void * W2, const void * SW
     return &g_fold.emplace(src0->data, c).first->second;
 }
 
-template <int KT, bool BC>
+// BC: 0 = exact sub + fmac rescale (GGML_N1_M2=1); else m2::BCARRY | (log2(flush groups) << 25)
+template <int KT, int BC>
 void launch_m2_kt(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
     const int ntile = Npad / 128;
     const dim3 grid((ntile + 1) / 2, F / 64);
-    m2::gemm_fold<8, 1, 1, 2, KT | (BC ? m2::BCARRY : 0)><<<grid, 256, 0, st>>>((const uint4 *) X, (const uint4 *) W, (const int8_t *) fo->w,
+    m2::gemm_fold<8, 1, 1, 2, KT | BC><<<grid, 256, 0, st>>>((const uint4 *) X, (const uint4 *) W, (const int8_t *) fo->w,
         (const float *) fo->sw, sx, Y, N, ntile, F, K, ldy);
 }
-template <bool BC>
+template <int BC>
 void launch_m2_bc(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
     // the last template slot of gemm_fold is its variant mask (bit LPF = 4, BCARRY = 1 << 24); KT tags K in the kernel name
     // for rocprofv3 with values that never set bit 2 (K / 1024 << 3)
@@ -547,8 +551,13 @@ void launch_m2_bc(const void * X, const void * W, const n1_w * fo, const float *
     }
 }
 void launch_m2(const void * X, const void * W, const n1_w * fo, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
-    if (env().m2bc) launch_m2_bc<true >(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
-    else            launch_m2_bc<false>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st);
+    if (!env().m2bc) { launch_m2_bc<0>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); return; }
+    switch (env().m2bc_flush) {   // GGML_N1_M2BC_FLUSH = 1, 2, 4 or 8 (default 8)
+        case 1:  launch_m2_bc<m2::BCARRY | (0 << 25)>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+        case 2:  launch_m2_bc<m2::BCARRY | (1 << 25)>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+        case 4:  launch_m2_bc<m2::BCARRY | (2 << 25)>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+        default: launch_m2_bc<m2::BCARRY | (3 << 25)>(X, W, fo, sx, Y, N, Npad, F, K, ldy, st); break;
+    }
 }
 
 // ---------------- GEMM launch ----------------

@@ -114,7 +114,7 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
     float sxa[FT];
     float sxs[FT] = {0.f, 0.f};   // BC (T424): running sum of the group scales; BIASF * sxs is subtracted every BC_FLUSH groups and in the epilogue
     int nres = 0;
-    constexpr int BC_FLUSH = 8;   // power of two
+    constexpr int BC_FLUSH = 1 << ((V >> 25) & 3);   // 1, 2, 4 or 8 rescale groups between bias flushes (variant bits 25-26)
 
 #define XLOAD(G, kb)                                                                                       \
     { const char* xb_ = xg + (size_t)(G) * XB;                                                                \
