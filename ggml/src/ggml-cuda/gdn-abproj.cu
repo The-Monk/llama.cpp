@@ -8,9 +8,8 @@ static __device__ __forceinline__ nv_bfloat162 abproj_bf2(const float a, const f
     return r;
 }
 
-// One block = 16 tokens x 48 outputs of ONE matrix (blockIdx.y: 0 = first, 1 = second; the activation is read by both blocks, the
-// second read hits L2): 8 waves split K, each accumulates 3 WMMA 16x16 tiles over its contiguous K slice, then the partial tiles are
-// reduced through LDS. 128 blocks at N=1024 (one block of 64 would leave half the CUs idle). RDNA4 only (gfx12 bf16 WMMA).
+// One block = 16 tokens x (48 + 48) outputs. 8 waves split K; each wave accumulates 6 WMMA 16x16 tiles (3 per matrix) over its
+// contiguous K slice, then the partial tiles are reduced through LDS. RDNA4 only (gfx12 bf16 WMMA).
 #define ABPROJ_NWAVES 8
 #define ABPROJ_NRT    3     // 48 features = 3 row tiles per matrix
 
@@ -23,10 +22,7 @@ static __global__ void __launch_bounds__(ABPROJ_NWAVES * 32) gdn_ab_proj_kernel(
     typedef tile<16, 8, nv_bfloat162> tile_ab;
     typedef tile<16, 16, float>       tile_c;
 
-    __shared__ float red[ABPROJ_NWAVES][ABPROJ_NRT][8][32];
-    const nv_bfloat162 * __restrict__ wm = blockIdx.y == 0 ? wa : wb;
-    float * __restrict__ dm = blockIdx.y == 0 ? da : db;
-    const int64_t sdm = blockIdx.y == 0 ? sda : sdb;
+    __shared__ float red[ABPROJ_NWAVES][2 * ABPROJ_NRT][8][32];
 
     const int wave   = threadIdx.x / 32;
     const int lane   = threadIdx.x % 32;
@@ -35,13 +31,15 @@ static __global__ void __launch_bounds__(ABPROJ_NWAVES * 32) gdn_ab_proj_kernel(
     const int ks0    = (wave * ksteps) / ABPROJ_NWAVES;
     const int ks1    = ((wave + 1) * ksteps) / ABPROJ_NWAVES;
 
-    tile_c acc[ABPROJ_NRT];
+    tile_c acc[2 * ABPROJ_NRT];
 
     const int  tok_l  = tok0 + lane % 16;
     const bool tok_ok = tok_l < n_tok;
     const float * xrow = x + (int64_t) (tok_ok ? tok_l : 0) * sx + (lane / 16) * 8;
 
-#pragma unroll 2
+    // 4 k-steps per iteration: the 8 float4 activation loads of the unrolled steps are issued before their WMMAs (memory-level parallelism;
+    // v1 without unroll read the 21 MB activation at ~330 GB/s, half of the card)
+#pragma unroll 4
     for (int ks = ks0; ks < ks1; ++ks) {
         tile_ab B;
         {
@@ -56,8 +54,8 @@ static __global__ void __launch_bounds__(ABPROJ_NWAVES * 32) gdn_ab_proj_kernel(
             B.x[3] = abproj_bf2(v1.z, v1.w);
         }
 #pragma unroll
-        for (int t = 0; t < ABPROJ_NRT; ++t) {
-            const nv_bfloat162 * w = wm + (int64_t) (t * 16 + lane % 16) * sw + ks * 8 + (lane / 16) * 4;
+        for (int t = 0; t < 2 * ABPROJ_NRT; ++t) {
+            const nv_bfloat162 * w = (t < ABPROJ_NRT ? wa : wb) + (int64_t) ((t % ABPROJ_NRT) * 16 + lane % 16) * sw + ks * 8 + (lane / 16) * 4;
             tile_ab A;
             const uint4 u = *(const uint4 *) w;
             *(uint4 *) &A.x[0] = u;
@@ -66,7 +64,7 @@ static __global__ void __launch_bounds__(ABPROJ_NWAVES * 32) gdn_ab_proj_kernel(
     }
 
 #pragma unroll
-    for (int t = 0; t < ABPROJ_NRT; ++t) {
+    for (int t = 0; t < 2 * ABPROJ_NRT; ++t) {
 #pragma unroll
         for (int l = 0; l < 8; ++l) {
             red[wave][t][l][lane] = acc[t].x[l];
@@ -75,7 +73,7 @@ static __global__ void __launch_bounds__(ABPROJ_NWAVES * 32) gdn_ab_proj_kernel(
     __syncthreads();
 
     // idx -> (t, token, f): f fastest so a wave stores contiguous features of one token
-    for (int idx = threadIdx.x; idx < ABPROJ_NRT * 16 * 16; idx += ABPROJ_NWAVES * 32) {
+    for (int idx = threadIdx.x; idx < 2 * ABPROJ_NRT * 16 * 16; idx += ABPROJ_NWAVES * 32) {
         const int f   = idx % 16;
         const int tk  = (idx / 16) % 16;
         const int t   = idx / 256;
@@ -87,7 +85,11 @@ static __global__ void __launch_bounds__(ABPROJ_NWAVES * 32) gdn_ab_proj_kernel(
             s += red[w][t][l][ln];
         }
         if (tok0 + tk < n_tok) {
-            dm[(int64_t) (tok0 + tk) * sdm + t * 16 + f] = s;
+            if (t < ABPROJ_NRT) {
+                da[(int64_t) (tok0 + tk) * sda + t * 16 + f] = s;
+            } else {
+                db[(int64_t) (tok0 + tk) * sdb + (t - ABPROJ_NRT) * 16 + f] = s;
+            }
         }
     }
 #else
@@ -121,7 +123,7 @@ void ggml_cuda_gdn_ab_proj(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const ggml_tensor * wb  = b->src[0];
     const ggml_tensor * act = a->src[1];
     const int n_tok = (int) act->ne[1];
-    const dim3 grid((n_tok + 15) / 16, 2, 1);
+    const dim3 grid((n_tok + 15) / 16, 1, 1);
     const dim3 block(ABPROJ_NWAVES * 32, 1, 1);
     gdn_ab_proj_kernel<<<grid, block, 0, ctx.stream()>>>(
         (const float *) act->data, (const nv_bfloat162 *) wa->data, (const nv_bfloat162 *) wb->data,
