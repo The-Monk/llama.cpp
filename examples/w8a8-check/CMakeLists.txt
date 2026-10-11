@@ -1,0 +1,8 @@
+set(TARGET llama-w8a8-check)
+add_executable(${TARGET} w8a8-check.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
+if (TARGET ggml-hip)
+    target_link_libraries(${TARGET} PRIVATE ggml-hip)
+endif()
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

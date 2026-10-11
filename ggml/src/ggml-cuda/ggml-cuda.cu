@@ -787,6 +787,11 @@ static bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_cuda_buffer_free_buffer;
 }
 
+// T513: a plain device allocation (not host / pinned / split); gates the in-place W8A8 conversion of weights (mul_mat_n1.cu)
+bool ggml_cuda_buffer_is_plain_device(ggml_backend_buffer_t buffer) {
+    return buffer != nullptr && ggml_backend_buffer_is_cuda(buffer);
+}
+
 static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
     return ctx->dev_ptr;

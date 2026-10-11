@@ -10,6 +10,14 @@ bool ggml_cuda_n1_enabled();
 // T505 (GGML_N1_W8_INPLACE=1): this Q8_0 weight is converted in place to per-channel int8 by the W8A8 GEMM, so no other kernel (mmvq / mmq / the
 // gate-up and bias fusions) may read it as Q8_0.
 bool ggml_cuda_n1_w8_inplace(const ggml_tensor * t);
+bool ggml_cuda_buffer_is_plain_device(ggml_backend_buffer_t buffer);   // ggml-cuda.cu
+
+// T513 test hooks (tests/test-w8a8-kernels.cpp, examples/w8a8-check): the W8 kernels on caller-supplied int8 data, and the engagement counters.
+// W is row-major [F][K], X row-major [N][K], Y row-major [N][F] (all host pointers); which: 0 = routed, 1 = GEMV (N <= 16), 2 = GEMM,
+// 3 = the ROW kernel (GGML_N1_W8_KERNEL=0). Returns 0 on success.
+int  ggml_cuda_n1_w8_selftest(const int8_t * W, const float * rs, const int8_t * X, const float * sx, float * Y, int N, int F, int K, int which);
+// out[0] = W8 MUL_MATs, out[1] = tensors converted (in place or cached), out[2] = GEMV calls, out[3] = refused
+void ggml_cuda_n1_w8_counters(unsigned long long out[4]);
 
 // Coverage accounting: call for every MUL_MAT reaching ggml_cuda_mul_mat when enabled.
 void ggml_cuda_n1_count(const ggml_tensor * src0, const ggml_tensor * src1);

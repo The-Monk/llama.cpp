@@ -268,6 +268,12 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 
+# T513: tests that reach the enterprise W8A8 path (GGML_N1_W8); driven by tests/test-w8a8.sh, not by ctest (needs a GPU and env sweeps)
+if (TARGET ggml-hip)
+  llama_build(test-w8a8.cpp)
+  target_link_libraries(test-w8a8 PRIVATE ggml-hip)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

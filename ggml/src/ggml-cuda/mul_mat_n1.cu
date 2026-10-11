@@ -41,6 +41,7 @@
 #include "mmq.cuh"
 #include "hipblaslt_wcache.cuh"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -49,6 +50,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #if defined(GGML_USE_HIP)
 #include "n1_gemm_iu8.cuh"
@@ -85,6 +87,8 @@ struct n1_env {
     int     w8_check_every = 1; // GGML_N1_W8_CHECK_EVERY=<m>: check one call in m
     int     w8_check = 0;     // GGML_N1_W8_CHECK=<n>: debug, compare both W8 kernels against an integer reference on the first n calls
     bool    w8_inplace = false; // GGML_N1_W8_INPLACE=1: convert the eligible Q8_0 weights IN PLACE to per-channel int8 on first use (no extra VRAM; the Q8_0 bytes are gone; decode runs the same GEMM at N=1)
+    int     w8_gemv_max = 8;   // GGML_N1_W8_GEMV_MAX=<n> (T513, default 8 = the mmvq batch limit; 0 = off): in-place W8 MUL_MATs with N <= n run the decode GEMV
+                               // (k_w8_gemv, dp4a over the same per-channel int8 stream and the same per-token activation), not the 128-token-padded GEMM
     size_t  w8_cache_mb = 0;   // GGML_N1_W8_CACHE_MB: per-tensor int8 copies kept resident up to this many MB (0 = requantise into pool scratch on every call)
     bool    m2bc = false;   // GGML_N1_M2=2 (T424): M2 path + bias-carry rescale (one fmac per element per 256 K)
     n1_env() {
@@ -116,6 +120,8 @@ struct n1_env {
         w8_check_every = w8y && atoi(w8y) > 0 ? atoi(w8y) : 1;
         const char * w8i = getenv("GGML_N1_W8_INPLACE");
         w8_inplace = w8 && w8i && strcmp(w8i, "0") != 0;
+        const char * w8g = getenv("GGML_N1_W8_GEMV_MAX");
+        w8_gemv_max = w8g ? std::min(16, std::max(0, atoi(w8g))) : 8;
         const char * w8c = getenv("GGML_N1_W8_CACHE_MB");
         w8_cache_mb = w8c ? (size_t) atoll(w8c) : 0;
         const char * fe = getenv("GGML_N1_M2BC_FLUSH");
@@ -166,13 +172,15 @@ struct n1_stats {
     std::atomic<uint64_t> mm_m2{0}, fl_m2{0}, conv_fold{0};  // T422: g128-arm calls on the fold+g256 kernel
     std::atomic<uint64_t> mm_gu{0}, conv_gu{0}, bytes_gu{0}, fb_gu{0};   // T486: merged gate/up GEMM calls / merged weights / their bytes / refused
     std::atomic<uint64_t> mm_w8{0}, fl_w8{0}, w8_conv{0}, w8_trans{0}, w8_fb{0}, w8_act_hit{0};   // T505
+    std::atomic<uint64_t> w8_gemv{0};                                                               // T513: calls that ran the decode GEMV
     std::atomic<uint64_t> mm_m3{0}, fl_m3{0}, m3_hit{0};      // T434: one-GEMM calls (m3_hit: activation from the FWHT producer)
     ~n1_stats() {
         if (!env().on || !env().stats) return;
         if (env().w8) {
-            fprintf(stderr, "[N1] stats: w8a8 %llu ops / %.3f TFLOP, cached tensors %llu, transient requants %llu, refused %llu, act-cache hits %llu\n",
+            fprintf(stderr, "[N1] stats: w8a8 %llu ops / %.3f TFLOP, cached tensors %llu, transient requants %llu, refused %llu, act-cache hits %llu, gemv %llu\n",
                     (unsigned long long) mm_w8.load(), fl_w8.load() * 1e-12, (unsigned long long) w8_conv.load(),
-                    (unsigned long long) w8_trans.load(), (unsigned long long) w8_fb.load(), (unsigned long long) w8_act_hit.load());
+                    (unsigned long long) w8_trans.load(), (unsigned long long) w8_fb.load(), (unsigned long long) w8_act_hit.load(),
+                    (unsigned long long) w8_gemv.load());
         }
         if (env().m3) {
             fprintf(stderr, "[N1] stats: m3 one-gemm %llu ops / %.3f TFLOP, activation from the fused FWHT producer %llu\n",
@@ -448,6 +456,27 @@ std::unordered_map<const void *, bool> g_w8_inpl;   // GGML_N1_W8_INPLACE: tenso
 void n1_invalidate(const void * base, size_t size) {
     std::lock_guard<std::mutex> lk(g_mtx);
     const char * b = (const char *) base;
+    // T513: the W8 tables key on the raw device address of the Q8_0 weight, which a later model load can reuse. A stale "converted in
+    // place" entry would make the next model's fresh Q8_0 bytes be read as the per-channel int8 stream (silently wrong logits).
+    for (auto it = g_w8_inpl.begin(); it != g_w8_inpl.end();) {
+        const char * k = (const char *) it->first;
+        it = (k >= b && k < b + size) ? g_w8_inpl.erase(it) : std::next(it);
+    }
+    for (auto it = g_w8_refused.begin(); it != g_w8_refused.end();) {
+        const char * k = (const char *) *it;
+        it = (k >= b && k < b + size) ? g_w8_refused.erase(it) : std::next(it);
+    }
+    for (auto it = g_w8.begin(); it != g_w8.end();) {
+        const char * k = (const char *) it->first;
+        if (k >= b && k < b + size) {
+            if (it->second.w)  (void) hipFree(it->second.w);
+            if (it->second.rs) (void) hipFree(it->second.rs);
+            g_w8_bytes -= it->second.bytes;
+            it = g_w8.erase(it);
+        } else {
+            ++it;
+        }
+    }
     for (auto it = g_fold.begin(); it != g_fold.end();) {
         const char * k = (const char *) it->first;
         if (k >= b && k < b + size) {
@@ -1127,10 +1156,15 @@ const w8_w * w8_cached(const ggml_tensor * src0, bool rot) {
 
 // GGML_N1_W8_INPLACE=1: static eligibility of a tensor for in-place conversion. A converted tensor no longer holds Q8_0 blocks, so
 // EVERY MUL_MAT of it (any batch, decode included) must go through n1_w8_mul_mat and the mmvq / gate-up fusions must skip it.
+// T513 refusals, every one static (a tensor's answer never changes, the fusions and the router must agree): only a whole tensor in a plain
+// device buffer is rewritten (never a view: the write covers F*K + 4F bytes from data and would clobber the neighbours; never a split-buffer
+// tensor, whose data pointer is not real; never host / mmap'd / pinned memory, so the GGUF on disk and host copies are never touched),
+// and never the embedding table (GET_ROWS reads it as Q8_0; tied output heads share it).
 bool w8_eligible(const ggml_tensor * t) {
     return env().on && env().w8 && env().w8_inplace && t->type == GGML_TYPE_Q8_0 && t->ne[2] == 1 && t->ne[3] == 1 &&
         t->ne[0] % 128 == 0 && t->ne[1] % N1_BF == 0 && ggml_is_contiguous(t) && strstr(t->name, "token_embd") == nullptr &&
-        t->buffer && !ggml_backend_buffer_is_host(t->buffer);
+        t->view_src == nullptr && t->extra == nullptr && t->buffer && !ggml_backend_buffer_is_host(t->buffer) &&
+        ggml_cuda_buffer_is_plain_device(t->buffer);
 }
 
 // Converts the Q8_0 tensor in place to [tiled int8 stream F*K][fp32 row scales F] (never larger than the Q8_0 bytes, K >= 64):
@@ -1140,8 +1174,13 @@ void w8_inplace_get(const ggml_tensor * src0, hipStream_t st, bool rot, const vo
     std::lock_guard<std::mutex> lk(g_mtx);
     auto it = g_w8_inpl.find(src0->data);
     if (it == g_w8_inpl.end()) {
+        hipStreamCaptureStatus cap = hipStreamCaptureStatusNone;
+        if (hipStreamIsCapturing(st, &cap) == hipSuccess && cap != hipStreamCaptureStatusNone) {
+            // a captured graph would replay the stock Q8_0 kernels on bytes that a later eager call converts: never convert (or fall back) under capture
+            GGML_ABORT("W8 in-place: %s first used under CUDA-graph capture; run one eager (non-captured) pass of every graph first or set GGML_CUDA_DISABLE_GRAPHS=1", src0->name);
+        }
         char * scratch = nullptr;
-        if (hipMalloc(&scratch, nbytes) != hipSuccess) { GGML_ABORT("W8 in-place: scratch alloc failed (%s)", src0->name); }
+        if (hipMalloc(&scratch, nbytes) != hipSuccess) { GGML_ABORT("W8 in-place: scratch alloc failed (%s): not enough free VRAM for one tensor-sized buffer (%zu bytes); lower the context / batch or turn GGML_N1_W8_INPLACE off", src0->name, nbytes); }
         w8_requant(src0, scratch, (float *) (scratch + F * K), st, rot);
         CUDA_CHECK(hipMemcpyAsync(src0->data, scratch, nbytes, hipMemcpyDeviceToDevice, st));
         CUDA_CHECK(hipStreamSynchronize(st));
@@ -1152,6 +1191,80 @@ void w8_inplace_get(const ggml_tensor * src0, hipStream_t st, bool rot, const vo
         GGML_ABORT("W8 in-place: %s was converted %s the rotation but this MUL_MAT wants %s", src0->name, it->second ? "with" : "without", rot ? "it" : "none");
     }
     *W = src0->data; *RS = (const float *) ((const char *) src0->data + F * K);
+}
+
+// T513 decode GEMV over the in-place per-channel int8 stream (the Q8_0 bytes are gone, so mmvq cannot run). One block per 16-row group
+// (tile = g >> 3, ri = g & 7): lane = (row & 15) + 16 * khalf reads one 16-byte chunk per 32-K block, a warp's four chunks are 4 x 512
+// contiguous bytes; the 8 warps split the 128-K segments and reduce through LDS. The activation is the same per-token int8 buffer the GEMM
+// reads (n1_off layout, token t of tile t >> 7), the integer sum is exact and the epilogue order is the GEMM's, ((acc * sx) * rs), so a
+// token gives the same bits through either kernel.
+template <int NT>
+__global__ void __launch_bounds__(256) k_w8_gemv(const uint4 * __restrict__ W, const uint4 * __restrict__ X, const float * __restrict__ rs,
+                                                 const float * __restrict__ sx, float * __restrict__ Y, int K, int ldy) {
+    const int S = K / 128, g = blockIdx.x, tile = g >> 3, ri = g & 7;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, h = lane >> 4, l16 = lane & 15;
+    int acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0;
+    for (int s0 = warp; s0 < S; s0 += 16) {
+        uint4 w[2][4];
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+            const int s = s0 + 8 * u;
+            if (s < S) {
+                const uint4 * wp = W + ((((size_t) tile * S + s) * 8 + ri) * 4) * 32 + lane;
+#pragma unroll
+                for (int kb = 0; kb < 4; ++kb) w[u][kb] = wp[kb * 32];
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+            const int s = s0 + 8 * u;
+            if (s < S) {
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+#pragma unroll
+                    for (int kb = 0; kb < 4; ++kb) {
+                        const uint4 x = X[(((((size_t) (t >> 7) * S + s) * 8 + ((t & 127) >> 4)) * 4 + kb) * 32) + 16 * h + (t & 15)];
+                        int a = acc[t];
+                        a = ggml_cuda_dp4a((int) w[u][kb].x, (int) x.x, a);
+                        a = ggml_cuda_dp4a((int) w[u][kb].y, (int) x.y, a);
+                        a = ggml_cuda_dp4a((int) w[u][kb].z, (int) x.z, a);
+                        a = ggml_cuda_dp4a((int) w[u][kb].w, (int) x.w, a);
+                        acc[t] = a;
+                    }
+                }
+            }
+        }
+    }
+    __shared__ int red[8][NT][16];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        const int v = acc[t] + __shfl_xor(acc[t], 16, 32);
+        if (h == 0) red[warp][t][l16] = v;
+    }
+    __syncthreads();
+    for (int o = threadIdx.x; o < NT * 16; o += blockDim.x) {
+        const int t = o >> 4, r = o & 15;
+        int v = 0;
+#pragma unroll
+        for (int w8 = 0; w8 < 8; ++w8) v += red[w8][t][r];
+        const int row = g * 16 + r;
+        Y[(size_t) t * ldy + row] = ((float) v * sx[t]) * rs[row];
+    }
+}
+
+template <int NT>
+void launch_w8_gemv_n(const void * X, const void * W, const float * rs, const float * sx, float * Y, int F, int K, int ldy, hipStream_t st) {
+    k_w8_gemv<NT><<<F / 16, 256, 0, st>>>((const uint4 *) W, (const uint4 *) X, rs, sx, Y, K, ldy);
+}
+void launch_w8_gemv(const void * X, const void * W, const float * rs, const float * sx, float * Y, int N, int F, int K, int ldy, hipStream_t st) {
+    switch (N) {
+#define W8G(n) case n: launch_w8_gemv_n<n>(X, W, rs, sx, Y, F, K, ldy, st); break;
+        W8G(1) W8G(2) W8G(3) W8G(4) W8G(5) W8G(6) W8G(7) W8G(8) W8G(9) W8G(10) W8G(11) W8G(12) W8G(13) W8G(14) W8G(15) W8G(16)
+#undef W8G
+        default: GGML_ABORT("W8 gemv: N=%d out of range", N);
+    }
 }
 
 template <int KT, int WTn, int WFn, int SEGS, int FEED>
@@ -1260,12 +1373,20 @@ bool n1_w8_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, co
     char * buf = act_cache ? ctx.act_cache_buf->get() : local.get();
     int8_t * X  = (int8_t *) buf;
     float  * sx = (float *) (buf + (size_t) Npad * K);
+    // T513: decode-size batches (N <= GGML_N1_W8_GEMV_MAX) quantise only the N real tokens (the GEMV never reads the tile padding) and run the GEMV
+    const bool gemv = N <= env().w8_gemv_max;
+    const int  nq   = gemv ? N : Npad;
     if (!act_hit) {
-        if (rot) k_w8_rot_quant_act<<<Npad, 32 * (K / 1024), 0, st>>>((const char *) src1->data, src1->nb[1], N, K, X, sx);
-        else     k_n1_quant_act<<<dim3(1, Npad), 256, 0, st>>>((const char *) src1->data, src1->nb[1], N, K, K, Npad, X, sx);
+        if (rot) k_w8_rot_quant_act<<<nq, 32 * (K / 1024), 0, st>>>((const char *) src1->data, src1->nb[1], N, K, X, sx);
+        else     k_n1_quant_act<<<dim3(1, nq), 256, 0, st>>>((const char *) src1->data, src1->nb[1], N, K, K, Npad, X, sx);
     }
-    launch_w8(X, Wp, RSp, sx, (float *) dst->data, N, Npad, F, K, (int) (dst->nb[1] / sizeof(float)), st);
-    if (env().w8_check) {   // debug: both kernels against an exact integer reference on a 64 x 128 corner (first calls only)
+    if (gemv) {
+        launch_w8_gemv(X, Wp, RSp, sx, (float *) dst->data, N, F, K, (int) (dst->nb[1] / sizeof(float)), st);
+        g_stats.w8_gemv++;
+    } else {
+        launch_w8(X, Wp, RSp, sx, (float *) dst->data, N, Npad, F, K, (int) (dst->nb[1] / sizeof(float)), st);
+    }
+    if (env().w8_check && !gemv) {   // debug: both kernels against an exact integer reference on a 64 x 128 corner (first calls only)
         static std::atomic<int> ncheck{0};
         const int cn = ncheck.fetch_add(1);
         const char * cname = getenv("GGML_N1_W8_CHECK_NAME");
@@ -1302,6 +1423,51 @@ bool n1_w8_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, co
 
 bool ggml_cuda_n1_enabled() { return env().on; }
 bool ggml_cuda_n1_w8_inplace(const ggml_tensor * t) { return w8_eligible(t); }
+
+void ggml_cuda_n1_w8_counters(unsigned long long out[4]) {
+    out[0] = g_stats.mm_w8.load(); out[1] = g_stats.w8_conv.load(); out[2] = g_stats.w8_gemv.load(); out[3] = g_stats.w8_fb.load();
+}
+
+static size_t w8_host_off(int r, int k, int S) {   // n1_off on the host
+    const int tile = r >> 7, s = k >> 7, ri = (r & 127) >> 4, kb = (k & 127) >> 5, h = (k & 31) >> 4, e = k & 15;
+    const int lane = 16 * h + (r & 15);
+    return (((((size_t) tile * S + s) * 8 + ri) * 4 + kb) * 32 + lane) * 16 + e;
+}
+
+int ggml_cuda_n1_w8_selftest(const int8_t * W, const float * rs, const int8_t * X, const float * sx, float * Y, int N, int F, int K, int which) {
+    if (K % 128 != 0 || F % N1_BF != 0 || N < 1 || which < 0 || which > 3 || (which == 1 && N > 16)) return 1;
+    const int S = K / 128, Npad = (N + N1_BT - 1) / N1_BT * N1_BT;
+    std::vector<int8_t> wt((size_t) F * K), xt((size_t) Npad * K, 0);
+    std::vector<float> sxp((size_t) Npad, 0.f);
+    for (int f = 0; f < F; ++f) for (int k = 0; k < K; ++k) wt[w8_host_off(f, k, S)] = W[(size_t) f * K + k];
+    for (int t = 0; t < N; ++t) for (int k = 0; k < K; ++k) xt[w8_host_off(t, k, S)] = X[(size_t) t * K + k];
+    for (int t = 0; t < N; ++t) sxp[t] = sx[t];
+    int8_t * dw = nullptr, * dx = nullptr; float * drs = nullptr, * dsx = nullptr, * dy = nullptr;
+    CUDA_CHECK(hipMalloc(&dw, wt.size())); CUDA_CHECK(hipMalloc(&dx, xt.size()));
+    CUDA_CHECK(hipMalloc(&drs, F * sizeof(float))); CUDA_CHECK(hipMalloc(&dsx, Npad * sizeof(float)));
+    CUDA_CHECK(hipMalloc(&dy, (size_t) Npad * F * sizeof(float)));
+    CUDA_CHECK(hipMemcpy(dw, wt.data(), wt.size(), hipMemcpyHostToDevice));
+    CUDA_CHECK(hipMemcpy(dx, xt.data(), xt.size(), hipMemcpyHostToDevice));
+    CUDA_CHECK(hipMemcpy(drs, rs, F * sizeof(float), hipMemcpyHostToDevice));
+    CUDA_CHECK(hipMemcpy(dsx, sxp.data(), Npad * sizeof(float), hipMemcpyHostToDevice));
+    CUDA_CHECK(hipMemset(dy, 0xFF, (size_t) Npad * F * sizeof(float)));   // NaN fill: an element the kernel does not write fails the comparison
+    hipStream_t st = nullptr;
+    CUDA_CHECK(hipStreamCreate(&st));
+    const int save = env().w8_kernel;
+    if (which == 3) { launch<0, 0>(dx, dw, drs, dsx, dy, N, Npad, F, K, F, st); }
+    else if (which == 1 || (which == 0 && N <= env().w8_gemv_max)) { launch_w8_gemv(dx, dw, drs, dsx, dy, N, F, K, F, st); }
+    else {
+        const_cast<n1_env &>(env()).w8_kernel = which == 2 ? 1 : env().w8_kernel;
+        launch_w8(dx, dw, drs, dsx, dy, N, Npad, F, K, F, st);
+        const_cast<n1_env &>(env()).w8_kernel = save;
+    }
+    CUDA_CHECK(hipGetLastError());
+    CUDA_CHECK(hipStreamSynchronize(st));
+    CUDA_CHECK(hipMemcpy(Y, dy, (size_t) N * F * sizeof(float), hipMemcpyDeviceToHost));
+    (void) hipStreamDestroy(st);
+    (void) hipFree(dw); (void) hipFree(dx); (void) hipFree(drs); (void) hipFree(dsx); (void) hipFree(dy);
+    return 0;
+}
 bool ggml_cuda_n1_gateup_enabled() { return env().on && env().m3 && env().gateup; }
 
 // T434: this MUL_MAT will run the one-GEMM path (GGML_N1_M3) and read the N1TOK cache entry of its FWHT src1. Mirrors the
