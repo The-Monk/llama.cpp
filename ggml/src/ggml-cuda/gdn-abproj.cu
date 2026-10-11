@@ -1,6 +1,13 @@
 #include "gdn-abproj.cuh"
 #include "mma.cuh"
 
+static __device__ __forceinline__ nv_bfloat162 abproj_bf2(const float a, const float b) {
+    nv_bfloat162 r;
+    r.x = __float2bfloat16(a);   // round-to-nearest-even, as convert_unary<float, bf16>
+    r.y = __float2bfloat16(b);
+    return r;
+}
+
 // One block = 16 tokens x (48 + 48) outputs. 8 waves split K; each wave accumulates 6 WMMA 16x16 tiles (3 per matrix) over its
 // contiguous K slice, then the partial tiles are reduced through LDS. RDNA4 only (gfx12 bf16 WMMA).
 #define ABPROJ_NWAVES 8
@@ -38,10 +45,10 @@ static __global__ void __launch_bounds__(ABPROJ_NWAVES * 32) gdn_ab_proj_kernel(
                 v0 = *(const float4 *) (xrow + ks * 16);
                 v1 = *(const float4 *) (xrow + ks * 16 + 4);
             }
-            B.x[0] = __floats2bfloat162_rn(v0.x, v0.y);
-            B.x[1] = __floats2bfloat162_rn(v0.z, v0.w);
-            B.x[2] = __floats2bfloat162_rn(v1.x, v1.y);
-            B.x[3] = __floats2bfloat162_rn(v1.z, v1.w);
+            B.x[0] = abproj_bf2(v0.x, v0.y);
+            B.x[1] = abproj_bf2(v0.z, v0.w);
+            B.x[2] = abproj_bf2(v1.x, v1.y);
+            B.x[3] = abproj_bf2(v1.z, v1.w);
         }
 #pragma unroll
         for (int t = 0; t < 2 * ABPROJ_NRT; ++t) {
