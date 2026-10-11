@@ -4414,6 +4414,11 @@ static bool ggml_cuda_b2_norm_bf16_enabled() {
     static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_NORM_BF16"); return v && atoi(v) != 0; }();
     return on;
 }
+// T492: attention q norm (RMS_NORM(256) + MUL(weight)) + mrope in one launch (prefill). =1 on, default off.
+static bool ggml_cuda_b2_qrope_fuse_enabled() {
+    static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_QROPE_FUSE"); return v && atoi(v) != 0; }();
+    return on;
+}
 // T492: attention output gate (CONT + sigmoid + MUL) folded into the wo FWHT producer's load (prefill). =1 on, default off.
 static bool ggml_cuda_b2_agq_fuse_enabled() {
     static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_AGQ_FUSE"); return v && atoi(v) != 0; }();
@@ -4745,6 +4750,38 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_nelements(node) == ggml_nelements(gv) && ggml_are_same_shape(out, node) && ggml_are_same_shape(cur, node) &&
             ggml_cuda_op_sigmoid_gate_strided(*cuda_ctx, gv, cur, out)) {
             return 2;
+        }
+    }
+
+    // T492 GGML_CUDA_B2_QROPE_FUSE: attention q/k norm [RMS_NORM(256), MUL(weight), ROPE(mrope)] -> one launch (prefill)
+    if (ggml_cuda_b2_qrope_fuse_enabled() && node->op == GGML_OP_RMS_NORM && node->ne[0] == 256 && node->ne[2] >= 64 && i + 2 < cgraph->n_nodes &&
+        cgraph->nodes[i + 1]->op == GGML_OP_MUL && cgraph->nodes[i + 2]->op == GGML_OP_ROPE &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, { i + 2 })) {
+        ggml_tensor * mulw = cgraph->nodes[i + 1];
+        ggml_tensor * rope = cgraph->nodes[i + 2];
+        if ((mulw->src[0] == node || mulw->src[1] == node) && rope->src[0] == mulw && ggml_are_same_shape(node, mulw) &&
+            ggml_are_same_shape(rope, mulw) && node->type == GGML_TYPE_F32 && mulw->type == GGML_TYPE_F32) {
+            static const bool qr_verify = getenv("GGML_B2_QROPE_VERIFY") != nullptr;   // gate only: syncs (run with GGML_CUDA_DISABLE_GRAPHS=1)
+            ggml_cuda_pool_alloc<char> rn(cuda_ctx->pool(), qr_verify ? ggml_nbytes(mulw) : 0), rr(cuda_ctx->pool(), qr_verify ? ggml_nbytes(rope) : 0);
+            if (qr_verify) {
+                ggml_tensor tn = *mulw;
+                tn.data = rn.get();
+                ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, &tn);
+                ggml_tensor tr = *rope;
+                tr.data = rr.get();
+                tr.src[0] = &tn;
+                ggml_cuda_op_rope(*cuda_ctx, &tr);
+            }
+            if (ggml_cuda_op_rms_norm_mul_rope_multi_fused(*cuda_ctx, node, mulw, rope)) {
+                if (qr_verify) {
+                    struct totals { int64_t n = 0, d = 0, b = 0;
+                        ~totals() { fprintf(stderr, "qrope: VERIFY %lld launches: %lld/%lld bytes differ from the unfused chain\n", (long long) n, (long long) d, (long long) b); } };
+                    static totals t;
+                    t.d += ggml_cuda_act_count_diff(rr.get(), rope->data, ggml_nbytes(rope), cuda_ctx->stream());
+                    t.b += (int64_t) ggml_nbytes(rope); t.n++;
+                }
+                return 2;
+            }
         }
     }
 

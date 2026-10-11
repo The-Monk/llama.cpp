@@ -753,6 +753,132 @@ static __global__ void rms_norm_mul_rope_f32(
     }
 }
 
+// T492 GGML_CUDA_B2_QROPE: RMS_NORM(256 columns) + MUL(weight) + ROPE (mrope / imrope, F32) in one launch, one block (256 threads) per
+// (head, token) row. Stage 1 is rms_norm_f32<256, true> (one column per thread, block_reduce, scale * x * w with the fp32 roundings the unfused
+// kernel stores); the normalized row is staged in LDS; stage 2 is rope_multi's per-pair body verbatim (sector -> theta -> rope_yarn -> rotate).
+template <bool has_ff>
+static __global__ void __launch_bounds__(256) rms_norm_mul_rope_multi_f32(
+        const float * __restrict__ x, float * __restrict__ dst, const int ncols,
+        const int64_t s01, const int64_t s02, const int64_t d1, const int64_t d2, const int ne02,
+        const float eps, const float * __restrict__ mul,
+        const int n_dims, const int32_t * __restrict__ pos,
+        const float freq_scale, const float ext_factor, const float attn_factor,
+        const rope_corr_dims corr_dims, const float theta_scale,
+        const float * __restrict__ freq_factors, const mrope_sections sections, const bool is_imrope) {
+    const int row = blockIdx.x, i2 = blockIdx.y, tid = threadIdx.x;
+    x   += (int64_t) i2 * s02 + (int64_t) row * s01;
+    dst += (int64_t) i2 * d2  + (int64_t) row * d1;
+    __shared__ float s_sum[32];
+    __shared__ float nvs[256];
+    const float xi = x[tid];
+    float tmp = xi * xi;
+    asm volatile("" : "+v"(tmp));
+    tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, s_sum);
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+    float nv = scale * xi;
+    asm volatile("" : "+v"(nv));
+    nv = nv * mul[tid];
+    asm volatile("" : "+v"(nv));
+    nvs[tid] = nv;
+    __syncthreads();
+    if (tid >= n_dims) {
+        dst[tid] = nvs[tid];
+        return;
+    }
+    if (tid >= n_dims / 2) {
+        return;
+    }
+    const int i0 = 2 * tid;
+    const int sect_dims = sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3];
+    const int sec_w = sections.v[1] + sections.v[0];
+    const int sector = (i0 / 2) % sect_dims;
+
+    float theta_base = 0.0;
+    if (is_imrope) {
+        if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
+            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, i0 / 2.0f);
+        } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {  // w
+            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, i0 / 2.0f);
+        } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {  // t
+            theta_base = pos[i2] * powf(theta_scale, i0 / 2.0f);
+        } else {
+            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, i0 / 2.0f);
+        }
+    } else {
+        if (sector < sections.v[0]) {
+            theta_base = pos[i2] * powf(theta_scale, i0 / 2.0f);
+        } else if (sector >= sections.v[0] && sector < sec_w) {
+            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, i0 / 2.0f);
+        } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
+            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, i0 / 2.0f);
+        } else if (sector >= sec_w + sections.v[2]) {
+            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, i0 / 2.0f);
+        }
+    }
+
+    const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
+
+    float cos_theta;
+    float sin_theta;
+
+    rope_yarn<true>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
+
+    const float x0 = nvs[i0/2 + 0];
+    const float x1 = nvs[i0/2 + n_dims/2];
+
+    dst[i0/2 + 0]        = x0*cos_theta - x1*sin_theta;
+    dst[i0/2 + n_dims/2] = x0*sin_theta + x1*cos_theta;
+}
+
+bool ggml_cuda_op_rms_norm_mul_rope_multi_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * mul, ggml_tensor * rope) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    const int n_dims = ((const int32_t *) rope->op_params)[1];
+    const int mode   = ((const int32_t *) rope->op_params)[2];
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || rope->type != GGML_TYPE_F32 || x->ne[0] != 256 || x->ne[3] != 1 ||
+        x->nb[0] != sizeof(float) || !ggml_is_contiguous(w) || ggml_nelements(w) != 256 || rope->nb[0] != sizeof(float) ||
+        !(mode & GGML_ROPE_TYPE_MROPE) || mode == GGML_ROPE_TYPE_VISION || (mode & GGML_ROPE_TYPE_NEOX) ||
+        n_dims % 2 != 0 || n_dims > 256 || n_dims <= 0 || rope->src[1] == nullptr || rope->src[1]->type != GGML_TYPE_I32 ||
+        x->nb[1] % sizeof(float) != 0 || x->nb[2] % sizeof(float) != 0 || rope->nb[1] % sizeof(float) != 0 || rope->nb[2] % sizeof(float) != 0 ||
+        ((uintptr_t) x->data | (uintptr_t) w->data | (uintptr_t) rope->data) % 4 != 0 || x->ne[1] > 65535 || x->ne[2] > 65535) {
+        return false;
+    }
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    const int n_ctx_orig = ((const int32_t *) rope->op_params)[4];
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    mrope_sections sections;
+    memcpy(&freq_base,   (const int32_t *) rope->op_params +  5, sizeof(float));
+    memcpy(&freq_scale,  (const int32_t *) rope->op_params +  6, sizeof(float));
+    memcpy(&ext_factor,  (const int32_t *) rope->op_params +  7, sizeof(float));
+    memcpy(&attn_factor, (const int32_t *) rope->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,   (const int32_t *) rope->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,   (const int32_t *) rope->op_params + 10, sizeof(float));
+    memcpy(&sections.v,  (const int32_t *) rope->op_params + 11, sizeof(int)*4);
+    if (!(sections.v[0] > 0 || sections.v[1] > 0 || sections.v[2] > 0)) {
+        return false;
+    }
+    const bool is_imrope = mode == GGML_ROPE_TYPE_IMROPE;
+    const int32_t * pos = (const int32_t *) rope->src[1]->data;
+    const float * freq_factors = rope->src[2] != nullptr ? (const float *) rope->src[2]->data : nullptr;
+    rope_corr_dims corr_dims;
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims.v);
+    const float theta_scale = powf(freq_base, -2.0f / n_dims);
+    const dim3 grid((unsigned) x->ne[1], (unsigned) x->ne[2], 1), block(256, 1, 1);
+    const ggml_cuda_kernel_launch_params lp = {grid, block, 0, ctx.stream()};
+    const int64_t s01 = x->nb[1] / sizeof(float), s02 = x->nb[2] / sizeof(float);
+    const int64_t d1 = rope->nb[1] / sizeof(float), d2 = rope->nb[2] / sizeof(float);
+    if (freq_factors == nullptr) {
+        ggml_cuda_kernel_launch(rms_norm_mul_rope_multi_f32<false>, lp, (const float *) x->data, (float *) rope->data, 256, s01, s02, d1, d2, (int) x->ne[2],
+            eps, (const float *) w->data, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope);
+    } else {
+        ggml_cuda_kernel_launch(rms_norm_mul_rope_multi_f32<true>, lp, (const float *) x->data, (float *) rope->data, 256, s01, s02, d1, d2, (int) x->ne[2],
+            eps, (const float *) w->data, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope);
+    }
+    return true;
+}
+
 template <typename D>
 static void rms_norm_mul_rope_cuda(
         const float * x, D * dst,
