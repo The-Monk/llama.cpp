@@ -1776,6 +1776,10 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
+    if (ggml_cuda_n1_w8_inplace(ffn_up->src[0]) || ggml_cuda_n1_w8_inplace(ffn_gate->src[0])) {   // T505: in-place W8A8 weights, per-op dispatch only
+        return false;
+    }
+
     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
     const bool has_scale = ffn_up_scale != nullptr || ffn_gate_scale != nullptr;
 
@@ -1907,7 +1911,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     // normal, unfused ggml_cuda_mul_mat(). Refuse fusion so those nodes take
     // that path.
     if (src0->type == GGML_TYPE_2OF4_FP8 || src0->type == GGML_TYPE_2OF4_F16 || src0->type == GGML_TYPE_IU4 ||
-        src0->type == GGML_TYPE_NK_Q2_0_W2ONLY) {
+        src0->type == GGML_TYPE_NK_Q2_0_W2ONLY || ggml_cuda_n1_w8_inplace(src0)) {
         return false;
     }
 

@@ -48,6 +48,7 @@ constexpr int LDSA = 1 << 28;  // T435: W fragments read by inline-asm ds_load_b
 constexpr int PRW = 1 << 8;   // T440 (GGML_N1_M3_FEED=3): s_setprio 2 around each k-block's WMMA burst (the burst-issuing wave wins the SIMD; widen/loads of the sibling waves fill its gaps)
 constexpr int GLUE = 1 << 22;    // T486 (ONEACC only): merged gate/up weight rows (16-row gate block, then the matching 16-row up block); epilogue writes silu(gate) * up, F/2 features, ldy = the GLU row stride
 constexpr int RESADD = 1 << 21;  // T492 (ONEACC only, not GLUE): the epilogue adds a fp32 residual row (same layout and stride as Y): Y = ((acc * sx) * S_f) + R
+constexpr int W8 = 1 << 20;       // T505 (ONEACC only): W stream = raw per-channel int8 in the X stream layout (16 KB per 128-row x 128-K segment); no LUT widen, no fold multipliers
 constexpr int ONEACC = 1 << 27;  // T434 variant bit: ONE int32 accumulation over the whole K (RS = 1), epilogue acc * sx[t] * S_f; no in-loop rescale
 constexpr int BCARRY = 1 << 24;   // T424 variant bit: bias-carry rescale (GGML_N1_M2=2); the low bits tag K (K / 1024 << 3)
 
@@ -87,8 +88,10 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
     static_assert(!kGlu || (kOne && FF % 2 == 0), "GLUE: ONEACC epilogue with gate/up block pairs");
     constexpr bool kAbX = V & ABX, kAbW = V & ABW, kAbC = V & ABC, kAbB = V & ABB, kAbCV = V & ABCV, kAbCM = V & ABCM, kAbCS = V & ABCS;
     static_assert(!kOne || RS == 1, "ONEACC: per-token scale, no rescale groups");
+    constexpr bool kW8 = V & W8;
+    static_assert(!kW8 || (kOne && !kAbCM && !kAbCV && !kAbCS), "W8: ONEACC only");
     constexpr int U = (RS > SEGS) ? RS / SEGS : 1;   // stages unrolled per loop iteration
-    constexpr int P0N = SEGS * (1 + DWN);
+    constexpr int P0N = kW8 ? SEGS * DWN : SEGS * (1 + DWN);
     constexpr int WSTAGE = SEGS * WSEG;
     __shared__ uint4 lds[2 * WSTAGE / 16];
 
@@ -107,9 +110,9 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
     const int dl0 = (BF == 64) ? (DWN == 1 ? (tid >> 8) : 0) : d0;
 
     const char* xg = (const char*)Xt;
-    const char* wg = (const char*)Wt + (size_t)ftile * S * 4096;
+    const char* wg = (const char*)Wt + (size_t)ftile * S * (kW8 ? 16384 : 4096);
     const uint32_t xvoff = (uint32_t)(((size_t)tile * S * XB) + ((wt % WPT) * FT * KBN * 32 + lane) * 16);
-    const uint32_t wvoff = (uint32_t)(pt * 16 + d0 * 4);
+    const uint32_t wvoff = (uint32_t)(pt * 16 + d0 * (kW8 ? 4096 : 4));   // W8: thread pt loads chunks q = pt + 256 (d0 + d) of the segment's 16 KB
     // fold multiplier byte of packed dword d (q = pt + 256 d): row in the 128-feature tile = (q >> 7) * 16 + (q & 15)
     uint32_t mvoff[DWN];
 #pragma unroll
@@ -132,6 +135,7 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
 
     u32x4 xr[KBN][FT];
     uint32_t rw[SEGS][DWN], rm[SEGS][DWN];
+    u32x4 rw8[kW8 ? SEGS : 1][kW8 ? DWN : 1];
     if constexpr (kAbCM) {   // ablation: a valid, runtime-opaque fold multiplier so the widened weights keep realistic data (zero weights would cut power and raise the clock)
 #pragma unroll
         for (int g = 0; g < SEGS; ++g)
@@ -149,8 +153,12 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
           { M2_EPRE asm volatile("global_load_b128 %0, %1, %2 offset:%3" : "=v"(xr[kb][i]) : "v"(xvoff), "s"(xb_), "i"((i * KBN + (kb)) * 512) : "memory"); M2_EPOST } }
 #define P0LOAD(stg)                                                                                          \
     { _Pragma("unroll") for (int g = 0; g < SEGS; ++g) {                                                       \
-          const char* wb_ = wg + (size_t)((stg) * SEGS + g) * 4096;                                             \
-          if constexpr (DWN == 4) { u32x4 t_;                                                                  \
+          const char* wb_ = wg + (size_t)((stg) * SEGS + g) * (kW8 ? 16384 : 4096);                             \
+          if constexpr (kW8) {                                                                                 \
+              _Pragma("unroll") for (int d = 0; d < DWN; ++d)                                                   \
+                  { M2_EPRE asm volatile("global_load_b128 %0, %1, %2 offset:%3" : "=v"(rw8[g][d]) : "v"(wvoff), "s"(wb_), "i"(d * 4096) : "memory"); M2_EPOST } \
+              continue; }                                                                                      \
+          if constexpr (DWN == 4) { u32x4 t_;                                                                \
               M2_EPRE asm volatile("global_load_b128 %0, %1, %2 offset:0" : "=v"(t_) : "v"(wvoff), "s"(wb_) : "memory"); M2_EPOST \
               rw[g][0] = t_.x; rw[g][1] = t_.y; rw[g][DWN - 2] = t_.z; rw[g][DWN - 1] = t_.w; }                   \
           else if constexpr (DWN == 2) { u32x2 t_;                                                             \
@@ -170,6 +178,13 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
 #define COMMIT(buf, waitn)                                                                                   \
     { asm volatile("s_wait_loadcnt %0" :: "i"(waitn) : "memory");                                              \
       _Pragma("unroll") for (int g = 0; g < SEGS; ++g) {                                                       \
+          if constexpr (kW8) {                                                                                 \
+              const uint32_t a8_ = ldsw + (uint32_t)(buf) * WSTAGE + g * WSEG;                                  \
+              _Pragma("unroll") for (int d = 0; d < DWN; ++d) {                                                 \
+                  asm volatile("" : "+v"(rw8[g][d]));                                                           \
+                  asm volatile("ds_store_b128 %0, %1 offset:%2" :: "v"(a8_), "v"(rw8[g][d]), "i"(d * 4096) : "memory"); \
+                  M2_ESM_STORE_WAIT }                                                                          \
+              continue; }                                                                                      \
           _Pragma("unroll") for (int d = 0; d < DWN; ++d) { asm volatile("" : "+v"(rw[g][d])); asm volatile("" : "+v"(rm[g][d])); } \
           const uint32_t a_ = ldsw + (uint32_t)(buf) * WSTAGE + g * WSEG;                                        \
           _Pragma("unroll") for (int d = 0; d < DWN; ++d) {                                                     \

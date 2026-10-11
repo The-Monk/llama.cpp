@@ -38,6 +38,7 @@
 
 #include "mul_mat_n1.cuh"
 #include "act-fuse.cuh"
+#include "mmq.cuh"
 #include "hipblaslt_wcache.cuh"
 
 #include <atomic>
@@ -76,6 +77,14 @@ struct n1_env {
     bool    gateup = false;    // GGML_N1_GATEUP=1 (T486, default OFF): merged gate/up one-GEMM with silu(gate)*up in the epilogue
     bool    m3_wide = false;   // GGML_N1_M3_WIDE=1: always the 256-token tile (A/B only)
     int     m2bc_flush = 8;
+    bool    w8 = false;        // GGML_N1_W8=1 (T505, default OFF, DIFFERENT MATH, KLD-gated): Q8_0 prefill MUL_MATs on the per-channel W8A8 GEMM
+                               // (Q8_0 requantised to ONE int8 scale per output row + per-token int8 activation, full-K int32 accumulation)
+    int     w8_kernel = 1;     // GGML_N1_W8_KERNEL: 0 = gemm_iu8<RS=0,FL=0> (the ROW kernel), 1 = gemm_fold W8 variant (M3 class)
+    char    w8_iso = 0;          // GGML_N1_W8_ISO=w|a: KLD isolation arms (weights-only / activations-only error through the stock mmq path); transient mode only
+    int     w8_check_every = 1; // GGML_N1_W8_CHECK_EVERY=<m>: check one call in m
+    int     w8_check = 0;     // GGML_N1_W8_CHECK=<n>: debug, compare both W8 kernels against an integer reference on the first n calls
+    bool    w8_inplace = false; // GGML_N1_W8_INPLACE=1: convert the eligible Q8_0 weights IN PLACE to per-channel int8 on first use (no extra VRAM; the Q8_0 bytes are gone; decode runs the same GEMM at N=1)
+    size_t  w8_cache_mb = 0;   // GGML_N1_W8_CACHE_MB: per-tensor int8 copies kept resident up to this many MB (0 = requantise into pool scratch on every call)
     bool    m2bc = false;   // GGML_N1_M2=2 (T424): M2 path + bias-carry rescale (one fmac per element per 256 K)
     n1_env() {
         const char * m1e = getenv("GGML_N1_M1");
@@ -92,6 +101,20 @@ struct n1_env {
         m3_segs = m3s && atoi(m3s) == 2 ? 2 : 1;
         const char * m3f = getenv("GGML_N1_M3_FEED");
         m3_feed = !m3f ? 3 : ((atoi(m3f) >= 1 && atoi(m3f) <= 3) ? atoi(m3f) : 0);   // T440: default 3 (64x64 wave tile + s_setprio around each k-block WMMA burst); 1 = T435 tile; GGML_N1_M3_FEED=0 disables
+        const char * w8e = getenv("GGML_N1_W8");
+        w8 = w8e && strcmp(w8e, "0") != 0;
+        const char * w8k = getenv("GGML_N1_W8_KERNEL");
+        w8_kernel = w8k ? atoi(w8k) : 1;
+        const char * w8o = getenv("GGML_N1_W8_ISO");
+        w8_iso = w8o && (w8o[0] == 'w' || w8o[0] == 'a') ? w8o[0] : 0;
+        const char * w8x = getenv("GGML_N1_W8_CHECK");
+        w8_check = w8x ? atoi(w8x) : 0;
+        const char * w8y = getenv("GGML_N1_W8_CHECK_EVERY");
+        w8_check_every = w8y && atoi(w8y) > 0 ? atoi(w8y) : 1;
+        const char * w8i = getenv("GGML_N1_W8_INPLACE");
+        w8_inplace = w8 && w8i && strcmp(w8i, "0") != 0;
+        const char * w8c = getenv("GGML_N1_W8_CACHE_MB");
+        w8_cache_mb = w8c ? (size_t) atoll(w8c) : 0;
         const char * fe = getenv("GGML_N1_M2BC_FLUSH");
         m2bc_flush = fe ? atoi(fe) : 8;
         dump = getenv("GGML_N1_DUMP");
@@ -112,6 +135,9 @@ struct n1_env {
         row_all = r && strcmp(r, "all") == 0;   // test-only: ROW mode for every routed tensor (test-backend-ops)
         const char * m = getenv("GGML_N1_MIN_N");
         if (m) min_n = atoll(m);
+        if (on && w8) {
+            fprintf(stderr, "[N1] W8A8 (T505): Q8_0 prefill on per-channel int8 x per-token int8 (kernel=%d cache_mb=%zu inplace=%d)\n", w8_kernel, w8_cache_mb, (int) w8_inplace);
+        }
         if (on) {
             fprintf(stderr, "[N1] Q2_0/Q1_0 prefill on native int8 WMMA (GGML_N1_PREFILL=0 disables): act=%s row=%s min_n=%lld dump=%s transient=%d g128_kernel=%s\n",
                     act_tok ? "token" : "g128", row_all ? "all" : row_ffn ? "ffn" : "none", (long long) min_n, dump ? dump : "-", (int) transient,
@@ -136,9 +162,15 @@ struct n1_stats {
     std::atomic<uint64_t> mm_nk{0}, mm_transient{0}, dumped{0};
     std::atomic<uint64_t> mm_m2{0}, fl_m2{0}, conv_fold{0};  // T422: g128-arm calls on the fold+g256 kernel
     std::atomic<uint64_t> mm_gu{0}, conv_gu{0}, bytes_gu{0}, fb_gu{0};   // T486: merged gate/up GEMM calls / merged weights / their bytes / refused
+    std::atomic<uint64_t> mm_w8{0}, fl_w8{0}, w8_conv{0}, w8_trans{0}, w8_fb{0}, w8_act_hit{0};   // T505
     std::atomic<uint64_t> mm_m3{0}, fl_m3{0}, m3_hit{0};      // T434: one-GEMM calls (m3_hit: activation from the FWHT producer)
     ~n1_stats() {
         if (!env().on || !env().stats) return;
+        if (env().w8) {
+            fprintf(stderr, "[N1] stats: w8a8 %llu ops / %.3f TFLOP, cached tensors %llu, transient requants %llu, refused %llu, act-cache hits %llu\n",
+                    (unsigned long long) mm_w8.load(), fl_w8.load() * 1e-12, (unsigned long long) w8_conv.load(),
+                    (unsigned long long) w8_trans.load(), (unsigned long long) w8_fb.load(), (unsigned long long) w8_act_hit.load());
+        }
         if (env().m3) {
             fprintf(stderr, "[N1] stats: m3 one-gemm %llu ops / %.3f TFLOP, activation from the fused FWHT producer %llu\n",
                     (unsigned long long) mm_m3.load(), fl_m3.load() * 1e-12, (unsigned long long) m3_hit.load());
@@ -403,6 +435,12 @@ struct n1_gu { n1_w w; n1_w fold; const void * up = nullptr; };
 std::unordered_map<const void *, n1_gu> g_gu;
 std::unordered_map<const void *, const void *> g_gu_of;   // gate / up data pointer -> g_gu key
 std::unordered_set<const void *> g_gu_refused;
+// T505: resident per-channel int8 copies of Q8_0 weights (w = tiled int8 stream, rs = fp32 row scales), keyed by the Q8_0 data pointer
+struct w8_w { void * w = nullptr; void * rs = nullptr; size_t bytes = 0; };
+std::unordered_map<const void *, w8_w> g_w8;
+std::unordered_set<const void *> g_w8_refused;
+size_t g_w8_bytes = 0;
+std::unordered_map<const void *, size_t> g_w8_inpl;   // GGML_N1_W8_INPLACE: tensors converted in place (data pointer -> original Q8_0 bytes)
 
 void n1_invalidate(const void * base, size_t size) {
     std::lock_guard<std::mutex> lk(g_mtx);
@@ -431,6 +469,25 @@ void n1_invalidate(const void * base, size_t size) {
         } else {
             ++it;
         }
+    }
+    for (auto it = g_w8.begin(); it != g_w8.end();) {   // T505
+        const char * k = (const char *) it->first;
+        if (k >= b && k < b + size) {
+            if (it->second.w)  (void) hipFree(it->second.w);
+            if (it->second.rs) (void) hipFree(it->second.rs);
+            g_w8_bytes -= it->second.bytes;
+            it = g_w8.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = g_w8_inpl.begin(); it != g_w8_inpl.end();) {
+        const char * k = (const char *) it->first;
+        it = (k >= b && k < b + size) ? g_w8_inpl.erase(it) : std::next(it);
+    }
+    for (auto it = g_w8_refused.begin(); it != g_w8_refused.end();) {
+        const char * k = (const char *) *it;
+        it = (k >= b && k < b + size) ? g_w8_refused.erase(it) : std::next(it);
     }
     for (auto it = g_refused.begin(); it != g_refused.end();) {
         const char * k = (const char *) *it;
@@ -785,9 +842,316 @@ int n1_weight_state(const ggml_tensor * src0, int mode) {
     return g_refused.count(src0->data) ? -1 : 0;
 }
 
+// ---------------- T505: W8A8 (Q8_0 -> per-output-channel int8 x per-token int8) ----------------
+// The enterprise W8A8 recipe (SmoothQuant / compressed-tensors INT8, vLLM / TensorRT-LLM): ONE weight scale per output row and
+// ONE activation scale per token, both factor out of the K sum, so the kernel accumulates the whole K in int32 and applies
+// acc * sx[t] * S_f in the epilogue (no in-loop rescale). The Q8_0 per-32 scales are folded into the int8 codes at requant time
+// (DIFFERENT MATH from mul_mat_q: w' = rint(d_b * q / S_f), S_f = max |d_b * q| / 127 per row).
+// block_q8_0 = { half d; int8 qs[32] } = 34 bytes (2-byte aligned only).
+
+// one 256-thread block per row: S_f = max over the row of |d_b * q| / 127 (1 for an all-zero row)
+__global__ void k_w8_rowscale(const char * __restrict__ w, size_t nb01, int K, float * __restrict__ rowS) {
+    const char * rw = w + (size_t) blockIdx.x * nb01;
+    float amax = 0.f;
+    for (int e = threadIdx.x; e < K; e += blockDim.x) {
+        const char * blk = rw + (size_t) (e >> 5) * sizeof(block_q8_0);
+        __half dh; memcpy(&dh, blk, sizeof(dh));
+        amax = fmaxf(amax, fabsf(__half2float(dh) * (float) (int8_t) blk[2 + (e & 31)]));
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor(amax, o, 32));
+    __shared__ float red[32];
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = amax;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = 0.f;
+        for (int i = 0; i < (int) (blockDim.x >> 5); ++i) m = fmaxf(m, red[i]);
+        rowS[blockIdx.x] = m > 0.f ? m * (1.0f / 127.0f) : 1.0f;
+    }
+}
+
+// int8 stream (LAYOUT.md section 1, == k_n1_pack_row): one thread per 16-byte chunk
+__global__ void k_w8_pack(const char * __restrict__ w, size_t nb01, int F, int K, const float * __restrict__ rowS, uint4 * __restrict__ out) {
+    const int S = K / 128;
+    const size_t total = (size_t) F * K / 16;
+    const size_t ci = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (ci >= total) return;
+    const int lane = (int) (ci % 32), kb = (int) ((ci / 32) % 4), ri = (int) ((ci / 128) % 8);
+    const size_t ts = ci / 1024;
+    const int s = (int) (ts % S), tile = (int) (ts / S);
+    const int row = tile * 128 + ri * 16 + (lane & 15);
+    const char * blk = w + (size_t) row * nb01 + (size_t) (s * 4 + kb) * sizeof(block_q8_0);
+    __half dh; memcpy(&dh, blk, sizeof(dh));
+    const float sc = __half2float(dh) / rowS[row];
+    const uint16_t * q16 = (const uint16_t *) (blk + 2 + 16 * (lane >> 4));
+    uint32_t v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t pair0 = q16[2 * i], pair1 = q16[2 * i + 1];
+        const uint32_t b4[4] = {pair0 & 0xFFu, pair0 >> 8, pair1 & 0xFFu, pair1 >> 8};
+        uint32_t p = 0;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float x = rintf((float) (int8_t) b4[e] * sc);
+            p |= ((uint32_t) (uint8_t) (int8_t) (int) fminf(127.f, fmaxf(-127.f, x))) << (8 * e);
+        }
+        v[i] = p;
+    }
+    out[ci] = make_uint4(v[0], v[1], v[2], v[3]);
+}
+
+// GGML_N1_W8_CHECK debug: exact integer reference Y[t][f] = (sum_k X[t][k] * W[f][k]) * sx[t] * rs[f] for t < gridDim.y, f < gridDim.x
+// (X and W are both in the n1_off tiled layout); one 256-thread block per output
+__global__ void k_w8_ref(const int8_t * __restrict__ X, const int8_t * __restrict__ W, const float * __restrict__ sx, const float * __restrict__ rs,
+                         float * __restrict__ Y, int K, int S, int nf, int ts, int fs) {
+    const int f = blockIdx.x * fs, t = blockIdx.y * ts;   // sampled rows / features: strides ts, fs
+    int acc = 0;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) acc += (int) X[n1_off(t, k, S)] * (int) W[n1_off(f, k, S)];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor(acc, o, 32);
+    __shared__ int red[8];
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int s = 0;
+        for (int i = 0; i < 8; ++i) s += red[i];
+        Y[blockIdx.y * nf + blockIdx.x] = ((float) s * sx[t]) * rs[f];
+    }
+}
+// out[o] = max |Y - ref|, out[o + 1] = max |ref| (non-negative floats: integer atomicMax on the bit pattern)
+__global__ void k_w8_cmp(const float * __restrict__ Y, int ldy, const float * __restrict__ ref, int nt, int nf, float * __restrict__ out, int o, int ts, int fs) {
+    float e = 0.f, m = 0.f;
+    for (int i = threadIdx.x; i < nt * nf; i += blockDim.x) {
+        const int t = (i / nf) * ts, f = (i % nf) * fs;
+        e = fmaxf(e, fabsf(Y[(size_t) t * ldy + f] - ref[i]));
+        m = fmaxf(m, fabsf(ref[i]));
+    }
+    atomicMax((int *) (out + o), __float_as_int(e));
+    atomicMax((int *) (out + o + 1), __float_as_int(m));
+}
+
+// GGML_N1_W8_ISO=w: Q8_0-format copy of the per-channel requantised weights: block {fp16 S_h; q'} with S_h = fp16(S_f), q' = rint(q d / S_h)
+__global__ void k_w8_iso_w(const char * __restrict__ w, size_t nb01, int F, int K, const float * __restrict__ rowS, char * __restrict__ out) {
+    const size_t bi = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int nbr = K / 32;
+    if (bi >= (size_t) F * nbr) return;
+    const int row = (int) (bi / nbr), b = (int) (bi % nbr);
+    const char * blk = w + (size_t) row * nb01 + (size_t) b * sizeof(block_q8_0);
+    char * ob = out + (size_t) row * nb01 + (size_t) b * sizeof(block_q8_0);
+    __half dh; memcpy(&dh, blk, sizeof(dh));
+    const __half sh = __float2half(rowS[row]);
+    const float sc = __half2float(dh) / __half2float(sh);
+    memcpy(ob, &sh, sizeof(sh));
+    for (int j = 0; j < 32; ++j) {
+        const float x = rintf((float) (int8_t) blk[2 + j] * sc);
+        ob[2 + j] = (char) (int8_t) (int) fminf(127.f, fmaxf(-127.f, x));
+    }
+}
+// GGML_N1_W8_ISO=a: dequantise the per-token int8 activation back to fp32 (xq[t][k] = X[t][k] * sx[t])
+__global__ void k_w8_iso_a(const int8_t * __restrict__ X, const float * __restrict__ sx, int K, int S, float * __restrict__ xq) {
+    const int t = blockIdx.y, k = blockIdx.x * blockDim.x + threadIdx.x;
+    xq[(size_t) t * K + k] = (float) X[n1_off(t, k, S)] * sx[t];
+}
+
+void w8_requant(const ggml_tensor * src0, void * wout, float * rs, hipStream_t st) {
+    const int F = (int) src0->ne[1], K = (int) src0->ne[0];
+    k_w8_rowscale<<<F, 256, 0, st>>>((const char *) src0->data, src0->nb[1], K, rs);
+    const size_t nc = (size_t) F * K / 16;
+    k_w8_pack<<<(unsigned) ((nc + 255) / 256), 256, 0, st>>>((const char *) src0->data, src0->nb[1], F, K, rs, (uint4 *) wout);
+}
+
+// resident per-channel copy if the budget and VRAM allow (built once on the conversion stream), else nullptr (caller requantises per call)
+const w8_w * w8_cached(const ggml_tensor * src0) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    auto it = g_w8.find(src0->data);
+    if (it != g_w8.end()) return &it->second;
+    if (g_w8_refused.count(src0->data)) return nullptr;
+    const size_t F = (size_t) src0->ne[1], K = (size_t) src0->ne[0];
+    const size_t need = F * K + F * sizeof(float);
+    if (g_w8_bytes + need > (env().w8_cache_mb << 20) || !vram_ok(need)) { g_w8_refused.insert(src0->data); return nullptr; }
+    w8_w c; c.bytes = need;
+    if (hipMalloc(&c.w, F * K) != hipSuccess) { g_w8_refused.insert(src0->data); return nullptr; }
+    if (hipMalloc(&c.rs, F * sizeof(float)) != hipSuccess) { (void) hipFree(c.w); g_w8_refused.insert(src0->data); return nullptr; }
+    hipStream_t st = conv_stream();
+    w8_requant(src0, c.w, (float *) c.rs, st);
+    CUDA_CHECK(hipGetLastError());
+    CUDA_CHECK(hipStreamSynchronize(st));
+    g_w8_bytes += need;
+    g_stats.w8_conv++;
+    return &g_w8.emplace(src0->data, c).first->second;
+}
+
+// GGML_N1_W8_INPLACE=1: static eligibility of a tensor for in-place conversion. A converted tensor no longer holds Q8_0 blocks, so
+// EVERY MUL_MAT of it (any batch, decode included) must go through n1_w8_mul_mat and the mmvq / gate-up fusions must skip it.
+bool w8_eligible(const ggml_tensor * t) {
+    return env().on && env().w8 && env().w8_inplace && t->type == GGML_TYPE_Q8_0 && t->ne[2] == 1 && t->ne[3] == 1 &&
+        t->ne[0] % 128 == 0 && t->ne[1] % N1_BF == 0 && ggml_is_contiguous(t) && strstr(t->name, "token_embd") == nullptr &&
+        t->buffer && !ggml_backend_buffer_is_host(t->buffer);
+}
+
+// Converts the Q8_0 tensor in place to [tiled int8 stream F*K][fp32 row scales F] (never larger than the Q8_0 bytes, K >= 64):
+// requant into a scratch buffer on the compute stream, copy back over the Q8_0 blocks. The Q8_0 data is gone afterwards.
+void w8_inplace_get(const ggml_tensor * src0, hipStream_t st, const void ** W, const float ** RS) {
+    const size_t F = (size_t) src0->ne[1], K = (size_t) src0->ne[0], nbytes = F * K + F * sizeof(float);
+    std::lock_guard<std::mutex> lk(g_mtx);
+    if (!g_w8_inpl.count(src0->data)) {
+        char * scratch = nullptr;
+        if (hipMalloc(&scratch, nbytes) != hipSuccess) { GGML_ABORT("W8 in-place: scratch alloc failed (%s)", src0->name); }
+        w8_requant(src0, scratch, (float *) (scratch + F * K), st);
+        CUDA_CHECK(hipMemcpyAsync(src0->data, scratch, nbytes, hipMemcpyDeviceToDevice, st));
+        CUDA_CHECK(hipStreamSynchronize(st));
+        (void) hipFree(scratch);
+        g_w8_inpl[src0->data] = ggml_nbytes(src0);
+        g_stats.w8_conv++;
+    }
+    *W = src0->data; *RS = (const float *) ((const char *) src0->data + F * K);
+}
+
+template <int KT, int WTn, int WFn, int SEGS, int FEED>
+void launch_w8_kt(const void * X, const void * W, const float * rs, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
+    constexpr int FTv = (FEED & m2::FT4) ? 4 : 2, FFv = (FEED & m2::FF8) ? 8 : 4;
+    constexpr int TPB = 16 * FTv * WTn / 128;
+    const int ntile = Npad / 128;
+    const dim3 grid((ntile + TPB - 1) / TPB, F / (16 * FFv * WFn));
+    m2::gemm_fold<WTn, WFn, SEGS, 1, KT | m2::ONEACC | m2::W8 | FEED><<<grid, WTn * WFn * 32, 0, st>>>((const uint4 *) X, (const uint4 *) W, nullptr,
+        rs, sx, Y, N, ntile, F, K, ldy, nullptr);
+}
+template <int WTn, int WFn, int SEGS, int FEED>
+void launch_w8_s(const void * X, const void * W, const float * rs, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
+    switch (K) {
+        case 5120:  launch_w8_kt<(5120 / 1024) << 3,  WTn, WFn, SEGS, FEED>(X, W, rs, sx, Y, N, Npad, F, K, ldy, st); break;
+        case 6144:  launch_w8_kt<(6144 / 1024) << 3,  WTn, WFn, SEGS, FEED>(X, W, rs, sx, Y, N, Npad, F, K, ldy, st); break;
+        case 17408: launch_w8_kt<(17408 / 1024) << 3, WTn, WFn, SEGS, FEED>(X, W, rs, sx, Y, N, Npad, F, K, ldy, st); break;
+        default:    launch_w8_kt<0,                   WTn, WFn, SEGS, FEED>(X, W, rs, sx, Y, N, Npad, F, K, ldy, st); break;
+    }
+}
+void launch_w8(const void * X, const void * W, const float * rs, const float * sx, float * Y, int N, int Npad, int F, int K, int ldy, hipStream_t st) {
+    if (env().w8_kernel == 0) { launch<0, 0>(X, W, rs, sx, Y, N, Npad, F, K, ldy, st); return; }
+    const bool odd = (Npad / 128) % 2 == 1 && !env().m3_wide;
+    if (odd) launch_w8_s<4, 2, 1, 0>(X, W, rs, sx, Y, N, Npad, F, K, ldy, st);
+    else if (env().m3_feed == 1) launch_w8_s<4, 2, 1, m2::FT4>(X, W, rs, sx, Y, N, Npad, F, K, ldy, st);
+    else if (env().m3_feed == 3) launch_w8_s<4, 2, 1, m2::FT4 | m2::PRW>(X, W, rs, sx, Y, N, Npad, F, K, ldy, st);
+    else if (env().m3_feed == 2) launch_w8_s<8, 1, 1, m2::FF8>(X, W, rs, sx, Y, N, Npad, F, K, ldy, st);
+    else launch_w8_s<8, 1, 1, 0>(X, W, rs, sx, Y, N, Npad, F, K, ldy, st);
+}
+
+bool n1_w8_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const uint64_t fl = mm_flops(src0, src1);
+    const bool inpl = w8_eligible(src0);
+    if (!n1_shape_ok(src0, src1, dst)) {
+        if (inpl) GGML_ABORT("W8 in-place: %s reached a MUL_MAT the N1 shape check refuses (the tensor is not Q8_0 any more)", src0->name);
+        g_stats.w8_fb++; return false;
+    }
+    const int F = (int) src0->ne[1], K = (int) src0->ne[0], N = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
+    const int Npad = (N + N1_BT - 1) / N1_BT * N1_BT;
+    hipStream_t st = ctx.stream();
+
+    if (env().w8_iso == 'w' && !inpl) {
+        // isolation arm: the per-channel requantised WEIGHTS only (as Q8_0 blocks with one fp16 scale per row), per-32 q8_1 activations, stock mmq
+        ggml_cuda_pool_alloc<char> q8(ctx.pool(), (size_t) F * src0->nb[1]);
+        ggml_cuda_pool_alloc<float> rs(ctx.pool(), (size_t) F);
+        k_w8_rowscale<<<F, 256, 0, st>>>((const char *) src0->data, src0->nb[1], K, rs.get());
+        const size_t nb = (size_t) F * K / 32;
+        k_w8_iso_w<<<(unsigned) ((nb + 255) / 256), 256, 0, st>>>((const char *) src0->data, src0->nb[1], F, K, rs.get(), q8.get());
+        ggml_tensor fake0 = *src0;
+        fake0.data = q8.get();
+        ggml_cuda_mul_mat_q(ctx, &fake0, src1, nullptr, dst);
+        g_stats.mm_w8++; g_stats.fl_w8 += fl;
+        return true;
+    }
+    if (env().w8_iso == 'a' && !inpl) {
+        // isolation arm: per-TOKEN int8 activations only (quantised, dequantised back to fp32), exact Q8_0 weights, stock mmq
+        ggml_cuda_pool_alloc<int8_t> X(ctx.pool(), (size_t) Npad * K);
+        ggml_cuda_pool_alloc<float>  sx(ctx.pool(), (size_t) Npad);
+        ggml_cuda_pool_alloc<float>  xq(ctx.pool(), (size_t) N * K);
+        k_n1_quant_act<<<dim3(1, Npad), 256, 0, st>>>((const char *) src1->data, src1->nb[1], N, K, K, Npad, X.get(), sx.get());
+        k_w8_iso_a<<<dim3(K / 256, N), 256, 0, st>>>(X.get(), sx.get(), K, K / 128, xq.get());
+        ggml_tensor fake1 = *src1;
+        fake1.data = xq.get();
+        fake1.nb[0] = sizeof(float); fake1.nb[1] = (size_t) K * sizeof(float); fake1.nb[2] = fake1.nb[1] * src1->ne[1]; fake1.nb[3] = fake1.nb[2] * src1->ne[2];
+        ctx.act_cache_tensor = nullptr; ctx.act_cache_buf.reset();   // the stack tensor's address must never hit a cache entry
+        ggml_cuda_mul_mat_q(ctx, src0, &fake1, nullptr, dst);
+        ctx.act_cache_tensor = nullptr; ctx.act_cache_buf.reset();
+        g_stats.mm_w8++; g_stats.fl_w8 += fl;
+        return true;
+    }
+
+    const void * Wp = nullptr;
+    const float * RSp = nullptr;
+    ggml_cuda_pool_alloc<int8_t> tw(ctx.pool());
+    ggml_cuda_pool_alloc<float>  trs(ctx.pool());
+    if (inpl) {
+        w8_inplace_get(src0, st, &Wp, &RSp);
+    } else if (const w8_w * c = w8_cached(src0)) {
+        Wp = c->w; RSp = (const float *) c->rs;
+    } else {
+        tw.alloc((size_t) F * K);
+        trs.alloc((size_t) F);
+        w8_requant(src0, tw.get(), trs.get(), st);
+        Wp = tw.get(); RSp = trs.get();
+        g_stats.w8_trans++;
+    }
+
+    // per-token activation; siblings sharing src1 (q/k/v, gate/up) quantise once through the act-fuse dedup cache
+    const size_t nbytes   = n1_act_bytes(K, N);
+    const int    mask     = ggml_cuda_act_fuse_mask();
+    const bool   act_hit  = mask && ctx.act_cache_tensor == src1 && ctx.act_cache_buf &&
+        ctx.act_cache_layout == GGML_CUDA_ACT_LAYOUT_N1TOK && ctx.act_cache_bytes == nbytes;
+    const bool   act_cache = act_hit || (mask & GGML_ACT_FUSE_DEDUP);
+    GGML_ASSERT(ctx.act_pending != src1 && "N1 W8: pending GLU consumer");
+    if (act_hit) g_stats.w8_act_hit++;
+    ggml_cuda_pool_alloc<char> local(ctx.pool(), act_cache ? 0 : nbytes);
+    if (act_cache && !act_hit) {
+        ctx.act_cache_buf.reset();
+        ctx.act_cache_buf    = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes);
+        ctx.act_cache_tensor = src1;
+        ctx.act_cache_layout = GGML_CUDA_ACT_LAYOUT_N1TOK;
+        ctx.act_cache_bytes  = nbytes;
+    }
+    char * buf = act_cache ? ctx.act_cache_buf->get() : local.get();
+    int8_t * X  = (int8_t *) buf;
+    float  * sx = (float *) (buf + (size_t) Npad * K);
+    if (!act_hit) {
+        k_n1_quant_act<<<dim3(1, Npad), 256, 0, st>>>((const char *) src1->data, src1->nb[1], N, K, K, Npad, X, sx);
+    }
+    launch_w8(X, Wp, RSp, sx, (float *) dst->data, N, Npad, F, K, (int) (dst->nb[1] / sizeof(float)), st);
+    if (env().w8_check) {   // debug: both kernels against an exact integer reference on a 64 x 128 corner (first calls only)
+        static std::atomic<int> ncheck{0};
+        const int cn = ncheck.fetch_add(1);
+        const char * cname = getenv("GGML_N1_W8_CHECK_NAME");
+        if ((cname && strstr(src0->name, cname)) || (cn % env().w8_check_every == 0 && cn / env().w8_check_every < env().w8_check)) {
+            const int nt = N < 64 ? N : 64, nf = 128, ldy = (int) (dst->nb[1] / sizeof(float));
+            const int ts = N / nt, fs = F / nf;   // sample 64 tokens and 128 features spread over the whole output
+            ggml_cuda_pool_alloc<float> yr(ctx.pool(), (size_t) nt * nf), y2(ctx.pool(), (size_t) Npad * F), er(ctx.pool(), 4);
+            k_w8_ref<<<dim3(nf, nt), 256, 0, st>>>(X, (const int8_t *) Wp, sx, RSp, yr.get(), K, K / 128, nf, ts, fs);
+            const int other = env().w8_kernel == 0 ? 1 : 0;
+            const int save = env().w8_kernel;
+            const_cast<n1_env &>(env()).w8_kernel = other;
+            launch_w8(X, Wp, RSp, sx, y2.get(), N, Npad, F, K, ldy, st);
+            const_cast<n1_env &>(env()).w8_kernel = save;
+            CUDA_CHECK(hipMemsetAsync(er.get(), 0, 4 * sizeof(float), st));
+            k_w8_cmp<<<1, 256, 0, st>>>((const float *) dst->data, ldy, yr.get(), nt, nf, er.get(), 0, ts, fs);
+            k_w8_cmp<<<1, 256, 0, st>>>(y2.get(), ldy, yr.get(), nt, nf, er.get(), 2, ts, fs);
+            ggml_cuda_pool_alloc<float> full(ctx.pool(), 2);   // whole-output cross-check of the two kernels (dst is contiguous: ldy == F)
+            CUDA_CHECK(hipMemsetAsync(full.get(), 0, 2 * sizeof(float), st));
+            k_w8_cmp<<<1, 1024, 0, st>>>((const float *) dst->data, ldy, y2.get(), N, F, full.get(), 0, 1, 1);
+            float h[6];
+            CUDA_CHECK(hipMemcpyAsync(h, er.get(), 4 * sizeof(float), hipMemcpyDeviceToHost, st));
+            CUDA_CHECK(hipMemcpyAsync(h + 4, full.get(), 2 * sizeof(float), hipMemcpyDeviceToHost, st));
+            CUDA_CHECK(hipStreamSynchronize(st));
+            fprintf(stderr, "[W8 check] %s N=%d K=%d F=%d: kernel %d max|err| %.3g (max|ref| %.3g) | kernel %d max|err| %.3g | whole-output max|k%d-k%d| %.3g (max|k%d| %.3g)\n",
+                    src0->name, N, K, F, save, h[0], h[1], other, h[2], save, other, h[4], other, h[5]);
+        }
+    }
+    g_stats.mm_w8++; g_stats.fl_w8 += fl;
+    CUDA_CHECK(hipGetLastError());
+    return true;
+}
+
 } // namespace
 
 bool ggml_cuda_n1_enabled() { return env().on; }
+bool ggml_cuda_n1_w8_inplace(const ggml_tensor * t) { return w8_eligible(t); }
 bool ggml_cuda_n1_gateup_enabled() { return env().on && env().m3 && env().gateup; }
 
 // T434: this MUL_MAT will run the one-GEMM path (GGML_N1_M3) and read the N1TOK cache entry of its FWHT src1. Mirrors the
@@ -857,7 +1221,7 @@ void ggml_cuda_n1_count(const ggml_tensor * src0, const ggml_tensor * src1) {
     if (src1->ne[1] < env().min_n) return;
     const uint64_t fl = mm_flops(src0, src1);
     g_stats.mm_total++; g_stats.fl_total += fl;
-    if (src0->type == GGML_TYPE_Q2_0 || src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NK_Q2_0_W2ONLY) {
+    if (src0->type == GGML_TYPE_Q2_0 || src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NK_Q2_0_W2ONLY || (env().w8 && src0->type == GGML_TYPE_Q8_0)) {
         g_stats.mm_q++; g_stats.fl_q += fl;
     }
 }
@@ -865,6 +1229,10 @@ void ggml_cuda_n1_count(const ggml_tensor * src0, const ggml_tensor * src1) {
 static bool n1_mul_mat_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
 bool ggml_cuda_n1_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (src0->type == GGML_TYPE_Q8_0 && env().w8) {
+        if (src1->ne[1] < env().min_n && !w8_eligible(src0)) return false;
+        return n1_w8_mul_mat(ctx, src0, src1, dst);
+    }
     if (src0->type != GGML_TYPE_Q2_0 && src0->type != GGML_TYPE_Q1_0) return false;
     if (src1->ne[1] < env().min_n) return false;
     return n1_mul_mat_impl(ctx, src0, src1, dst);
@@ -1125,6 +1493,7 @@ void ggml_cuda_n1_act_ref_quant(const float * x, int64_t s11, int64_t K, int64_t
 #else
 
 bool ggml_cuda_n1_enabled() { return false; }
+bool ggml_cuda_n1_w8_inplace(const ggml_tensor *) { return false; }
 bool ggml_cuda_n1_m3_ready(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }
 bool ggml_cuda_n1_gateup_enabled() { return false; }
 bool ggml_cuda_n1_gateup(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }

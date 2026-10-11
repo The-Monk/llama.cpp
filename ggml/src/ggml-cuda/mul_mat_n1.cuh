@@ -7,6 +7,10 @@
 
 bool ggml_cuda_n1_enabled();
 
+// T505 (GGML_N1_W8_INPLACE=1): this Q8_0 weight is converted in place to per-channel int8 by the W8A8 GEMM, so no other kernel (mmvq / mmq / the
+// gate-up and bias fusions) may read it as Q8_0.
+bool ggml_cuda_n1_w8_inplace(const ggml_tensor * t);
+
 // Coverage accounting: call for every MUL_MAT reaching ggml_cuda_mul_mat when enabled.
 void ggml_cuda_n1_count(const ggml_tensor * src0, const ggml_tensor * src1);
 
