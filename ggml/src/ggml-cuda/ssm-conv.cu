@@ -424,6 +424,61 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     }
 }
 
+// T508 (GGML_GDN_CONV_SEQ): in-place multi-token conv (d_conv == 4, no L2 epilogue, silu). dst aliases x: y[t] overwrites x[t]. One thread owns a
+// channel for the WHOLE token range (no tile halo, hence no cross-block read/write race on the overlapping 3-token windows); the window lives in
+// registers and KT tokens are loaded ahead of the compute. Same per-element arithmetic as ssm_conv_prefill_f32's d_conv == 4 branch (fma x0..x3
+// from bias 0, then silu). The recurrent state row is read first and the last 3 raw x values are written back at the end (own row, same thread).
+template <int THREADS, int KT>
+static __global__ void __launch_bounds__(THREADS) ssm_conv_seq_f32(float * __restrict__ state, float * x, const float * __restrict__ w,
+                                                               const int state_nb1, const int state_nb2, const int x_nb1, const int x_nb2,
+                                                               const int w_nb1, const int64_t n_t, const int state_is_zero) {
+    const int ch = blockIdx.x * THREADS + threadIdx.x;
+    float * s_row = (float *) ((char *) state + blockIdx.y * state_nb2 + ch * state_nb1);
+    float * xs    = (float *) ((char *) x + blockIdx.y * x_nb2) + ch;
+    const int stride_x = x_nb1 / sizeof(float);
+    const float * wr = w + (size_t) ch * (w_nb1 / sizeof(float));
+    const float w0 = wr[0], w1 = wr[1], w2 = wr[2], w3 = wr[3];
+    const float b = 0.0f;
+
+    float a0 = state_is_zero ? 0.0f : s_row[0];
+    float a1 = state_is_zero ? 0.0f : s_row[1];
+    float a2 = state_is_zero ? 0.0f : s_row[2];
+
+    float cur[KT];
+#pragma unroll
+    for (int k = 0; k < KT; k++) {
+        cur[k] = k < n_t ? xs[(int64_t) k * stride_x] : 0.0f;
+    }
+    for (int64_t t0 = 0; t0 < n_t; t0 += KT) {
+        float nxt[KT];
+#pragma unroll
+        for (int k = 0; k < KT; k++) {
+            const int64_t t = t0 + KT + k;
+            nxt[k] = t < n_t ? xs[t * stride_x] : 0.0f;
+        }
+#pragma unroll
+        for (int k = 0; k < KT; k++) {
+            const int64_t t = t0 + k;
+            if (t < n_t) {
+                float sumf = fmaf(a0, w0, b);
+                sumf = fmaf(a1, w1, sumf);
+                sumf = fmaf(a2, w2, sumf);
+                sumf = fmaf(cur[k], w3, sumf);
+                xs[t * stride_x] = ggml_cuda_op_silu_single(sumf);
+                a0 = a1; a1 = a2; a2 = cur[k];
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < KT; k++) {
+            cur[k] = nxt[k];
+        }
+    }
+    // (a0, a1, a2) are now the last three raw x values (n_t >= 3: the caller guarantees n_t > 32)
+    s_row[0] = a0;
+    s_row[1] = a1;
+    s_row[2] = a2;
+}
+
 // T409 host side of ssm_conv_prefill_f32 (multi-token GGML_OP_SSM_CONV_UPDATE).
 static void ssm_conv_prefill_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const bool apply_silu) {
     ggml_tensor *              state = dst->src[0];
@@ -444,6 +499,19 @@ static void ssm_conv_prefill_cuda(ggml_backend_cuda_context & ctx, ggml_tensor *
     GGML_ASSERT(state->ne[0] == nc - 1);
     GGML_ASSERT(state->nb[0] == sizeof(float) && x->nb[0] == sizeof(float) && w->nb[0] == sizeof(float));
     GGML_ASSERT(dst->ne[0] == nr && dst->ne[1] == n_t && dst->nb[0] == sizeof(float));
+
+    if (ggml_get_op_params_i32(dst, 4) != 0) {   // T508 in-place sequential kernel
+        GGML_ASSERT(nc == 4 && l2_n == 0 && apply_silu && n_t > 32 && dst->data == x->data && dst->nb[1] == x->nb[1] && dst->nb[2] == x->nb[2]);
+        // wrx90 kernel trace, pp2048 -ub 1024, median per call: 32x16 115, 32x32 117, 64x16 114, 128x16 113-116, x8 123 (tiled kernel 151)
+        constexpr int seq_threads = 64;
+        constexpr int seq_kt      = 16;
+        GGML_ASSERT(nr % seq_threads == 0);
+        const dim3 sblocks(nr / seq_threads, n_s, 1);
+        ssm_conv_seq_f32<seq_threads, seq_kt><<<sblocks, seq_threads, 0, ctx.stream()>>>(
+            (float *) state->data, (float *) x->data, (const float *) w->data, (int) state->nb[1], (int) state->nb[2],
+            (int) x->nb[1], (int) x->nb[2], (int) w->nb[1], n_t, state_is_zero ? 1 : 0);
+        return;
+    }
 
     const int threads = 128;
     GGML_ASSERT(nr % threads == 0);

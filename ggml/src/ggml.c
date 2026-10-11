@@ -5743,7 +5743,7 @@ struct ggml_tensor * ggml_ssm_conv_update(
     return ggml_ssm_conv_update_ext(ctx, s, x, c, apply_silu, false, 0, 0.0f);
 }
 
-struct ggml_tensor * ggml_ssm_conv_update_ext(
+static struct ggml_tensor * ggml_ssm_conv_update_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * s,
         struct ggml_tensor  * x,
@@ -5751,7 +5751,8 @@ struct ggml_tensor * ggml_ssm_conv_update_ext(
         bool                  apply_silu,
         bool                  state_is_zero,
         int32_t               l2_n,
-        float                 l2_eps) {
+        float                 l2_eps,
+        bool                  inplace) {
     GGML_ASSERT(ggml_is_3d(s));
     GGML_ASSERT(ggml_is_matrix(c));
 
@@ -5768,12 +5769,16 @@ struct ggml_tensor * ggml_ssm_conv_update_ext(
     GGML_ASSERT(l2_n >= 0 && l2_n % 128 == 0 && l2_n <= d_inner);
     GGML_ASSERT(n_t > 1 || (!state_is_zero && l2_n == 0)); // the single-token kernel (T368) has neither option
 
-    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
+    if (inplace) {
+        GGML_ASSERT(ggml_is_contiguous(x) && n_t > 1 && l2_n == 0);
+    }
+    struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, x) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
 
     ggml_set_op_params_i32(result, 0, apply_silu ? 1 : 0);
     ggml_set_op_params_i32(result, 1, state_is_zero ? 1 : 0);
     ggml_set_op_params_i32(result, 2, l2_n);
     ggml_set_op_params_f32(result, 3, l2_eps);
+    ggml_set_op_params_i32(result, 4, inplace ? 1 : 0);
 
     result->op     = GGML_OP_SSM_CONV_UPDATE;
     result->src[0] = s;
@@ -5781,6 +5786,29 @@ struct ggml_tensor * ggml_ssm_conv_update_ext(
     result->src[2] = x;
 
     return result;
+}
+
+struct ggml_tensor * ggml_ssm_conv_update_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * c,
+        bool                  apply_silu,
+        bool                  state_is_zero,
+        int32_t               l2_n,
+        float                 l2_eps) {
+    return ggml_ssm_conv_update_impl(ctx, s, x, c, apply_silu, state_is_zero, l2_n, l2_eps, false);
+}
+
+// T508: the result is a view of x (the conv output overwrites its input; same values as ggml_ssm_conv_update_ext with l2_n == 0)
+struct ggml_tensor * ggml_ssm_conv_update_ext_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * c,
+        bool                  apply_silu,
+        bool                  state_is_zero) {
+    return ggml_ssm_conv_update_impl(ctx, s, x, c, apply_silu, state_is_zero, 0, 0.0f, true);
 }
 
 // ggml_ssm_scan

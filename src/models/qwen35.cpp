@@ -582,8 +582,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         cb(conv_state, "conv_state_inplace_view", il);
 
         const int32_t l2_n = gdn_glue_l2 ? (int32_t) (2 * head_k_dim * num_k_heads) : 0;
-        conv_output_silu = ggml_ssm_conv_update_ext(ctx0, conv_state, qkv_mixed, conv_kernel, true,
-                                                    inp->mctx->get_rs_z() >= 0, l2_n, hparams.f_norm_rms_eps);
+        // T508 GGML_GDN_CONV_SEQ=1 (default off): the conv overwrites its input (qkv_mixed has no other reader on this path) with a
+        // one-thread-per-channel sequential kernel; the 84 MB read+write footprint becomes 42 MB. d_conv == 4, no L2 fold.
+        const bool gdn_conv_seq = gdn_env_on("GGML_GDN_CONV_SEQ") && l2_n == 0 && conv_kernel_size == 4;
+        conv_output_silu = gdn_conv_seq ?
+            ggml_ssm_conv_update_ext_inplace(ctx0, conv_state, qkv_mixed, conv_kernel, true, inp->mctx->get_rs_z() >= 0) :
+            ggml_ssm_conv_update_ext(ctx0, conv_state, qkv_mixed, conv_kernel, true,
+                                     inp->mctx->get_rs_z() >= 0, l2_n, hparams.f_norm_rms_eps);
         cb(conv_output_silu, "conv_output_silu", il);
         static bool logged[2] = { false, false }; // once per state_is_zero value
         if (!logged[inp->mctx->get_rs_z() >= 0]) {

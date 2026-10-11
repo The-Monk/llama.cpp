@@ -2551,6 +2551,15 @@ extern "C" {
             int32_t               l2_n,
             float                 l2_eps);
 
+    // T508: in-place form (d_conv == 4, n_t > 32, no L2): the result is a view of x, which must be contiguous and have no other reader
+    GGML_API struct ggml_tensor * ggml_ssm_conv_update_ext_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            bool                  apply_silu,
+            bool                  state_is_zero);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,
