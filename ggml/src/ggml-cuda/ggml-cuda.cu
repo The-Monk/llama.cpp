@@ -4359,12 +4359,26 @@ struct ggml_cuda_m3_norm {
     ggml_tensor *       normdst;   // MUL(weight) node, or nullptr when no other node reads it
     const ggml_tensor * mulw;      // the norm weight
     float               eps;
+    int                 bf16_n   = 0;   // T492 (GGML_CUDA_B2_NORM_BF16): number of BF16-weight MUL_MATs that read the normalized row (src1 == normdst); the kernel then stores bf16 instead of fp32
+    int                 bf16_end = 0;   // node index of the last of them
+};
+
+// T492 (GGML_CUDA_B2_GNQ_FUSE): the GDN gated norm (RMS_NORM + MUL(weight) + silu(z) * .) in front of the permuted ssm_out producer
+struct ggml_cuda_m3_gn {
+    const ggml_tensor * rms;    // the RMS_NORM node
+    const ggml_tensor * mulw;   // MUL(weight)
+    const ggml_tensor * un;     // UNARY(silu) of the z view
+    ggml_tensor *       mulg;   // the gated product (never written by the fused kernel)
+    const ggml_tensor * x;      // rms->src[0]
+    const ggml_tensor * w;      // the norm weight
+    const ggml_tensor * z;      // un->src[0]->src[0]'s data holder (the z view)
+    float               eps;
 };
 
 // T434 M3: defined with the act-fuse helpers below
 static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, int off,
         const ggml_tensor * x, const ggml_tensor * up, const ggml_tensor * signs, ggml_tensor * mm,
-        int perm_hd = 0, int perm_nk = 0, int perm_rep = 0, const ggml_cuda_m3_norm * na = nullptr);
+        int perm_hd = 0, int perm_nk = 0, int perm_rep = 0, const ggml_cuda_m3_norm * na = nullptr, const ggml_cuda_m3_gn * gn = nullptr);
 
 
 static const ggml_tensor * ggml_cuda_act_first_consumer(const ggml_cgraph * cgraph, int i, const ggml_tensor * t);
@@ -4379,6 +4393,16 @@ static bool ggml_cuda_b2_gatecont_fuse_enabled() {
 }
 static bool ggml_cuda_b2_gatenorm_fuse_enabled() {
     static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_GATENORM_FUSE"); return v && atoi(v) != 0; }();
+    return on;
+}
+// T492: GDN gated norm + ssm_out permute + FWHT + int8 quantize in one launch (prefill). =1 on, default off.
+static bool ggml_cuda_b2_gnq_fuse_enabled() {
+    static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_GNQ_FUSE"); return v && atoi(v) != 0; }();
+    return on;
+}
+// T492: ADDNORM stores the normalized row as bf16 (the form the sibling BF16 GEMMs read) instead of fp32 + a convert_unary launch. Default off.
+static bool ggml_cuda_b2_norm_bf16_enabled() {
+    static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_NORM_BF16"); return v && atoi(v) != 0; }();
     return on;
 }
 static bool ggml_cuda_b2_addnorm_fuse_enabled() {
@@ -4631,6 +4655,65 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // T492 GGML_CUDA_B2_GNQ_FUSE: prefill GDN gated norm [RMS_NORM, MUL(w), RESHAPE(z), UNARY(silu), MUL] + the ssm_out producer chain
+    // [views..., CONT, RESHAPE, MUL(signs), RESHAPE, MUL_MAT(FWHT hint)] -> ONE launch (see gn_perm_fwht_quant_n1t); the gated-norm output,
+    // the permuted copy and the fp32 FWHT output are never written
+    if (ggml_cuda_b2_gnq_fuse_enabled() && ggml_cuda_n1_enabled() && node->op == GGML_OP_RMS_NORM && node->ne[0] == 128 && node->ne[2] > 32 &&
+        i + 9 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL && cgraph->nodes[i + 2]->op == GGML_OP_RESHAPE &&
+        cgraph->nodes[i + 3]->op == GGML_OP_UNARY && cgraph->nodes[i + 4]->op == GGML_OP_MUL) {
+        const ggml_tensor * mulw = cgraph->nodes[i + 1];
+        const ggml_tensor * zrsh = cgraph->nodes[i + 2];
+        const ggml_tensor * silu = cgraph->nodes[i + 3];
+        ggml_tensor *       mulg = cgraph->nodes[i + 4];
+        const ggml_tensor * w    = mulw->src[0] == node ? mulw->src[1] : mulw->src[0];
+        int c = i + 5;
+        while (c < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[c])) {
+            ++c;
+        }
+        if (c + 4 < cgraph->n_nodes && cgraph->nodes[c]->op == GGML_OP_CONT &&
+            (mulw->src[0] == node || mulw->src[1] == node) && silu->src[0] == zrsh && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU &&
+            ((mulg->src[0] == mulw && mulg->src[1] == silu) || (mulg->src[0] == silu && mulg->src[1] == mulw)) &&
+            zrsh->src[0] != mulw && zrsh->src[0] != node &&
+            ggml_node_get_use_count(cgraph, i) == 1 && ggml_node_get_use_count(cgraph, i + 1) == 1 && ggml_node_get_use_count(cgraph, i + 2) == 1 &&
+            ggml_node_get_use_count(cgraph, i + 3) == 1 && ggml_node_get_use_count(cgraph, i + 4) == 1 &&
+            !(node->flags & GGML_TENSOR_FLAG_OUTPUT) && !(mulw->flags & GGML_TENSOR_FLAG_OUTPUT) && !(silu->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            !(mulg->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            ggml_can_fuse_subgraph(cgraph, c, { GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { c + 4 })) {
+            const ggml_tensor * cont  = cgraph->nodes[c];
+            const ggml_tensor * perm  = cont->src[0];
+            const ggml_tensor * rsh   = cgraph->nodes[c + 1];
+            const ggml_tensor * muls  = cgraph->nodes[c + 2];
+            const ggml_tensor * rsh2  = cgraph->nodes[c + 3];
+            ggml_tensor *       mm    = cgraph->nodes[c + 4];
+            const ggml_tensor * base  = perm && perm->op == GGML_OP_PERMUTE && perm->src[0] && perm->src[0]->op == GGML_OP_RESHAPE ? perm->src[0]->src[0] : nullptr;
+            const ggml_tensor * signs = muls->src[1];
+            const ggml_tensor * bt    = base;
+            while (bt && bt != mulg && bt->op == GGML_OP_RESHAPE) {
+                bt = bt->src[0];
+            }
+            if (base && bt == mulg && rsh->src[0] == cont && muls->src[0] == rsh && rsh2->src[0] == muls && mm->src[1] == rsh2 &&
+                ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD && mm->src[0]->ne[0] == 1024 &&
+                base->type == GGML_TYPE_F32 && ggml_is_contiguous(base) && cont->type == GGML_TYPE_F32 && muls->type == GGML_TYPE_F32 &&
+                perm->ne[3] > 1 && ggml_nelements(base) == ggml_nelements(cont) && ggml_nelements(perm) == ggml_nelements(base) &&
+                perm->src[0]->ne[0] == perm->ne[0] && perm->src[0]->ne[1] == perm->ne[2] && perm->src[0]->ne[2] == perm->ne[1] &&
+                perm->src[0]->ne[3] == perm->ne[3] &&
+                perm->nb[0] == sizeof(float) && perm->nb[1] == perm->ne[0] * perm->ne[2] * sizeof(float) &&
+                perm->nb[2] == perm->ne[0] * sizeof(float) && perm->ne[0] == 128 &&
+                base->ne[0] == perm->ne[0] * perm->ne[1] * perm->ne[2] && ggml_nelements(base) == base->ne[0] * perm->ne[3] &&
+                signs->type == GGML_TYPE_F32 && ggml_is_contiguous(signs) && signs->ne[1] == 1 && signs->ne[2] == 1 && signs->ne[3] == 1 &&
+                signs->ne[0] == base->ne[0] && signs->ne[0] % 1024 == 0 && ggml_nelements(rsh2) == ggml_nelements(base) &&
+                ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(zrsh) && node->src[0]->type == GGML_TYPE_F32) {
+                float eps;
+                memcpy(&eps, node->op_params, sizeof(float));
+                const ggml_cuda_m3_gn gn = { node, mulw, silu, mulg, node->src[0], w, zrsh, eps };
+                if (ggml_cuda_m3_fwht_quant(cuda_ctx, cgraph, c, 2, base, nullptr, signs, mm, (int) perm->ne[0], (int) perm->ne[2], (int) perm->ne[1], nullptr, &gn)) {
+                    cuda_ctx->act_fuse_nowrite = true;   // the skipped nodes' (dead) memory may overlap the FWHT node's, whose cache entry must survive
+                    return c + 4 - i;
+                }
+            }
+        }
+    }
+
     // T439 GGML_CUDA_B2_GATENORM_FUSE: GDN gated norm RMS_NORM + MUL(weight) + RESHAPE(z, a view) + UNARY(silu) + MUL -> one launch
     if (ggml_cuda_b2_gatenorm_fuse_enabled() && node->op == GGML_OP_RMS_NORM && node->ne[0] == 128 && i + 4 < cgraph->n_nodes &&
         cgraph->nodes[i + 1]->op == GGML_OP_MUL && cgraph->nodes[i + 2]->op == GGML_OP_RESHAPE &&
@@ -4694,7 +4777,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && w->ne[0] == add->ne[0] && ggml_nelements(w) == add->ne[0] &&
             signs->type == GGML_TYPE_F32 && ggml_is_contiguous(signs) && signs->ne[0] == add->ne[0] && ggml_nelements(signs) == add->ne[0] &&
             muls->src[0]->ne[0] == add->ne[0] && add->ne[0] % 1024 == 0 && ggml_nelements(rsh) == ggml_nelements(add)) {
-            const ggml_cuda_m3_norm na = { add, norm_shared ? mulw : nullptr, w, eps };
+            ggml_cuda_m3_norm na = { add, norm_shared ? mulw : nullptr, w, eps };
+            if (norm_shared && ggml_cuda_b2_norm_bf16_enabled() && !(mulw->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                // every other reader of the normalized row must be a BF16-weight MUL_MAT on it (GDN ssm_beta / ssm_alpha), so no fp32 copy is needed
+                int n = 0, last = 0;
+                for (int j = i + 6; j < cgraph->n_nodes && j <= i + 96; ++j) {
+                    const ggml_tensor * nd = cgraph->nodes[j];
+                    if (nd->op == GGML_OP_MUL_MAT && nd->src[1] == mulw && nd->src[0]->type == GGML_TYPE_BF16 && nd->src[2] == nullptr) {
+                        n++; last = j;
+                    }
+                }
+                if (n > 0 && n == ggml_node_get_use_count(cgraph, i + 2) - 1 && mulw->ne[1] >= 64 && mulw->ne[2] == 1 && mulw->ne[3] == 1) {
+                    na.bf16_n = n; na.bf16_end = last;
+                }
+            }
             if (ggml_cuda_m3_fwht_quant(cuda_ctx, cgraph, i, 3, add->src[0], nullptr, signs, mm, 0, 0, 0, &na)) {
                 return 5;
             }
@@ -5923,7 +6019,7 @@ static int ggml_cuda_act_try_fuse(ggml_backend_cuda_context * ctx, ggml_cgraph *
 // off = 1 with `up` set: the pattern starts one node earlier with the swiglu_split GLU (x = gate, up = up).
 static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, int off,
         const ggml_tensor * x, const ggml_tensor * up, const ggml_tensor * signs, ggml_tensor * mm,
-        int perm_hd, int perm_nk, int perm_rep, const ggml_cuda_m3_norm * na) {
+        int perm_hd, int perm_nk, int perm_rep, const ggml_cuda_m3_norm * na, const ggml_cuda_m3_gn * gn) {
     static const bool fuse_on = [] {
         const char * m3 = getenv("GGML_N1_M3"), * e = getenv("GGML_N1_M3_FUSE");
         return !(m3 && strcmp(m3, "0") == 0) && !(e && atoi(e) == 0);   // default ON, like n1_env().m3
@@ -5993,6 +6089,9 @@ static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_c
             skip_fp32 = false;
         }
     }
+    if (gn && !skip_fp32) {
+        return false;   // the gated-norm producer writes only the int8 bytes
+    }
     struct glu_stats {
         int64_t fused = 0, rejected = 0;
         ~glu_stats() { if (getenv("GGML_N1_STATS") && (fused || rejected)) fprintf(stderr, "[N1] stats: m3 glu-fused FWHT producers %lld, rejected for gate/up aliasing %lld\n", (long long) fused, (long long) rejected); }
@@ -6036,8 +6135,18 @@ static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_c
     }
     // the GLU variant under VERIFY keeps its fp32 output off (mm may alias gate/up): only its int8 bytes are compared
     const bool write_fp32 = !skip_fp32 || (verify && !up);
-    const bool launched = na ? ggml_cuda_op_add_norm_fwht_quant_n1t(*ctx, na->add->src[0], na->add->src[1], na->add, na->mulw, signs, na->normdst, mm,
-                                                                    na->eps, write_fp32, ctx->act_cache_buf->get())
+    static const bool gnv_env = getenv("GGML_B2_GNQ_VERIFY") != nullptr;
+    std::unique_ptr<ggml_cuda_pool_alloc<char>> gnq_dbg;
+    if (gn && gnv_env) {
+        gnq_dbg = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx->pool(), ggml_nbytes(gn->mulg));
+    }
+    std::unique_ptr<ggml_cuda_pool_alloc<char>> bf16_buf;
+    if (na && na->bf16_n > 0) {
+        bf16_buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx->pool(), ggml_nelements(na->normdst) * sizeof(nv_bfloat16));
+    }
+    const bool launched = gn ? ggml_cuda_op_gn_perm_fwht_quant_n1t(*ctx, gn->x, gn->w, gn->z, signs, mm, gn->eps, perm_nk, perm_rep, ctx->act_cache_buf->get(), gnq_dbg.get() ? (float *) gnq_dbg.get()->get() : nullptr)
+                         : na ? ggml_cuda_op_add_norm_fwht_quant_n1t(*ctx, na->add->src[0], na->add->src[1], na->add, na->mulw, signs, na->normdst, mm,
+                                                                    na->eps, write_fp32, ctx->act_cache_buf->get(), bf16_buf ? bf16_buf->get() : nullptr)
                              : ggml_cuda_op_fwht_signed_quant_n1t(*ctx, x, up, signs, mm, write_fp32, ctx->act_cache_buf->get(), perm_hd, perm_nk, perm_rep);
     if (!launched) {
         ctx->act_cache_tensor = nullptr;
@@ -6045,6 +6154,45 @@ static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_c
         return false;
     }
     CUDA_CHECK(cudaGetLastError());
+    if (bf16_buf) {
+        // arm the T447 BF16_SHARE hand-off: the sibling MUL_MATs consume this buffer instead of converting the (never written) fp32 row
+        ctx->bf16_share_buf  = std::move(bf16_buf);
+        ctx->bf16_share_src1 = na->normdst;
+        ctx->bf16_share_data = na->normdst->data;
+        ctx->bf16_share_uses = na->bf16_n;
+        ctx->bf16_share_end  = na->bf16_end;
+    }
+    static const bool gn_verify_env = getenv("GGML_B2_GNQ_VERIFY") != nullptr;   // gate only: syncs (run with GGML_CUDA_DISABLE_GRAPHS=1)
+    if (gn && gn_verify_env) {
+        // reference: the T447 gated-norm kernel into scratch, then the plain permuted producer on it, byte-compared with the fused bytes
+        const int64_t K = signs->ne[0], ntok = ggml_nelements(gn->x) / K;
+        ggml_cuda_pool_alloc<char> s1(ctx->pool(), ggml_nbytes(gn->mulg)), rb(ctx->pool(), bytes);
+        ggml_tensor tg = *gn->mulg;
+        tg.data = s1.get();
+        ggml_tensor tb = tg;
+        tb.ne[0] = K; tb.ne[1] = ntok; tb.ne[2] = 1; tb.ne[3] = 1;
+        tb.nb[0] = sizeof(float); tb.nb[1] = K * sizeof(float); tb.nb[2] = tb.nb[3] = ntok * K * sizeof(float);
+        CUDA_CHECK(cudaMemsetAsync(rb.get(), 0, bytes, ctx->stream()));   // the cache buffer's padding is zeroed by act_cache_set
+        const bool r1 = ggml_cuda_op_rms_norm_mul_silu_gate(*ctx, gn->rms, gn->mulw, gn->un, &tg);
+        const bool r2 = ggml_cuda_op_fwht_signed_quant_n1t(*ctx, &tb, nullptr, signs, mm, false, rb.get(), 128, perm_nk, perm_rep);
+        struct totals { int64_t n = 0, d = 0, b = 0, bad = 0;
+            ~totals() { fprintf(stderr, "gnq: VERIFY %lld launches: %lld/%lld int8+scale bytes differ from the unfused chain (%lld reference failures)\n",
+                (long long) n, (long long) d, (long long) b, (long long) bad); } };
+        static totals t;
+        if (r1 && r2) {
+            const int64_t dd = ggml_cuda_act_count_diff(rb.get(), ctx->act_cache_buf->get(), bytes, ctx->stream());
+            const size_t xb = bytes - (size_t) ((ntok + 127) / 128 * 128) * 4;
+            const int64_t dx = ggml_cuda_act_count_diff(rb.get(), ctx->act_cache_buf->get(), xb, ctx->stream());
+            if (t.n < 6) {
+                const int64_t dg = gnq_dbg ? ggml_cuda_act_count_diff(s1.get(), gnq_dbg->get(), ggml_nbytes(gn->mulg), ctx->stream()) : -1;
+                fprintf(stderr, "gnq: launch %lld: %lld/%zu differ (X region %lld/%zu), gated-norm values differ %lld/%zu bytes\n", (long long) t.n, (long long) dd, bytes, (long long) dx, xb, (long long) dg, ggml_nbytes(gn->mulg));
+            }
+            t.d += dd;
+            t.b += (int64_t) bytes; t.n++;
+        } else {
+            t.bad++;
+        }
+    }
     if (verify) {
         // (a) the fused kernel's fp32 rotation vs the unfused FWHT kernel (not for the GLU variant), (b) its int8 bytes vs the unfused
         // per-token quantizer run on the UNFUSED kernel's fp32, (c) the same quantizer run on the fused kernel's own fp32 (isolates
@@ -6077,14 +6225,14 @@ static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_c
 
 static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, int off,
         const ggml_tensor * x, const ggml_tensor * up, const ggml_tensor * signs, ggml_tensor * mm,
-        int perm_hd, int perm_nk, int perm_rep, const ggml_cuda_m3_norm * na) {
+        int perm_hd, int perm_nk, int perm_rep, const ggml_cuda_m3_norm * na, const ggml_cuda_m3_gn * gn) {
     struct host_time {
         double us = 0; int64_t calls = 0;
         ~host_time() { if (getenv("GGML_N1_STATS") && calls) fprintf(stderr, "[N1] stats: m3 FWHT-producer host time %.1f ms over %lld calls\n", us * 1e-3, (long long) calls); }
     };
     static host_time ht;
     const auto t0 = std::chrono::steady_clock::now();
-    const bool r = ggml_cuda_m3_fwht_quant_impl(ctx, cgraph, i, off, x, up, signs, mm, perm_hd, perm_nk, perm_rep, na);
+    const bool r = ggml_cuda_m3_fwht_quant_impl(ctx, cgraph, i, off, x, up, signs, mm, perm_hd, perm_nk, perm_rep, na, gn);
     ht.us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
     ht.calls++;
     return r;
@@ -6318,9 +6466,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (act_fuse) {
-                    for (int k = 1; k <= nodes_to_skip; ++k) {
-                        if (!ggml_cuda_is_view_or_noop(cgraph->nodes[i + k])) {
-                            ggml_cuda_act_note_write(cuda_ctx, cgraph->nodes[i + k]);
+                    if (cuda_ctx->act_fuse_nowrite) {
+                        cuda_ctx->act_fuse_nowrite = false;   // T492: those nodes were skipped, not written
+                    } else {
+                        for (int k = 1; k <= nodes_to_skip; ++k) {
+                            if (!ggml_cuda_is_view_or_noop(cgraph->nodes[i + k])) {
+                                ggml_cuda_act_note_write(cuda_ctx, cgraph->nodes[i + k]);
+                            }
                         }
                     }
                 }

@@ -278,12 +278,14 @@ __global__ void fwht_quant_n1t_glu_pf(const float * __restrict__ src, const floa
 // same `scale * x * w` expression), the sum row is stored as the ADD node's value; the normalized row is staged in LDS (and
 // stored as the MUL node's value when another node reads it); stage 2 is fwht_quant_n1t's tail on the staged values, one warp
 // per 1024-block (warps beyond the row's blocks only take part in the barriers).
-template <int NB, bool write_norm, bool write_fp32>
+// WNM: 0 = the normalized row is not stored, 1 = stored as fp32 (norm_dst), 2 = stored as bf16 (T492 GGML_CUDA_B2_NORM_BF16: the bf16
+// copy the sibling BF16 GEMMs would otherwise make with convert_unary, same __float2bfloat16 rounding).
+template <int NB, int WNM, bool write_fp32>
 __launch_bounds__(256, 1)
 __global__ void add_norm_fwht_quant_n1t(const float * __restrict__ xa, const float * __restrict__ xb, float * __restrict__ sum_dst,
                                         const int ntok, const float eps, const float * __restrict__ mulw,
                                         const float * __restrict__ signs, const float fscale,
-                                        float * __restrict__ norm_dst, float * __restrict__ fwht_dst,
+                                        void * __restrict__ norm_dst, float * __restrict__ fwht_dst,
                                         int8_t * __restrict__ X, float * __restrict__ sx, const int S) {
     constexpr int N = 1024, warp_size = 32, el_w = N / warp_size, NT = 256, NJ = 1024 / NT, ncols = NB * N;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
@@ -357,8 +359,10 @@ __global__ void add_norm_fwht_quant_n1t(const float * __restrict__ xa, const flo
                 const int col = tid + NT * j + k * 1024;
                 const float nv = scale * sv[j][k] * mulw[col];
                 nvs[col] = nv;
-                if (write_norm) {
-                    norm_dst[row + col] = nv;
+                if (WNM == 1) {
+                    ((float *) norm_dst)[row + col] = nv;
+                } else if (WNM == 2) {
+                    ((__hip_bfloat16 *) norm_dst)[row + col] = __float2bfloat16(nv);
                 }
             }
         }
@@ -425,6 +429,144 @@ __global__ void add_norm_fwht_quant_n1t(const float * __restrict__ xa, const flo
                 *(uint32_t *) (X + n1_off(tok, w * N + 4 * jj, S)) = *(const uint32_t *) (qs + w * N + 4 * jj);
             }
         }
+    }
+}
+
+// T492 GGML_CUDA_B2_GNQ_FUSE: the GDN gated norm (RMS_NORM + MUL(weight) + silu(z) * ., 128-wide rows, the T447 kernel's arithmetic) +
+// the ssm_out tiled->grouped reorder (PERM) + signed FWHT + per-token int8 quantize in ONE launch. The gated-norm output (a 25 MB fp32
+// tensor written, re-read by a scalar copy kernel, written again and re-read by the producer) is never materialized. One block per
+// token, one warp per 1024 outputs = 8 grouped heads of 128; lane L of warp w holds output element i * 32 + L (i < 32), i.e. head i / 4,
+// column (i % 4) * 32 + L of that head. rms_norm_mul_silu_gate_f32<128> sums x*x with block_reduce over 128 threads = 4 warps (thread
+// c * 32 + L holds column c * 32 + L): warp_reduce_sum per warp (xor tree 16, 8, 4, 2, 1), then the tree over [t0, t1, t2, t3, 0, ...],
+// which is (t0 + t2) + (t1 + t3). Here the 32 x 33 squares of a warp are staged in LDS and lane j sums the 32 squares of reduction j
+// (head j / 4, quarter j % 4) in exactly the xor-tree shape, so every partial sum is the reference's. All fp32 roundings the unfused chain
+// stores to memory (x*x, scale*x, *w, the gated product) are pinned with an empty asm.
+template <int NB>
+__launch_bounds__(32 * NB)
+__global__ void gn_perm_fwht_quant_n1t(const float * __restrict__ x, const float * __restrict__ z, const float * __restrict__ nw,
+                                       const float eps, const float fscale, const float * __restrict__ signs,
+                                       int8_t * __restrict__ X, float * __restrict__ sx, const int S,
+                                       const int perm_nk, const int perm_rep, float * __restrict__ dbg) {
+    constexpr int N = 1024, warp_size = 32, el_w = N / warp_size, K = NB * N, HD = 128, LDQ = 33, WSTRIDE = 4224;
+    const int tok = blockIdx.x, w = threadIdx.y, lane = threadIdx.x;
+    extern __shared__ __align__(16) char smem[];
+    float  * red = (float *) smem;
+    float  * sqw = (float *) (smem + 128 + (size_t) w * WSTRIDE);   // 32 x 33 squares, then (after the barrier below) 1024 int8
+    int8_t * qs  = (int8_t *) (smem + 128 + (size_t) w * WSTRIDE);
+
+    const float * xr = x + (size_t) tok * K;
+    const float * zr = z + (size_t) tok * K;
+    const float * sg = signs + (size_t) w * N;
+    float xv[el_w], zv[el_w];
+#pragma unroll
+    for (int hh = 0; hh < 8; ++hh) {
+        const int t   = w * 8 + hh;                                   // grouped head
+        const int src = HD * (t / perm_rep + perm_nk * (t % perm_rep));   // its tiled source head
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            xv[hh * 4 + q] = xr[src + q * 32 + lane];
+            zv[hh * 4 + q] = zr[src + q * 32 + lane];
+        }
+    }
+    float wv[4];
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        wv[q] = nw[q * 32 + lane];
+    }
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        float sq = xv[i] * xv[i];
+        asm volatile("" : "+v"(sq));   // round x*x before the sums (rms_norm sums rounded squares)
+        sqw[i * LDQ + lane] = sq;
+    }
+    __syncthreads();
+    float a[16], b[8], c[4];
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        a[k] = sqw[lane * LDQ + k] + sqw[lane * LDQ + k + 16];
+        asm volatile("" : "+v"(a[k]));
+    }
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        b[k] = a[k] + a[k + 8];
+        asm volatile("" : "+v"(b[k]));
+    }
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        c[k] = b[k] + b[k + 4];
+        asm volatile("" : "+v"(c[k]));
+    }
+    float d0 = c[0] + c[2], d1 = c[1] + c[3];
+    asm volatile("" : "+v"(d0));
+    asm volatile("" : "+v"(d1));
+    const float tq = d0 + d1;   // lane j: sum of reduction j (head j / 4, quarter j % 4)
+    const int   hb = lane & ~3;
+    const float t0 = __shfl_sync(0xFFFFFFFF, tq, hb + 0, 32), t1 = __shfl_sync(0xFFFFFFFF, tq, hb + 1, 32);
+    const float t2 = __shfl_sync(0xFFFFFFFF, tq, hb + 2, 32), t3 = __shfl_sync(0xFFFFFFFF, tq, hb + 3, 32);
+    float s02 = t0 + t2, s13 = t1 + t3;
+    asm volatile("" : "+v"(s02));
+    asm volatile("" : "+v"(s13));
+    const float tot = s02 + s13;   // the head (lane / 4)'s sum of squares, in lanes 4h .. 4h + 3
+    float reg[el_w];
+#pragma unroll
+    for (int hh = 0; hh < 8; ++hh) {
+        const float th    = __shfl_sync(0xFFFFFFFF, tot, hh * 4, 32);
+        const float mean  = th / HD;
+        const float scale = rsqrtf(mean + eps);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const int i = hh * 4 + q;
+            float normed = scale * xv[i];
+            asm volatile("" : "+v"(normed));
+            normed = normed * wv[q];
+            asm volatile("" : "+v"(normed));
+            float g = ggml_cuda_op_silu_single(zv[i]) * normed;
+            asm volatile("" : "+v"(g));   // the gated-norm output is a stored fp32 in the unfused chain
+            if (dbg) {   // verify only: the gated-norm value at its tiled position
+                dbg[(size_t) tok * K + HD * ((w * 8 + hh) / perm_rep + perm_nk * ((w * 8 + hh) % perm_rep)) + q * 32 + lane] = g;
+            }
+            float v = g;
+            v *= fscale;
+            v *= sg[i * warp_size + lane];
+            reg[i] = v;
+        }
+    }
+    fwht_net<N, warp_size>(reg, lane);
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        asm volatile("" : "+v"(reg[i]));
+    }
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        amax = fmaxf(amax, fabsf(reg[i]));
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, o, 32));
+    }
+    if (lane == 0) {
+        red[w] = amax;
+    }
+    __syncthreads();
+    amax = 0.f;
+    for (int i = 0; i < NB; ++i) {
+        amax = fmaxf(amax, red[i]);
+    }
+    const float d  = n1_scale(amax);
+    const float id = n1_recip(d);
+    if (w == 0 && lane == 0) {
+        sx[tok] = d;
+    }
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        qs[i * warp_size + lane] = (int8_t) (d > 0.f ? (uint8_t) n1_q1(reg[i], id) : 0);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int m = 0; m < N / 4 / warp_size; ++m) {
+        const int j = lane + warp_size * m;
+        *(uint32_t *) (X + n1_off(tok, w * N + 4 * j, S)) = *(const uint32_t *) (qs + 4 * j);
     }
 }
 
@@ -671,7 +813,8 @@ bool ggml_cuda_op_fwht_signed_quant_n1t(ggml_backend_cuda_context & ctx, const g
 
 bool ggml_cuda_op_add_norm_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const ggml_tensor * xa, const ggml_tensor * xb,
                                           ggml_tensor * sum, const ggml_tensor * mulw, const ggml_tensor * signs,
-                                          ggml_tensor * norm_dst, ggml_tensor * mm, float eps, bool write_fp32, void * y) {
+                                          ggml_tensor * norm_dst, ggml_tensor * mm, float eps, bool write_fp32, void * y,
+                                          void * norm_bf16) {
     const int64_t ncols = xa->ne[0];
     const int64_t ntok  = ggml_nelements(xa) / ncols;
     if (ncols % 1024 != 0 || ncols > 8192 || ntok > (1 << 20) || ncols % 128 != 0 ||
@@ -700,10 +843,11 @@ bool ggml_cuda_op_add_norm_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const
     const int   S      = (int) (ncols / 128);
 #define AQ(NB, WN, WF) ggml_cuda_kernel_launch(add_norm_fwht_quant_n1t<NB, WN, WF>, lp, (const float *) xa->data, (const float *) xb->data, \
         (float *) sum->data, (int) ntok, eps, (const float *) mulw->data, (const float *) signs->data, fscale, \
-        norm_dst ? (float *) norm_dst->data : (float *) nullptr, (float *) mm->data, X, sx, S)
+        norm_bf16 ? norm_bf16 : norm_dst ? (void *) norm_dst->data : (void *) nullptr, (float *) mm->data, X, sx, S)
 #define AQN(NB) \
-    if (norm_dst) { if (write_fp32) AQ(NB, true, true); else AQ(NB, true, false); } \
-    else          { if (write_fp32) AQ(NB, false, true); else AQ(NB, false, false); }
+    if (norm_bf16)     { if (write_fp32) AQ(NB, 2, true); else AQ(NB, 2, false); } \
+    else if (norm_dst) { if (write_fp32) AQ(NB, 1, true); else AQ(NB, 1, false); } \
+    else               { if (write_fp32) AQ(NB, 0, true); else AQ(NB, 0, false); }
     switch (nblk) {
         case 4: AQN(4) break;
         case 5: AQN(5) break;
@@ -712,6 +856,42 @@ bool ggml_cuda_op_add_norm_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const
     }
 #undef AQN
 #undef AQ
+    return true;
+}
+
+bool ggml_cuda_op_gn_perm_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * nw,
+                                         const ggml_tensor * z, const ggml_tensor * signs, const ggml_tensor * mm, float eps,
+                                         int perm_nk, int perm_rep, void * y, float * dbg) {
+    const int64_t K = signs->ne[0];
+    if (x->ne[0] != 128 || x->type != GGML_TYPE_F32 || z->type != GGML_TYPE_F32 || nw->type != GGML_TYPE_F32 || signs->type != GGML_TYPE_F32 ||
+        mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(z) || !ggml_is_contiguous(nw) || !ggml_is_contiguous(signs) ||
+        ggml_nelements(nw) != 128 || ggml_nelements(z) != ggml_nelements(x) || ggml_nelements(signs) != K || K % 1024 != 0 ||
+        mm->ne[0] != 1024 || perm_nk <= 0 || perm_rep <= 0 || (int64_t) 128 * perm_nk * perm_rep != K || ggml_nelements(x) % K != 0 ||
+        ((uintptr_t) x->data | (uintptr_t) z->data | (uintptr_t) nw->data | (uintptr_t) signs->data) % 16 != 0) {
+        return false;
+    }
+    const int nblk = (int) (K / 1024);
+    const int64_t ntok = ggml_nelements(x) / K;
+    if ((nblk != 4 && nblk != 5 && nblk != 6 && nblk != 8) || ntok > (1 << 20)) {
+        return false;
+    }
+    const int64_t Npad = n1_npad(ntok);
+    int8_t * X  = (int8_t *) y;
+    float *  sx = (float *) ((char *) y + (size_t) Npad * K);
+    const dim3   grid((unsigned) ntok, 1, 1), block(32, nblk, 1);
+    const size_t shmem = 128 + (size_t) nblk * 4224;
+    const ggml_cuda_kernel_launch_params lp(grid, block, shmem, ctx.stream());
+    const float fscale = 1 / sqrtf(1024.f);
+    const int   S      = (int) (K / 128);
+#define GQ(NB) ggml_cuda_kernel_launch(gn_perm_fwht_quant_n1t<NB>, lp, (const float *) x->data, (const float *) z->data, (const float *) nw->data, \
+        eps, fscale, (const float *) signs->data, X, sx, S, perm_nk, perm_rep, dbg)
+    switch (nblk) {
+        case 4: GQ(4); break;
+        case 5: GQ(5); break;
+        case 6: GQ(6); break;
+        default: GQ(8); break;
+    }
+#undef GQ
     return true;
 }
 

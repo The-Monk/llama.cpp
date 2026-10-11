@@ -21,9 +21,16 @@ bool ggml_cuda_op_fwht_signed_q8_1_perm(ggml_backend_cuda_context & ctx, const g
                                         const ggml_tensor * signs, ggml_tensor * dst, void * qy,
                                         int perm_hd, int perm_nk, int perm_rep);
 
+// T492: GDN gated norm (rms_norm(x) * nw * silu(z), 128-wide rows) + the ssm_out tiled->grouped reorder (perm_nk x perm_rep heads of 128)
+// + signed FWHT (1024 blocks) + per-token int8 quantize (N1 layout) in one launch; nothing but the int8 bytes and scales is written.
+bool ggml_cuda_op_gn_perm_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * nw,
+                                         const ggml_tensor * z, const ggml_tensor * signs, const ggml_tensor * mm, float eps,
+                                         int perm_nk, int perm_rep, void * y, float * dbg = nullptr);   // dbg: verify only, receives the gated-norm values
+
 // T439: residual ADD + RMS_NORM + MUL(weight) + signed FWHT (1024 blocks) + per-token int8 quantize (N1 layout) in one launch.
 // sum = the ADD node (xa + xb, always written), norm_dst = the MUL(weight) node value (written only if non-null),
 // mm = the FWHT node (written only if write_fp32). y = N1TOK act buffer. false = declined (nothing launched).
 bool ggml_cuda_op_add_norm_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const ggml_tensor * xa, const ggml_tensor * xb,
                                           ggml_tensor * sum, const ggml_tensor * mulw, const ggml_tensor * signs,
-                                          ggml_tensor * norm_dst, ggml_tensor * mm, float eps, bool write_fp32, void * y);
+                                          ggml_tensor * norm_dst, ggml_tensor * mm, float eps, bool write_fp32, void * y,
+                                          void * norm_bf16 = nullptr);   // norm_bf16 != nullptr: the normalized row is stored there as bf16 instead (norm_dst then only names the node)
