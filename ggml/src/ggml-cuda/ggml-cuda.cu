@@ -6158,8 +6158,8 @@ static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_c
     // use lists of this graph evaluation (tensor -> indices of the nodes that read it, one entry per src slot), built once per
     // evaluation: the per-site forward scans cost ~10 ms of host time per 1024-token graph at 257 sites.
     // T491: built into flat arrays with an open-addressing pointer table instead of unordered_map<ptr, vector<int>> (the first call of
-    // every ubatch happens while the device is idle, and the map build cost ~350 us there). GGML_CUDA_B2_USERS_FAST=0 restores the map.
-    static const bool users_fast = [] { const char * e = getenv("GGML_CUDA_B2_USERS_FAST"); return e == nullptr || atoi(e) != 0; }();
+    // every ubatch happens while the device is idle, and the map build cost ~350 us there). GGML_CUDA_B2_USERS_FAST=1 enables (default off).
+    static const bool users_fast = [] { const char * e = getenv("GGML_CUDA_B2_USERS_FAST"); return e != nullptr && atoi(e) != 0; }();
     static thread_local struct {
         uint64_t gen = ~0ull; const ggml_cgraph * cg = nullptr; std::unordered_map<const ggml_tensor *, std::vector<int>> users;
         std::vector<const ggml_tensor *> key; std::vector<int32_t> head, next, node; size_t mask = 0;
