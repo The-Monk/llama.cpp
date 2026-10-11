@@ -35,6 +35,7 @@ bool ggml_cuda_op_attn_gate_fwht_quant_n1t(ggml_backend_cuda_context & ctx, cons
 // T439: residual ADD + RMS_NORM + MUL(weight) + signed FWHT (1024 blocks) + per-token int8 quantize (N1 layout) in one launch.
 // sum = the ADD node (xa + xb, always written), norm_dst = the MUL(weight) node value (written only if non-null),
 // mm = the FWHT node (written only if write_fp32). y = N1TOK act buffer. false = declined (nothing launched).
+// xb == nullptr (T492, 5120-wide rows only): xa is already the sum (written by the GEMM epilogue), nothing is added or stored.
 bool ggml_cuda_op_add_norm_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const ggml_tensor * xa, const ggml_tensor * xb,
                                           ggml_tensor * sum, const ggml_tensor * mulw, const ggml_tensor * signs,
                                           ggml_tensor * norm_dst, ggml_tensor * mm, float eps, bool write_fp32, void * y,

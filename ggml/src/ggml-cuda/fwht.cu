@@ -280,7 +280,8 @@ __global__ void fwht_quant_n1t_glu_pf(const float * __restrict__ src, const floa
 // per 1024-block (warps beyond the row's blocks only take part in the barriers).
 // WNM: 0 = the normalized row is not stored, 1 = stored as fp32 (norm_dst), 2 = stored as bf16 (T492 GGML_CUDA_B2_NORM_BF16: the bf16
 // copy the sibling BF16 GEMMs would otherwise make with convert_unary, same __float2bfloat16 rounding).
-template <int NB, int WNM, bool write_fp32>
+// HB = false (T492 GGML_CUDA_B2_RESADD): the residual add already happened in the producing GEMM's epilogue; xa IS the sum (nothing is added or stored back)
+template <int NB, int WNM, bool write_fp32, bool HB = true>
 __launch_bounds__(256, 1)
 __global__ void add_norm_fwht_quant_n1t(const float * __restrict__ xa, const float * __restrict__ xb, float * __restrict__ sum_dst,
                                         const int ntok, const float eps, const float * __restrict__ mulw,
@@ -306,7 +307,9 @@ __global__ void add_norm_fwht_quant_n1t(const float * __restrict__ xa, const flo
             for (int k = 0; k < NB; ++k) {
                 const size_t o = (size_t) tok * ncols + tid + NT * j + k * 1024;
                 ca[j][k] = xa[o];
-                cb[j][k] = xb[o];
+                if (HB) {
+                    cb[j][k] = xb[o];
+                }
             }
         }
     }
@@ -323,9 +326,11 @@ __global__ void add_norm_fwht_quant_n1t(const float * __restrict__ xa, const flo
             p[j] = 0.0f;
 #pragma unroll
             for (int k = 0; k < NB; ++k) {
-                const float s = ca[j][k] + cb[j][k];
+                const float s = HB ? ca[j][k] + cb[j][k] : ca[j][k];
                 sv[j][k] = s;
-                sum_dst[row + tid + NT * j + k * 1024] = s;
+                if (HB) {
+                    sum_dst[row + tid + NT * j + k * 1024] = s;
+                }
                 p[j] += s * s;
             }
         }
@@ -337,7 +342,9 @@ __global__ void add_norm_fwht_quant_n1t(const float * __restrict__ xa, const flo
                 for (int k = 0; k < NB; ++k) {
                     const size_t o = (size_t) tn * ncols + tid + NT * j + k * 1024;
                     ca[j][k] = xa[o];
-                    cb[j][k] = xb[o];
+                    if (HB) {
+                        cb[j][k] = xb[o];
+                    }
                 }
             }
         }
@@ -885,17 +892,17 @@ bool ggml_cuda_op_add_norm_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const
     const int64_t ncols = xa->ne[0];
     const int64_t ntok  = ggml_nelements(xa) / ncols;
     if (ncols % 1024 != 0 || ncols > 8192 || ntok > (1 << 20) || ncols % 128 != 0 ||
-        xa->type != GGML_TYPE_F32 || xb->type != GGML_TYPE_F32 || sum->type != GGML_TYPE_F32 || mulw->type != GGML_TYPE_F32 ||
+        xa->type != GGML_TYPE_F32 || (xb && xb->type != GGML_TYPE_F32) || sum->type != GGML_TYPE_F32 || mulw->type != GGML_TYPE_F32 ||
         signs->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || (norm_dst && norm_dst->type != GGML_TYPE_F32) ||
-        !ggml_is_contiguous(xa) || !ggml_is_contiguous(xb) || !ggml_is_contiguous(sum) || !ggml_is_contiguous(mulw) ||
+        !ggml_is_contiguous(xa) || (xb && !ggml_is_contiguous(xb)) || !ggml_is_contiguous(sum) || !ggml_is_contiguous(mulw) ||
         !ggml_is_contiguous(signs) || !ggml_is_contiguous(mm) || (norm_dst && !ggml_is_contiguous(norm_dst)) ||
-        xb->ne[0] != ncols || ggml_nelements(xb) != ggml_nelements(xa) || ggml_nelements(sum) != ggml_nelements(xa) ||
+        (xb && (xb->ne[0] != ncols || ggml_nelements(xb) != ggml_nelements(xa))) || ggml_nelements(sum) != ggml_nelements(xa) ||
         ggml_nelements(mulw) != ncols || ggml_nelements(signs) != ncols || ggml_nelements(mm) != ggml_nelements(xa) ||
         (norm_dst && ggml_nelements(norm_dst) != ggml_nelements(xa)) || mm->ne[0] != 1024) {
         return false;
     }
     const int nblk = (int) (ncols / 1024);
-    if (nblk != 4 && nblk != 5 && nblk != 6 && nblk != 8) {
+    if ((nblk != 4 && nblk != 5 && nblk != 6 && nblk != 8) || (!xb && nblk != 5)) {
         return false;
     }
     const int64_t Npad = n1_npad(ntok);
@@ -908,9 +915,12 @@ bool ggml_cuda_op_add_norm_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const
     const ggml_cuda_kernel_launch_params lp(grid, block, shmem, ctx.stream());
     const float fscale = 1 / sqrtf(1024.f);
     const int   S      = (int) (ncols / 128);
-#define AQ(NB, WN, WF) ggml_cuda_kernel_launch(add_norm_fwht_quant_n1t<NB, WN, WF>, lp, (const float *) xa->data, (const float *) xb->data, \
+#define AQ(NB, WN, WF) do { if (xb) ggml_cuda_kernel_launch(add_norm_fwht_quant_n1t<NB, WN, WF, true>, lp, (const float *) xa->data, (const float *) xb->data, \
         (float *) sum->data, (int) ntok, eps, (const float *) mulw->data, (const float *) signs->data, fscale, \
-        norm_bf16 ? norm_bf16 : norm_dst ? (void *) norm_dst->data : (void *) nullptr, (float *) mm->data, X, sx, S)
+        norm_bf16 ? norm_bf16 : norm_dst ? (void *) norm_dst->data : (void *) nullptr, (float *) mm->data, X, sx, S); \
+    else if constexpr (NB == 5) ggml_cuda_kernel_launch(add_norm_fwht_quant_n1t<NB, WN, WF, false>, lp, (const float *) xa->data, (const float *) nullptr, \
+        (float *) sum->data, (int) ntok, eps, (const float *) mulw->data, (const float *) signs->data, fscale, \
+        norm_bf16 ? norm_bf16 : norm_dst ? (void *) norm_dst->data : (void *) nullptr, (float *) mm->data, X, sx, S); } while (0)
 #define AQN(NB) \
     if (norm_bf16)     { if (write_fp32) AQ(NB, 2, true); else AQ(NB, 2, false); } \
     else if (norm_dst) { if (write_fp32) AQ(NB, 1, true); else AQ(NB, 1, false); } \

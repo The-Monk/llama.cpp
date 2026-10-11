@@ -47,6 +47,7 @@ constexpr int ABCV = 1 << 13, ABCM = 1 << 14, ABCS = 1 << 15;   // commit sub-ab
 constexpr int LDSA = 1 << 28;  // T435: W fragments read by inline-asm ds_load_b128, ONE s_wait_dscnt per k-block (the compiler emits one per fragment)
 constexpr int PRW = 1 << 8;   // T440 (GGML_N1_M3_FEED=3): s_setprio 2 around each k-block's WMMA burst (the burst-issuing wave wins the SIMD; widen/loads of the sibling waves fill its gaps)
 constexpr int GLUE = 1 << 22;    // T486 (ONEACC only): merged gate/up weight rows (16-row gate block, then the matching 16-row up block); epilogue writes silu(gate) * up, F/2 features, ldy = the GLU row stride
+constexpr int RESADD = 1 << 21;  // T492 (ONEACC only, not GLUE): the epilogue adds a fp32 residual row (same layout and stride as Y): Y = ((acc * sx) * S_f) + R
 constexpr int ONEACC = 1 << 27;  // T434 variant bit: ONE int32 accumulation over the whole K (RS = 1), epilogue acc * sx[t] * S_f; no in-loop rescale
 constexpr int BCARRY = 1 << 24;   // T424 variant bit: bias-carry rescale (GGML_N1_M2=2); the low bits tag K (K / 1024 << 3)
 
@@ -67,7 +68,7 @@ template <int WTn, int WFn, int SEGS, int RS, int V>
 __global__ __launch_bounds__(WTn * WFn * 32, 1)
 void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const int8_t* __restrict__ mq,
                const float* __restrict__ rowS, const float* __restrict__ sx, float* __restrict__ Y,
-               int Ntok, int ntile, int F, int K, int ldy) {
+               int Ntok, int ntile, int F, int K, int ldy, const float* __restrict__ Rres) {
     // FF8 (T435): 32 tokens x 128 features per wave (X bytes per WMMA halved); FT4: 64 tokens x 64 features per wave (W LDS reads per WMMA halved)
     constexpr int NT = WTn * WFn * 32, FT = (V & FT4) ? 4 : 2, FF = (V & FF8) ? 8 : 4, KBN = 4;
     static_assert(!((V & FT4) && (V & FF8)), "FT4 and FF8 together need 256 accumulator VGPRs");
@@ -81,6 +82,8 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
     constexpr bool kLpf = V & LPF, kBc = V & BCARRY, kOne = V & ONEACC, kLa = V & LDSA;
     constexpr bool kPrw = V & PRW;
     constexpr bool kGlu = V & GLUE;
+    constexpr bool kRes = V & RESADD;
+    static_assert(!kRes || (kOne && !kGlu), "RESADD: ONEACC epilogue only");
     static_assert(!kGlu || (kOne && FF % 2 == 0), "GLUE: ONEACC epilogue with gate/up block pairs");
     constexpr bool kAbX = V & ABX, kAbW = V & ABW, kAbC = V & ABC, kAbB = V & ABB, kAbCV = V & ABCV, kAbCM = V & ABCM, kAbCS = V & ABCS;
     static_assert(!kOne || RS == 1, "ONEACC: per-token scale, no rescale groups");
@@ -386,6 +389,14 @@ void gemm_fold(const uint4* __restrict__ Xt, const uint4* __restrict__ Wt, const
             float o[8];
 #pragma unroll
             for (int l = 0; l < 8; ++l) o[l] = kOne ? ((float) acc[i][j][l] * sxa[i]) * rs[l] : (kBc ? __builtin_fmaf(-BIASF, sxs[i], accf[i][j][l]) : accf[i][j][l]) * rs[l];
+            if constexpr (kRes) {
+                // the GEMM output is a rounded fp32 before the residual add (the unfused ADD's xa): no (x * rs) + R contraction
+#pragma unroll
+                for (int l = 0; l < 8; ++l) asm volatile("" : "+v"(o[l]));
+                const float4 q0 = *(const float4*)(Rres + (size_t)t * ldy + f0), q1 = *(const float4*)(Rres + (size_t)t * ldy + f0 + 4);
+                o[0] = o[0] + q0.x; o[1] = o[1] + q0.y; o[2] = o[2] + q0.z; o[3] = o[3] + q0.w;
+                o[4] = o[4] + q1.x; o[5] = o[5] + q1.y; o[6] = o[6] + q1.z; o[7] = o[7] + q1.w;
+            }
             float4* yp = (float4*)(Y + (size_t)t * ldy + f0);
             yp[0] = make_float4(o[0], o[1], o[2], o[3]);
             yp[1] = make_float4(o[4], o[5], o[6], o[7]);

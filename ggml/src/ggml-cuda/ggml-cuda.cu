@@ -4361,6 +4361,7 @@ struct ggml_cuda_m3_norm {
     float               eps;
     int                 bf16_n   = 0;   // T492 (GGML_CUDA_B2_NORM_BF16): number of BF16-weight MUL_MATs that read the normalized row (src1 == normdst); the kernel then stores bf16 instead of fp32
     int                 bf16_end = 0;   // node index of the last of them
+    bool                pre_added = false;   // T492 (GGML_CUDA_B2_RESADD): the producing GEMM's epilogue already wrote the sum into the ADD node
 };
 
 // T492 (GGML_CUDA_B2_GNQ_FUSE): the GDN gated norm (RMS_NORM + MUL(weight) + silu(z) * .) in front of the permuted ssm_out producer
@@ -4494,6 +4495,59 @@ static void ggml_cuda_fwht_quant_publish(ggml_backend_cuda_context * cuda_ctx, c
             }
         }
     }
+}
+
+// T439 ADDNORM (extracted by T492 so the residual-add GEMM epilogue can call it ahead of every other fusion): returns the number of extra nodes
+// consumed, 0 = declined
+static int ggml_cuda_try_addnorm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * node = cgraph->nodes[i];
+    // T439 GGML_CUDA_B2_ADDNORM_FUSE: prefill ADD (residual) + RMS_NORM + MUL(weight) + MUL(signs) + RESHAPE + FWHT matmul -> ONE launch
+    // (the M3 producer with the add and the norm in front of it)
+    if (ggml_cuda_b2_addnorm_fuse_enabled() && ggml_cuda_n1_enabled() && node->op == GGML_OP_ADD && i + 5 < cgraph->n_nodes &&
+        cgraph->nodes[i + 1]->op == GGML_OP_RMS_NORM && cgraph->nodes[i + 1]->src[0] == node) {
+        ggml_tensor *       add   = cgraph->nodes[i];
+        const ggml_tensor * rms   = cgraph->nodes[i + 1];
+        ggml_tensor *       mulw  = cgraph->nodes[i + 2];
+        const ggml_tensor * muls  = cgraph->nodes[i + 3];
+        const ggml_tensor * rsh   = cgraph->nodes[i + 4];
+        ggml_tensor *       mm    = cgraph->nodes[i + 5];
+        const bool norm_shared = ggml_node_get_use_count(cgraph, i + 2) > 1;   // another node (e.g. an unfolded bf16 matmul) reads the normalized row
+        const bool can = norm_shared ? ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i, i + 2, i + 5 })
+                                     : ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i, i + 5 });
+        const ggml_tensor * w     = mulw->src[0] == rms ? mulw->src[1] : mulw->src[0];
+        const ggml_tensor * signs = muls->src[1];
+        float eps;
+        memcpy(&eps, rms->op_params, sizeof(float));
+        if (can && (mulw->src[0] == rms || mulw->src[1] == rms) && muls->src[0] == mulw && rsh->src[0] == muls && mm->src[1] == rsh &&
+            ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD && mm->src[0]->ne[0] == 1024 &&
+            add->type == GGML_TYPE_F32 && add->src[0]->type == GGML_TYPE_F32 && add->src[1]->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(add->src[0], add) && ggml_are_same_shape(add->src[1], add) &&
+            ggml_is_contiguous(add->src[0]) && ggml_is_contiguous(add->src[1]) && ggml_is_contiguous(add) &&
+            mulw->type == GGML_TYPE_F32 && muls->type == GGML_TYPE_F32 && ggml_are_same_shape(mulw, add) &&
+            w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && w->ne[0] == add->ne[0] && ggml_nelements(w) == add->ne[0] &&
+            signs->type == GGML_TYPE_F32 && ggml_is_contiguous(signs) && signs->ne[0] == add->ne[0] && ggml_nelements(signs) == add->ne[0] &&
+            muls->src[0]->ne[0] == add->ne[0] && add->ne[0] % 1024 == 0 && ggml_nelements(rsh) == ggml_nelements(add)) {
+            ggml_cuda_m3_norm na = { add, norm_shared ? mulw : nullptr, w, eps };
+            na.pre_added = cuda_ctx->res_done && cuda_ctx->res_add == add;
+            if (norm_shared && ggml_cuda_b2_norm_bf16_enabled() && !(mulw->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                // every other reader of the normalized row must be a BF16-weight MUL_MAT on it (GDN ssm_beta / ssm_alpha), so no fp32 copy is needed
+                int n = 0, last = 0;
+                for (int j = i + 6; j < cgraph->n_nodes && j <= i + 96; ++j) {
+                    const ggml_tensor * nd = cgraph->nodes[j];
+                    if (nd->op == GGML_OP_MUL_MAT && nd->src[1] == mulw && nd->src[0]->type == GGML_TYPE_BF16 && nd->src[2] == nullptr) {
+                        n++; last = j;
+                    }
+                }
+                if (n > 0 && n == ggml_node_get_use_count(cgraph, i + 2) - 1 && mulw->ne[1] >= 64 && mulw->ne[2] == 1 && mulw->ne[3] == 1) {
+                    na.bf16_n = n; na.bf16_end = last;
+                }
+            }
+            if (ggml_cuda_m3_fwht_quant(cuda_ctx, cgraph, i, 3, add->src[0], nullptr, signs, mm, 0, 0, 0, &na)) {
+                return 5;
+            }
+        }
+    }
+    return 0;
 }
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
@@ -4790,49 +4844,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // T439 GGML_CUDA_B2_ADDNORM_FUSE: prefill ADD (residual) + RMS_NORM + MUL(weight) + MUL(signs) + RESHAPE + FWHT matmul -> ONE launch
-    // (the M3 producer with the add and the norm in front of it)
-    if (ggml_cuda_b2_addnorm_fuse_enabled() && ggml_cuda_n1_enabled() && node->op == GGML_OP_ADD && i + 5 < cgraph->n_nodes &&
-        cgraph->nodes[i + 1]->op == GGML_OP_RMS_NORM && cgraph->nodes[i + 1]->src[0] == node) {
-        ggml_tensor *       add   = cgraph->nodes[i];
-        const ggml_tensor * rms   = cgraph->nodes[i + 1];
-        ggml_tensor *       mulw  = cgraph->nodes[i + 2];
-        const ggml_tensor * muls  = cgraph->nodes[i + 3];
-        const ggml_tensor * rsh   = cgraph->nodes[i + 4];
-        ggml_tensor *       mm    = cgraph->nodes[i + 5];
-        const bool norm_shared = ggml_node_get_use_count(cgraph, i + 2) > 1;   // another node (e.g. an unfolded bf16 matmul) reads the normalized row
-        const bool can = norm_shared ? ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i, i + 2, i + 5 })
-                                     : ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i, i + 5 });
-        const ggml_tensor * w     = mulw->src[0] == rms ? mulw->src[1] : mulw->src[0];
-        const ggml_tensor * signs = muls->src[1];
-        float eps;
-        memcpy(&eps, rms->op_params, sizeof(float));
-        if (can && (mulw->src[0] == rms || mulw->src[1] == rms) && muls->src[0] == mulw && rsh->src[0] == muls && mm->src[1] == rsh &&
-            ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD && mm->src[0]->ne[0] == 1024 &&
-            add->type == GGML_TYPE_F32 && add->src[0]->type == GGML_TYPE_F32 && add->src[1]->type == GGML_TYPE_F32 &&
-            ggml_are_same_shape(add->src[0], add) && ggml_are_same_shape(add->src[1], add) &&
-            ggml_is_contiguous(add->src[0]) && ggml_is_contiguous(add->src[1]) && ggml_is_contiguous(add) &&
-            mulw->type == GGML_TYPE_F32 && muls->type == GGML_TYPE_F32 && ggml_are_same_shape(mulw, add) &&
-            w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && w->ne[0] == add->ne[0] && ggml_nelements(w) == add->ne[0] &&
-            signs->type == GGML_TYPE_F32 && ggml_is_contiguous(signs) && signs->ne[0] == add->ne[0] && ggml_nelements(signs) == add->ne[0] &&
-            muls->src[0]->ne[0] == add->ne[0] && add->ne[0] % 1024 == 0 && ggml_nelements(rsh) == ggml_nelements(add)) {
-            ggml_cuda_m3_norm na = { add, norm_shared ? mulw : nullptr, w, eps };
-            if (norm_shared && ggml_cuda_b2_norm_bf16_enabled() && !(mulw->flags & GGML_TENSOR_FLAG_OUTPUT)) {
-                // every other reader of the normalized row must be a BF16-weight MUL_MAT on it (GDN ssm_beta / ssm_alpha), so no fp32 copy is needed
-                int n = 0, last = 0;
-                for (int j = i + 6; j < cgraph->n_nodes && j <= i + 96; ++j) {
-                    const ggml_tensor * nd = cgraph->nodes[j];
-                    if (nd->op == GGML_OP_MUL_MAT && nd->src[1] == mulw && nd->src[0]->type == GGML_TYPE_BF16 && nd->src[2] == nullptr) {
-                        n++; last = j;
-                    }
-                }
-                if (n > 0 && n == ggml_node_get_use_count(cgraph, i + 2) - 1 && mulw->ne[1] >= 64 && mulw->ne[2] == 1 && mulw->ne[3] == 1) {
-                    na.bf16_n = n; na.bf16_end = last;
-                }
-            }
-            if (ggml_cuda_m3_fwht_quant(cuda_ctx, cgraph, i, 3, add->src[0], nullptr, signs, mm, 0, 0, 0, &na)) {
-                return 5;
-            }
+    {
+        const int r = ggml_cuda_try_addnorm(cuda_ctx, cgraph, i);
+        if (r) {
+            return r;
         }
     }
 
@@ -6186,7 +6201,7 @@ static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_c
     }
     const bool launched = ag ? ggml_cuda_op_attn_gate_fwht_quant_n1t(*ctx, ag->gview, ag->cur, signs, mm, ctx->act_cache_buf->get())
                          : gn ? ggml_cuda_op_gn_perm_fwht_quant_n1t(*ctx, gn->x, gn->w, gn->z, signs, mm, gn->eps, perm_nk, perm_rep, ctx->act_cache_buf->get(), gnq_dbg.get() ? (float *) gnq_dbg.get()->get() : nullptr)
-                         : na ? ggml_cuda_op_add_norm_fwht_quant_n1t(*ctx, na->add->src[0], na->add->src[1], na->add, na->mulw, signs, na->normdst, mm,
+                         : na ? ggml_cuda_op_add_norm_fwht_quant_n1t(*ctx, na->pre_added ? na->add : na->add->src[0], na->pre_added ? nullptr : na->add->src[1], na->add, na->mulw, signs, na->normdst, mm,
                                                                     na->eps, write_fp32, ctx->act_cache_buf->get(), bf16_buf ? bf16_buf->get() : nullptr)
                              : ggml_cuda_op_fwht_signed_quant_n1t(*ctx, x, up, signs, mm, write_fp32, ctx->act_cache_buf->get(), perm_hd, perm_nk, perm_rep);
     if (!launched) {
@@ -6303,6 +6318,52 @@ static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph
     return r;
 }
 
+// T492 GGML_CUDA_B2_RESADD: before a MUL_MAT whose only consumer is the residual ADD (the Hadamard-folded wo / ssm_out / ffn_down GEMMs; views
+// between them are skipped), publish the ADD's other operand and output so the GEMM's epilogue can write xa + residual straight into the ADD node.
+// Consumed (res_done set) only by the M3 one-GEMM launch; the ADD node is then skipped or handed to ADDNORM in its pre-added form.
+static void ggml_cuda_res_add_arm(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool enabled = [] { const char * v = getenv("GGML_CUDA_B2_RESADD"); return v && atoi(v) != 0; }();   // default off
+    ctx.res_mm = nullptr;
+    if (!enabled || !ggml_cuda_n1_enabled() || !ctx.stream_context().concurrent_events.empty()) {
+        return;
+    }
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (node->type != GGML_TYPE_F32 || node->ne[1] < 64 || node->ne[2] != 1 || node->ne[3] != 1 || !ggml_is_contiguous(node) ||
+        (node->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1) {
+        return;
+    }
+    const ggml_tensor * t = node;
+    int j = i + 1;
+    for (; j < cgraph->n_nodes && j <= i + 4 && ggml_cuda_is_view_or_noop(cgraph->nodes[j]); ++j) {
+        const ggml_tensor * v = cgraph->nodes[j];
+        if (v->op == GGML_OP_RESHAPE && v->src[0] == t) {
+            if (ggml_node_get_use_count(cgraph, j) != 1) {
+                return;
+            }
+            t = v;
+        }
+    }
+    if (j >= cgraph->n_nodes) {
+        return;
+    }
+    ggml_tensor * ad = cgraph->nodes[j];
+    if (ad->op != GGML_OP_ADD || ad->src[0] != t || ad->src[1] == t || !(ad->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        return;
+    }
+    const ggml_tensor * R = ad->src[1];
+    if (ad->type != GGML_TYPE_F32 || R->type != GGML_TYPE_F32 || !ggml_is_contiguous(R) || !ggml_is_contiguous(ad) ||
+        !ggml_are_same_shape(R, ad) || !ggml_are_same_shape(t, ad) || ggml_nelements(ad) != ggml_nelements(node) || ad->ne[0] != node->ne[0] ||
+        ad->nb[1] != node->nb[1] || R->nb[1] != node->nb[1] || R->data == nullptr || ad->data == nullptr) {
+        return;
+    }
+    // R must not be produced between the GEMM and the ADD (views only in between, checked above), and the ADD's output must not overlap the
+    // GEMM's own inputs: the pool-held activation and the weights are not graph tensors, so only the activation view needs a check
+    ctx.res_mm  = node;
+    ctx.res_add = ad;
+    ctx.res_R   = (const float *) R->data;
+    ctx.res_out = (float *) ad->data;
+}
+
 // T447 GGML_CUDA_BF16_SHARE: before a BF16-weight MUL_MAT on an F32 activation, look a few nodes ahead for a sibling MUL_MAT on the SAME
 // activation tensor (GDN ssm_beta / ssm_alpha) and arm the context so the pair converts the activation to bf16 once. Nothing between the
 // two may write into the activation's memory. Prefill-sized activations only (>= 64 rows), which never run under a captured CUDA graph.
@@ -6346,6 +6407,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     cuda_ctx->bf16_share_buf.reset();
     cuda_ctx->bf16_share_src1 = nullptr;
     cuda_ctx->bf16_share_data = nullptr;
+    cuda_ctx->res_mm = cuda_ctx->res_add = nullptr;
+    cuda_ctx->res_R = nullptr; cuda_ctx->res_out = nullptr; cuda_ctx->res_done = false;
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -6502,6 +6565,28 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // T492 GGML_CUDA_B2_RESADD: this ADD was computed by the GEMM epilogue; only the norm + producer (ADDNORM, pre-added form) remains
+                if (cuda_ctx->res_done && node == cuda_ctx->res_add) {
+                    const int rn = ggml_cuda_try_addnorm(cuda_ctx, cgraph, i);
+                    cuda_ctx->res_done = false;
+                    cuda_ctx->res_add  = nullptr;
+                    if (rn > 0) {
+                        if (act_fuse) {
+                            if (cuda_ctx->act_fuse_nowrite) {
+                                cuda_ctx->act_fuse_nowrite = false;
+                            } else {
+                                for (int k = 1; k <= rn; ++k) {
+                                    if (!ggml_cuda_is_view_or_noop(cgraph->nodes[i + k])) {
+                                        ggml_cuda_act_note_write(cuda_ctx, cgraph->nodes[i + k]);
+                                    }
+                                }
+                            }
+                        }
+                        i += rn;
+                    }
+                    continue;
+                }
+
                 // producers only launch kernels and take pool memory (capture-safe, like the
                 // mmvq dedup); VERIFY syncs, so it runs only outside CUDA graph capture
                 if (act_fuse && !is_concurrent_event_active && !(use_cuda_graph && ggml_cuda_act_fuse_verify())) {
@@ -6631,6 +6716,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if (node->op == GGML_OP_MUL_MAT) {
                     ggml_cuda_bf16_share_arm(*cuda_ctx, cgraph, i);
+                    ggml_cuda_res_add_arm(*cuda_ctx, cgraph, i);
                 }
 
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);

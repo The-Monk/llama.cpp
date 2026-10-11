@@ -2048,6 +2048,13 @@ struct ggml_backend_cuda_context {
     // T434: a Hadamard FWHT node whose fp32 output was NOT written (all its consumers are one-GEMM N1 matmuls reading the
     // N1TOK cache entry); a consumer that cannot take the cache must abort rather than read stale memory
     const ggml_tensor * act_nofp32 = nullptr;
+    // T492 GGML_CUDA_B2_RESADD: the wo / ssm_out / down GEMM's epilogue adds the residual and writes the ADD node's value (set by the graph loop
+    // before the MUL_MAT, consumed by ggml_cuda_n1_mul_mat; res_done tells the loop the ADD node is already computed)
+    const ggml_tensor * res_mm   = nullptr;
+    const ggml_tensor * res_add  = nullptr;
+    const float *       res_R    = nullptr;
+    float *             res_out  = nullptr;
+    bool                res_done = false;
     bool                act_fuse_nowrite = false;   // T492: the fusion that just ran wrote none of its skipped nodes (the graph loop then skips act_note_write for them)
     uint64_t act_eval_gen = 0;   // bumped at the start of every graph evaluation (per-evaluation caches key on it)
     int64_t act_stat_hit = 0, act_stat_miss = 0, act_stat_glu = 0, act_stat_norm = 0, act_stat_norm_add = 0;
