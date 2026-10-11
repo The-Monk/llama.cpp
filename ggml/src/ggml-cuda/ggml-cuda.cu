@@ -4582,7 +4582,30 @@ static int ggml_cuda_try_addnorm(ggml_backend_cuda_context * cuda_ctx, ggml_cgra
                     na.bf16_n = n; na.bf16_end = last;
                 }
             }
-            if (ggml_cuda_m3_fwht_quant(cuda_ctx, cgraph, i, 3, add->src[0], nullptr, signs, mm, 0, 0, 0, &na)) {
+            // T491: the persistent kernel prefetches the NEXT token's rows of both ADD inputs and writes the ADD / MUL(weight) rows of the
+            // current one. The unfused order never overlaps those (each node completes before the next allocates), but the graph
+            // allocator may place a fused-away output over a dead input at a different offset. Decline when an output overlaps an input
+            // other than an exact in-place ADD (GGML_CUDA_B2_ADDNORM_ALIAS_GUARD=0 disables; =2 also prints).
+            static const int alias_guard = [] { const char * v = getenv("GGML_CUDA_B2_ADDNORM_ALIAS_GUARD"); return v ? atoi(v) : 1; }();
+            bool bad = false;
+            if (alias_guard) {
+                auto ovl = [](const ggml_tensor * p, const ggml_tensor * q) {
+                    const char * ps = (const char *) p->data; const char * qs = (const char *) q->data;
+                    return ps < qs + ggml_nbytes(q) && qs < ps + ggml_nbytes(p);
+                };
+                auto same = [](const ggml_tensor * p, const ggml_tensor * q) { return p->data == q->data && ggml_nbytes(p) == ggml_nbytes(q); };
+                const ggml_tensor * ins[4] = { add->src[0], add->src[1], w, signs };
+                for (int k = 0; k < 4; ++k) {
+                    if (ovl(add, ins[k]) && !(k < 2 && same(add, ins[k]))) { bad = true; }
+                    if (norm_shared && ovl(mulw, ins[k])) { bad = true; }
+                }
+                if (norm_shared && ovl(mulw, add)) { bad = true; }
+                if (alias_guard == 2 && (bad || ovl(mm, add->src[0]) || ovl(mm, add->src[1]))) {
+                    fprintf(stderr, "[T491] addnorm node %d: bad=%d mm~xa=%d mm~xb=%d sum~xa=%d sum~xb=%d norm_shared=%d\n", i, (int) bad,
+                            (int) ovl(mm, add->src[0]), (int) ovl(mm, add->src[1]), (int) ovl(add, add->src[0]), (int) ovl(add, add->src[1]), (int) norm_shared);
+                }
+            }
+            if (!bad && ggml_cuda_m3_fwht_quant(cuda_ctx, cgraph, i, 3, add->src[0], nullptr, signs, mm, 0, 0, 0, &na)) {
                 return 5;
             }
         }
@@ -6298,6 +6321,25 @@ static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_c
     }
     // the GLU variant under VERIFY keeps its fp32 output off (mm may alias gate/up): only its int8 bytes are compared
     const bool write_fp32 = !skip_fp32 || (verify && !up);
+    // T491: the ADD+NORM persistent kernel stores the fp32 transform rows of `mm` (when written) while other blocks still read / prefetch
+    // the ADD inputs, and its ADD / MUL(weight) rows: a non-exact overlap of `mm` with any of them is a cross-block race (the GLU variant
+    // above has the equivalent check). Exact (same address and size) overlap is element-wise safe.
+    if (na && write_fp32) {
+        static const int alias_guard = [] { const char * v = getenv("GGML_CUDA_B2_ADDNORM_ALIAS_GUARD"); return v ? atoi(v) : 1; }();
+        if (alias_guard) {
+            const ggml_tensor * others[4] = { na->add->src[0], na->add->src[1], na->add, na->mulw };
+            for (int k = 0; k < 4; ++k) {
+                if (others[k] && ggml_cuda_act_overlaps(mm, others[k]) && !(mm->data == others[k]->data && ggml_nbytes(mm) == ggml_nbytes(others[k]))) {
+                    if (alias_guard == 2) {
+                        fprintf(stderr, "[T491] addnorm mm overlap declined: mm vs %d non-exact\n", k);
+                    }
+                    ctx->act_cache_tensor = nullptr;
+                    ctx->act_cache_buf.reset();
+                    return false;
+                }
+            }
+        }
+    }
     static const bool gnv_env = getenv("GGML_B2_GNQ_VERIFY") != nullptr;
     std::unique_ptr<ggml_cuda_pool_alloc<char>> gnq_dbg;
     if (gn && gnv_env) {
