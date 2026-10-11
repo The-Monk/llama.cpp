@@ -319,6 +319,71 @@ __global__ void fwht_quant_n1t_glu_pf(const float * __restrict__ src, const floa
     }
 }
 
+// T512 GGML_CUDA_B2_PROD_V4: the same butterfly network with a 16-byte-load element mapping. Lane L holds idx = 4 * (L + 32 * m) + c
+// (m < 8, c < 4) in reg[4 * m + c]: index bits 0-1 live in registers, bits 2-6 across the lanes, bits 7-9 in registers. Every stage
+// pairs the same two indices (bit h of idx) in the same ascending-h order as fwht_net, lower + upper / lower - upper, so each output
+// is the identical sequence of fp32 operations and the result is bit-identical; only which lane holds an element differs.
+static __device__ __forceinline__ void fwht_net_v4(float (&reg)[32], const int lane, const int fl) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+    const bool dpp = (fl & 1) != 0;
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        const float a = reg[4 * m], b = reg[4 * m + 1], c = reg[4 * m + 2], d = reg[4 * m + 3];
+        const float a1 = a + b, b1 = a - b, c1 = c + d, d1 = c - d;   // h = 1
+        reg[4 * m]     = a1 + c1;                                      // h = 2
+        reg[4 * m + 2] = a1 - c1;
+        reg[4 * m + 1] = b1 + d1;
+        reg[4 * m + 3] = b1 - d1;
+    }
+    if (dpp) {   // idx bits 2..6 = lane bits 0..4
+        fwht_stage_dpp<1, 32>(reg, lane);
+        fwht_stage_dpp<2, 32>(reg, lane);
+        fwht_stage_dpp<4, 32>(reg, lane);
+        fwht_stage_dpp<8, 32>(reg, lane);
+        fwht_stage_dpp<16, 32>(reg, lane);
+    } else {
+#pragma unroll
+    for (int h = 1; h < 32; h *= 2) {
+#pragma unroll
+        for (int j = 0; j < 32; j++) {
+            const float val  = reg[j];
+            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, 32);
+
+            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+        }
+    }
+    }
+#pragma unroll
+    for (int s = 1; s < 8; s *= 2) {    // idx bits 7..9 = m bits 0..2
+#pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            if ((m & s) == 0) {
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    const float x = reg[4 * m + c];
+                    const float y = reg[4 * (m + s) + c];
+
+                    reg[4 * m + c]       = x + y;
+                    reg[4 * (m + s) + c] = x - y;
+                }
+            }
+        }
+    }
+}
+
+static __device__ __forceinline__ uint32_t prod_pack4(const float (&reg)[32], const int m, const float id, const bool nz, const bool fast) {
+    uint32_t q0, q1, q2, q3;
+    if (fast) {
+        q0 = nz ? n1_q1_fast(reg[4 * m], id) : 0u; q1 = nz ? n1_q1_fast(reg[4 * m + 1], id) : 0u;
+        q2 = nz ? n1_q1_fast(reg[4 * m + 2], id) : 0u; q3 = nz ? n1_q1_fast(reg[4 * m + 3], id) : 0u;
+    } else {
+        q0 = nz ? n1_q1(reg[4 * m], id) : 0u; q1 = nz ? n1_q1(reg[4 * m + 1], id) : 0u;
+        q2 = nz ? n1_q1(reg[4 * m + 2], id) : 0u; q3 = nz ? n1_q1(reg[4 * m + 3], id) : 0u;
+    }
+    return (q0 & 0xFFu) | ((q1 & 0xFFu) << 8) | ((q2 & 0xFFu) << 16) | ((q3 & 0xFFu) << 24);
+}
+
 // T439 GGML_CUDA_B2_ADDNORM_FUSE: the residual ADD + RMS_NORM + MUL(weight) in front of a Hadamard-folded matmul fused with the
 // M3 producer: one launch per token instead of k_bin_bcast add, rms_norm_f32<1024,true> and fwht_quant_n1t. Stage 1 is
 // rms_norm_f32<1024, true> verbatim (strided partial sums over the same columns in the same order, the same block_reduce, the
@@ -328,7 +393,8 @@ __global__ void fwht_quant_n1t_glu_pf(const float * __restrict__ src, const floa
 // WNM: 0 = the normalized row is not stored, 1 = stored as fp32 (norm_dst), 2 = stored as bf16 (T492 GGML_CUDA_B2_NORM_BF16: the bf16
 // copy the sibling BF16 GEMMs would otherwise make with convert_unary, same __float2bfloat16 rounding).
 // HB = false (T492 GGML_CUDA_B2_RESADD): the residual add already happened in the producing GEMM's epilogue; xa IS the sum (nothing is added or stored back)
-template <int NB, int WNM, bool write_fp32, bool HB = true>
+// T514 V4 (GGML_CUDA_B2_PROD_V4 bit 128): stage 2 in the 16-byte mapping with the int8 bytes packed in registers; V4 = false is the T439 kernel unchanged
+template <int NB, int WNM, bool write_fp32, bool HB = true, bool V4 = false>
 __launch_bounds__(256, 1)
 __global__ void add_norm_fwht_quant_n1t(const float * __restrict__ xa, const float * __restrict__ xb, float * __restrict__ sum_dst,
                                         const int ntok, const float eps, const float * __restrict__ mulw,
@@ -341,7 +407,8 @@ __global__ void add_norm_fwht_quant_n1t(const float * __restrict__ xa, const flo
     float  * s_sum = (float *) smem;
     float  * red   = (float *) (smem + 128);
     int8_t * qs    = (int8_t *) (smem + 256);
-    float  * nvs   = (float *) (smem + 256 + (size_t) NB * N);
+    // T514 V4: the int8 bytes are packed in registers (no qs staging), so the normalized row starts right after the header
+    float  * nvs   = (float *) (smem + 256 + (V4 ? (size_t) 0 : (size_t) NB * N));
 
     // Persistent over tokens (tok, tok + gridDim.x, ...): the next token's two input rows are loaded into registers before the
     // current token's reduction / transform / quantize, so the memory pipe stays busy while the block computes.
@@ -423,6 +490,68 @@ __global__ void add_norm_fwht_quant_n1t(const float * __restrict__ xa, const flo
         }
         __syncthreads();
 
+        if constexpr (V4) {
+            // T514: stage 2 in the T512 16-byte mapping (lane L holds idx 4 * (L + 32 m) + c): float4 LDS reads of the normalized row, float4
+            // sign loads, the DPP/shuffle butterfly of fwht_net_v4 (same fp32 operation sequence per output), the int8 bytes packed in
+            // registers and stored as one u32 per (lane, m): no byte stores to LDS, no reload, one barrier less.
+            float reg[32];
+            float amax = 0.f;
+            if (w < NB) {
+                const float4 * sg4 = (const float4 *) (signs + (size_t) w * N);
+                const float4 * nv4 = (const float4 *) (nvs + w * N);
+#pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    const float4 v = nv4[lane + warp_size * m];
+                    const float4 g = sg4[lane + warp_size * m];
+                    reg[4 * m]     = v.x * fscale * g.x;
+                    reg[4 * m + 1] = v.y * fscale * g.y;
+                    reg[4 * m + 2] = v.z * fscale * g.z;
+                    reg[4 * m + 3] = v.w * fscale * g.w;
+                }
+                fwht_net_v4(reg, lane, dpp);
+#pragma unroll
+                for (int i = 0; i < 32; ++i) {
+                    asm volatile("" : "+v"(reg[i]));
+                }
+                if (write_fp32) {
+                    float4 * d4 = (float4 *) (fwht_dst + row + (size_t) w * N);
+#pragma unroll
+                    for (int m = 0; m < 8; ++m) {
+                        d4[lane + warp_size * m] = make_float4(reg[4 * m], reg[4 * m + 1], reg[4 * m + 2], reg[4 * m + 3]);
+                    }
+                }
+#pragma unroll
+                for (int i = 0; i < 32; ++i) {
+                    amax = fmaxf(amax, fabsf(reg[i]));
+                }
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) {
+                    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, o, 32));
+                }
+                if (lane == 0) {
+                    red[w] = amax;
+                }
+            }
+            __syncthreads();
+            amax = 0.f;
+#pragma unroll
+            for (int i = 0; i < NB; ++i) {
+                amax = fmaxf(amax, red[i]);
+            }
+            const float d  = n1_scale(amax);
+            const float id = n1_recip(d);
+            if (tid == 0) {
+                sx[rtok] = d;
+            }
+            if (w < NB) {
+#pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    const int j = lane + warp_size * m;
+                    *(uint32_t *) (X + n1_off(rtok, w * N + 4 * j, S)) = prod_pack4(reg, m, id, d > 0.f, (dpp & 2) != 0);
+                }
+            }
+            continue;   // no trailing barrier: red[] / nvs are rewritten only after the next token's two barriers
+        }
         float reg[el_w];
         float amax = 0.f;
         if (w < NB) {
@@ -690,71 +819,6 @@ __global__ void attn_gate_fwht_quant_n1t(const float * __restrict__ cur, const f
         const int j = lane + warp_size * m;
         *(uint32_t *) (X + n1_off(tok, w * N + 4 * j, S)) = *(const uint32_t *) (qs + 4 * j);
     }
-}
-
-// T512 GGML_CUDA_B2_PROD_V4: the same butterfly network with a 16-byte-load element mapping. Lane L holds idx = 4 * (L + 32 * m) + c
-// (m < 8, c < 4) in reg[4 * m + c]: index bits 0-1 live in registers, bits 2-6 across the lanes, bits 7-9 in registers. Every stage
-// pairs the same two indices (bit h of idx) in the same ascending-h order as fwht_net, lower + upper / lower - upper, so each output
-// is the identical sequence of fp32 operations and the result is bit-identical; only which lane holds an element differs.
-static __device__ __forceinline__ void fwht_net_v4(float (&reg)[32], const int lane, const int fl) {
-#pragma clang fp reassociate(off)
-#pragma clang fp contract(off)
-    const bool dpp = (fl & 1) != 0;
-#pragma unroll
-    for (int m = 0; m < 8; ++m) {
-        const float a = reg[4 * m], b = reg[4 * m + 1], c = reg[4 * m + 2], d = reg[4 * m + 3];
-        const float a1 = a + b, b1 = a - b, c1 = c + d, d1 = c - d;   // h = 1
-        reg[4 * m]     = a1 + c1;                                      // h = 2
-        reg[4 * m + 2] = a1 - c1;
-        reg[4 * m + 1] = b1 + d1;
-        reg[4 * m + 3] = b1 - d1;
-    }
-    if (dpp) {   // idx bits 2..6 = lane bits 0..4
-        fwht_stage_dpp<1, 32>(reg, lane);
-        fwht_stage_dpp<2, 32>(reg, lane);
-        fwht_stage_dpp<4, 32>(reg, lane);
-        fwht_stage_dpp<8, 32>(reg, lane);
-        fwht_stage_dpp<16, 32>(reg, lane);
-    } else {
-#pragma unroll
-    for (int h = 1; h < 32; h *= 2) {
-#pragma unroll
-        for (int j = 0; j < 32; j++) {
-            const float val  = reg[j];
-            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, 32);
-
-            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
-        }
-    }
-    }
-#pragma unroll
-    for (int s = 1; s < 8; s *= 2) {    // idx bits 7..9 = m bits 0..2
-#pragma unroll
-        for (int m = 0; m < 8; ++m) {
-            if ((m & s) == 0) {
-#pragma unroll
-                for (int c = 0; c < 4; ++c) {
-                    const float x = reg[4 * m + c];
-                    const float y = reg[4 * (m + s) + c];
-
-                    reg[4 * m + c]       = x + y;
-                    reg[4 * (m + s) + c] = x - y;
-                }
-            }
-        }
-    }
-}
-
-static __device__ __forceinline__ uint32_t prod_pack4(const float (&reg)[32], const int m, const float id, const bool nz, const bool fast) {
-    uint32_t q0, q1, q2, q3;
-    if (fast) {
-        q0 = nz ? n1_q1_fast(reg[4 * m], id) : 0u; q1 = nz ? n1_q1_fast(reg[4 * m + 1], id) : 0u;
-        q2 = nz ? n1_q1_fast(reg[4 * m + 2], id) : 0u; q3 = nz ? n1_q1_fast(reg[4 * m + 3], id) : 0u;
-    } else {
-        q0 = nz ? n1_q1(reg[4 * m], id) : 0u; q1 = nz ? n1_q1(reg[4 * m + 1], id) : 0u;
-        q2 = nz ? n1_q1(reg[4 * m + 2], id) : 0u; q3 = nz ? n1_q1(reg[4 * m + 3], id) : 0u;
-    }
-    return (q0 & 0xFFu) | ((q1 & 0xFFu) << 8) | ((q2 & 0xFFu) << 16) | ((q3 & 0xFFu) << 24);
 }
 
 // T512 fwht_quant_n1t (glu = false, perm = false) with 16-byte loads of the row and the signs, the int8 bytes packed in registers and
@@ -1242,6 +1306,7 @@ static void prod_check_cmp(cudaStream_t st, const void * a, const void * b, cons
 // T512 activation-producer knobs (bit-identical; bitmasks, default all on: V4 = 127, REV = 15; =0 restores the T508 release kernels):
 // GGML_CUDA_B2_PROD_V4 : 1 = FFN-down producer (fwht_quant_n1t), 2 = GNQ, 4 = AGQ use the 16-byte-load kernels; 8 = their FWHT lane exchanges on DPP,
 //                        16 = ADDNORM's lane exchanges on DPP; 32 = the 3-instruction roundf in those kernels, 64 = in ADDNORM
+//                        128 (T514) = ADDNORM stage 2 in the 16-byte mapping with the int8 bytes packed in registers (no LDS staging, one barrier less)
 // GGML_CUDA_B2_PROD_REV: 1 = FFN-down producer, 2 = ADDNORM, 4 = GNQ, 8 = AGQ process tokens last-to-first
 static int prod_mask(const char * name, const int def) {
     const char * v = getenv(name);
@@ -1374,11 +1439,17 @@ bool ggml_cuda_op_add_norm_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const
     const float fscale = 1 / sqrtf(1024.f);
     const int   S      = (int) (ncols / 128);
     const int   rev_an = (PROD_REV & 2) ? 1 : 0, dpp_an = prod_fl(PROD_V4 >> 1);
-    auto run_an = [&](const int rv, const int dp, float * o_sum, void * o_norm, float * o_mm, int8_t * o_X, float * o_sx) {
-#define AQ(NB, WN, WF) do { if (xb) ggml_cuda_kernel_launch(add_norm_fwht_quant_n1t<NB, WN, WF, true>, lp, (const float *) xa->data, (const float *) xb->data, \
+    // T514 PROD_V4 bit 128: ADDNORM stage 2 in the 16-byte mapping, bytes packed in registers (no qs staging in LDS)
+    const bool  v4_an = (PROD_V4 & 128) && ((uintptr_t) signs->data | (uintptr_t) mm->data) % 16 == 0;
+    const size_t shmem4 = 256 + (size_t) ncols * sizeof(float);
+    const ggml_cuda_kernel_launch_params lp4(grid, block, shmem4, ctx.stream());
+    auto run_an = [&](const bool v4, const int rv, const int dp, float * o_sum, void * o_norm, float * o_mm, int8_t * o_X, float * o_sx) {
+#define AQH(NB, WN, WF, HBV, XB) do { if (!v4) ggml_cuda_kernel_launch(add_norm_fwht_quant_n1t<NB, WN, WF, HBV, false>, lp, (const float *) xa->data, XB, \
         o_sum, (int) ntok, eps, (const float *) mulw->data, (const float *) signs->data, fscale, o_norm, o_mm, o_X, o_sx, S, rv, dp); \
-    else if constexpr (NB == 5) ggml_cuda_kernel_launch(add_norm_fwht_quant_n1t<NB, WN, WF, false>, lp, (const float *) xa->data, (const float *) nullptr, \
+    else ggml_cuda_kernel_launch(add_norm_fwht_quant_n1t<NB, WN, WF, HBV, true>, lp4, (const float *) xa->data, XB, \
         o_sum, (int) ntok, eps, (const float *) mulw->data, (const float *) signs->data, fscale, o_norm, o_mm, o_X, o_sx, S, rv, dp); } while (0)
+#define AQ(NB, WN, WF) do { if (xb) AQH(NB, WN, WF, true, (const float *) xb->data); \
+    else if constexpr (NB == 5) AQH(NB, WN, WF, false, (const float *) nullptr); } while (0)
 #define AQN(NB) \
     if (norm_bf16)     { if (write_fp32) AQ(NB, 2, true); else AQ(NB, 2, false); } \
     else if (norm_dst) { if (write_fp32) AQ(NB, 1, true); else AQ(NB, 1, false); } \
@@ -1391,10 +1462,11 @@ bool ggml_cuda_op_add_norm_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const
         }
 #undef AQN
 #undef AQ
+#undef AQH
     };
     void * normp = norm_bf16 ? norm_bf16 : norm_dst ? (void *) norm_dst->data : (void *) nullptr;
-    run_an(rev_an, dpp_an, (float *) sum->data, normp, (float *) mm->data, X, sx);
-    if (prod_check_on() && (rev_an || dpp_an) && (!xb || ((const void *) sum->data != (const void *) xa->data && (const void *) sum->data != (const void *) xb->data)) &&
+    run_an(v4_an, rev_an, dpp_an, (float *) sum->data, normp, (float *) mm->data, X, sx);
+    if (prod_check_on() && (rev_an || dpp_an || v4_an) && (!xb || ((const void *) sum->data != (const void *) xa->data && (const void *) sum->data != (const void *) xb->data)) &&
         (const void *) mm->data != (const void *) xa->data) {
         const size_t ybytes = n1_act_bytes(ncols, ntok), nel = (size_t) ntok * ncols, nbytes = norm_bf16 ? nel * 2 : nel * 4;
         ggml_cuda_pool_alloc<char> y2(ctx.pool(), ybytes);
@@ -1410,7 +1482,7 @@ bool ggml_cuda_op_add_norm_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const
         if (normp) {
             CUDA_CHECK(cudaMemcpyAsync(norm2.get(), normp, nbytes, cudaMemcpyDeviceToDevice, ctx.stream()));
         }
-        run_an(0, 0, xb ? sum2.get() : (float *) sum->data, normp ? (void *) norm2.get() : nullptr, write_fp32 ? mm2.get() : (float *) mm->data,
+        run_an(false, 0, 0, xb ? sum2.get() : (float *) sum->data, normp ? (void *) norm2.get() : nullptr, write_fp32 ? mm2.get() : (float *) mm->data,
                (int8_t *) y2.get(), (float *) (y2.get() + (size_t) Npad * ncols));
         prod_check_cmp(ctx.stream(), y, y2.get(), ybytes, "ADDNORM");
         if (xb) prod_check_cmp(ctx.stream(), sum->data, sum2.get(), nel * 4, "ADDNORM-sum");
