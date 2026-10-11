@@ -570,6 +570,73 @@ __global__ void gn_perm_fwht_quant_n1t(const float * __restrict__ x, const float
     }
 }
 
+// T492 GGML_CUDA_B2_AGQ_FUSE: the attention output gate (CONT of the strided gate view + sigmoid + MUL with the attention output) in
+// front of the wo producer, folded into its load: the gate (a [hd, heads, ntok] view of the Q+gate projection, strides g_s1 / g_s2 in
+// elements) is read in place, v = sigmoid(gate) * cur is the FWHT input; neither the contiguous gate copy nor the gated fp32 tensor exists.
+template <int NB>
+__launch_bounds__(32 * NB)
+__global__ void attn_gate_fwht_quant_n1t(const float * __restrict__ cur, const float * __restrict__ gate, const int64_t g_s1, const int64_t g_s2,
+                                         const int hd, const float fscale, const float * __restrict__ signs,
+                                         int8_t * __restrict__ X, float * __restrict__ sx, const int S) {
+    constexpr int N = 1024, warp_size = 32, el_w = N / warp_size, K = NB * N;
+    const int tok = blockIdx.x, w = threadIdx.y, lane = threadIdx.x;
+    extern __shared__ __align__(16) char smem[];
+    float  * red = (float *) smem;
+    int8_t * qs  = (int8_t *) (smem + 128 + (size_t) w * N);
+    const float * cr = cur + (size_t) tok * K;
+    const float * gt = gate + (size_t) tok * g_s2;
+    const float * sg = signs + (size_t) w * N;
+    float reg[el_w];
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        const int ob   = w * N + i * warp_size;   // warp-uniform: 32 consecutive flat features never cross a head (32 | hd)
+        const int head = ob / hd, d0 = ob % hd;
+        const float gv = gt[(size_t) head * g_s1 + d0 + lane];
+        float v = (1.0f / (1.0f + expf(-gv))) * cr[ob + lane];
+        asm volatile("" : "+v"(v));   // the gated tensor is a stored fp32 in the unfused chain
+        v *= fscale;
+        v *= sg[i * warp_size + lane];
+        reg[i] = v;
+    }
+    fwht_net<N, warp_size>(reg, lane);
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        asm volatile("" : "+v"(reg[i]));
+    }
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        amax = fmaxf(amax, fabsf(reg[i]));
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, o, 32));
+    }
+    if (lane == 0) {
+        red[w] = amax;
+    }
+    __syncthreads();
+    amax = 0.f;
+    for (int i = 0; i < NB; ++i) {
+        amax = fmaxf(amax, red[i]);
+    }
+    const float d  = n1_scale(amax);
+    const float id = n1_recip(d);
+    if (w == 0 && lane == 0) {
+        sx[tok] = d;
+    }
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        qs[i * warp_size + lane] = (int8_t) (d > 0.f ? (uint8_t) n1_q1(reg[i], id) : 0);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int m = 0; m < N / 4 / warp_size; ++m) {
+        const int j = lane + warp_size * m;
+        *(uint32_t *) (X + n1_off(tok, w * N + 4 * j, S)) = *(const uint32_t *) (qs + 4 * j);
+    }
+}
+
 // T430 GGML_CUDA_FWHT_QUANT: N=1024 signed transform that also emits the Q2_FIELD-layout q8_1 form of its output
 // (the MMVQ decode activation for Q2_0 g128 weights; the bytes quantize_q8_1<Q8_1_LAYOUT_Q2_FIELD> writes reading
 // dst back). Lane j holds the 32 contiguous elements j*32..j*32+31 = exactly one q8_1 block, so the quantizer is
@@ -892,6 +959,42 @@ bool ggml_cuda_op_gn_perm_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const 
         default: GQ(8); break;
     }
 #undef GQ
+    return true;
+}
+
+bool ggml_cuda_op_attn_gate_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const ggml_tensor * gview, const ggml_tensor * cur,
+                                           const ggml_tensor * signs, const ggml_tensor * mm, void * y) {
+    const int64_t K = signs->ne[0];
+    if (gview->type != GGML_TYPE_F32 || cur->type != GGML_TYPE_F32 || signs->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+        gview->ne[3] != 1 || gview->nb[0] != sizeof(float) || gview->nb[1] % sizeof(float) != 0 || gview->nb[2] % sizeof(float) != 0 ||
+        !ggml_is_contiguous(cur) || !ggml_is_contiguous(signs) || ggml_nelements(cur) != ggml_nelements(gview) || ggml_nelements(signs) != K ||
+        K % 1024 != 0 || mm->ne[0] != 1024 || gview->ne[0] % 32 != 0 || (int64_t) gview->ne[0] * gview->ne[1] != K ||
+        ggml_nelements(cur) % K != 0 || (uintptr_t) signs->data % 16 != 0) {
+        return false;
+    }
+    const int nblk = (int) (K / 1024);
+    const int64_t ntok = ggml_nelements(cur) / K;
+    if ((nblk != 4 && nblk != 5 && nblk != 6 && nblk != 8) || ntok > (1 << 20) || gview->ne[2] != ntok) {
+        return false;
+    }
+    const int64_t Npad = n1_npad(ntok);
+    int8_t * X  = (int8_t *) y;
+    float *  sx = (float *) ((char *) y + (size_t) Npad * K);
+    const dim3   grid((unsigned) ntok, 1, 1), block(32, nblk, 1);
+    const size_t shmem = 128 + (size_t) nblk * 1024;
+    const ggml_cuda_kernel_launch_params lp(grid, block, shmem, ctx.stream());
+    const float fscale = 1 / sqrtf(1024.f);
+    const int   S      = (int) (K / 128);
+    const int64_t s1 = gview->nb[1] / sizeof(float), s2 = gview->nb[2] / sizeof(float);
+#define AG(NB) ggml_cuda_kernel_launch(attn_gate_fwht_quant_n1t<NB>, lp, (const float *) cur->data, (const float *) gview->data, s1, s2, \
+        (int) gview->ne[0], fscale, (const float *) signs->data, X, sx, S)
+    switch (nblk) {
+        case 4: AG(4); break;
+        case 5: AG(5); break;
+        case 6: AG(6); break;
+        default: AG(8); break;
+    }
+#undef AG
     return true;
 }
 

@@ -27,6 +27,11 @@ bool ggml_cuda_op_gn_perm_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const 
                                          const ggml_tensor * z, const ggml_tensor * signs, const ggml_tensor * mm, float eps,
                                          int perm_nk, int perm_rep, void * y, float * dbg = nullptr);   // dbg: verify only, receives the gated-norm values
 
+// T492: attention output gate sigmoid(gview) * cur (gview = strided [hd, heads, ntok] view of the Q+gate projection, read in place) +
+// signed FWHT + per-token int8 quantize in one launch (cur and the result are [heads * hd, ntok]); only the int8 bytes are written.
+bool ggml_cuda_op_attn_gate_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const ggml_tensor * gview, const ggml_tensor * cur,
+                                           const ggml_tensor * signs, const ggml_tensor * mm, void * y);
+
 // T439: residual ADD + RMS_NORM + MUL(weight) + signed FWHT (1024 blocks) + per-token int8 quantize (N1 layout) in one launch.
 // sum = the ADD node (xa + xb, always written), norm_dst = the MUL(weight) node value (written only if non-null),
 // mm = the FWHT node (written only if write_fp32). y = N1TOK act buffer. false = declined (nothing launched).
