@@ -4404,24 +4404,24 @@ static bool ggml_cuda_b2_gatenorm_fuse_enabled() {
     static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_GATENORM_FUSE"); return v && atoi(v) != 0; }();
     return on;
 }
-// T492: GDN gated norm + ssm_out permute + FWHT + int8 quantize in one launch (prefill). =1 on, default off.
+// T492: GDN gated norm + ssm_out permute + FWHT + int8 quantize in one launch (prefill). default ON, =0 disables.
 static bool ggml_cuda_b2_gnq_fuse_enabled() {
-    static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_GNQ_FUSE"); return v && atoi(v) != 0; }();
+    static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_GNQ_FUSE"); return !v || atoi(v) != 0; }();   // default ON, =0 disables
     return on;
 }
-// T492: ADDNORM stores the normalized row as bf16 (the form the sibling BF16 GEMMs read) instead of fp32 + a convert_unary launch. Default off.
+// T492: ADDNORM stores the normalized row as bf16 (the form the sibling BF16 GEMMs read) instead of fp32 + a convert_unary launch. Default ON, =0 disables.
 static bool ggml_cuda_b2_norm_bf16_enabled() {
-    static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_NORM_BF16"); return v && atoi(v) != 0; }();
+    static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_NORM_BF16"); return !v || atoi(v) != 0; }();   // default ON, =0 disables
     return on;
 }
-// T492: attention q norm (RMS_NORM(256) + MUL(weight)) + mrope in one launch (prefill). =1 on, default off.
+// T492: attention q norm (RMS_NORM(256) + MUL(weight)) + mrope in one launch (prefill). default ON, =0 disables.
 static bool ggml_cuda_b2_qrope_fuse_enabled() {
-    static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_QROPE_FUSE"); return v && atoi(v) != 0; }();
+    static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_QROPE_FUSE"); return !v || atoi(v) != 0; }();   // default ON, =0 disables
     return on;
 }
-// T492: attention output gate (CONT + sigmoid + MUL) folded into the wo FWHT producer's load (prefill). =1 on, default off.
+// T492: attention output gate (CONT + sigmoid + MUL) folded into the wo FWHT producer's load (prefill). default ON, =0 disables.
 static bool ggml_cuda_b2_agq_fuse_enabled() {
-    static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_AGQ_FUSE"); return v && atoi(v) != 0; }();
+    static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_AGQ_FUSE"); return !v || atoi(v) != 0; }();   // default ON, =0 disables
     return on;
 }
 static bool ggml_cuda_b2_addnorm_fuse_enabled() {
@@ -6359,7 +6359,7 @@ static bool ggml_cuda_m3_fwht_quant(ggml_backend_cuda_context * ctx, ggml_cgraph
 // between them are skipped), publish the ADD's other operand and output so the GEMM's epilogue can write xa + residual straight into the ADD node.
 // Consumed (res_done set) only by the M3 one-GEMM launch; the ADD node is then skipped or handed to ADDNORM in its pre-added form.
 static void ggml_cuda_res_add_arm(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
-    static const bool enabled = [] { const char * v = getenv("GGML_CUDA_B2_RESADD"); return v && atoi(v) != 0; }();   // default off
+    static const bool enabled = [] { const char * v = getenv("GGML_CUDA_B2_RESADD"); return !v || atoi(v) != 0; }();   // default ON, =0 disables
     ctx.res_mm = nullptr;
     if (!enabled || !ggml_cuda_n1_enabled() || !ctx.stream_context().concurrent_events.empty()) {
         return;
