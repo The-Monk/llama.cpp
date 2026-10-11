@@ -1303,7 +1303,7 @@ static void prod_check_cmp(cudaStream_t st, const void * a, const void * b, cons
     }
 }
 
-// T512 activation-producer knobs (bit-identical; bitmasks, default all on: V4 = 127, REV = 15; =0 restores the T508 release kernels):
+// T512 activation-producer knobs (bit-identical; bitmasks, default all on: V4 = 255, REV = 15; =0 restores the T508 release kernels):
 // GGML_CUDA_B2_PROD_V4 : 1 = FFN-down producer (fwht_quant_n1t), 2 = GNQ, 4 = AGQ use the 16-byte-load kernels; 8 = their FWHT lane exchanges on DPP,
 //                        16 = ADDNORM's lane exchanges on DPP; 32 = the 3-instruction roundf in those kernels, 64 = in ADDNORM
 //                        128 (T514) = ADDNORM stage 2 in the 16-byte mapping with the int8 bytes packed in registers (no LDS staging, one barrier less)
@@ -1314,7 +1314,7 @@ static int prod_mask(const char * name, const int def) {
 }
 // bit 8 -> DPP exchanges (fl bit 0), 32 -> the 3-instruction round (fl bit 1); ADDNORM reads the same two bits shifted by 1 (16, 64)
 static int prod_fl(const int m) { return ((m & 8) ? 1 : 0) | ((m & 32) ? 2 : 0); }
-#define PROD_V4  ([] { static const int m = prod_mask("GGML_CUDA_B2_PROD_V4", 127);  return m; }())
+#define PROD_V4  ([] { static const int m = prod_mask("GGML_CUDA_B2_PROD_V4", 255);  return m; }())
 #define PROD_REV ([] { static const int m = prod_mask("GGML_CUDA_B2_PROD_REV", 15); return m; }())
 
 bool ggml_cuda_op_fwht_signed_quant_n1t(ggml_backend_cuda_context & ctx, const ggml_tensor * src, const ggml_tensor * up,
