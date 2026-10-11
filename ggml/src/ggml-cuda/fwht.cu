@@ -11,11 +11,57 @@
 // The butterfly network, shared by fwht_cuda and fwht_quant_n1t (T434). Under -funsafe-math-optimizations the compiler may
 // reassociate or contract these adds differently in every kernel it is inlined into (the fused producer's rotated fp32
 // differed from the standalone kernel's in ~13% of bytes); one strict-IEEE body makes both produce the same values.
+// T512 lane-xor exchange on DPP/permlane (VALU) instead of ds_bpermute (LDS pipe): a stage is partner + (lane has bit h ? -own : own), which is the
+// same IEEE result as own + partner (low lane) / partner - own (high lane): negation is exact and addition commutes.
+template <int MASK>
+static __device__ __forceinline__ float lane_xor_dpp(const float v) {
+#if !defined(__gfx1200__) && !defined(__gfx1201__)
+    return __shfl_xor_sync(0xFFFFFFFF, v, MASK, 32);   // DPP row_xmask / permlanex16 are gfx10+; the other archs keep the shuffle
+#else
+    const int iv = __float_as_int(v);
+    int r;
+    if constexpr (MASK == 1)      r = __builtin_amdgcn_update_dpp(0, iv, 0xB1, 0xF, 0xF, false);    // quad_perm [1,0,3,2]
+    else if constexpr (MASK == 2) r = __builtin_amdgcn_update_dpp(0, iv, 0x4E, 0xF, 0xF, false);    // quad_perm [2,3,0,1]
+    else if constexpr (MASK == 4) r = __builtin_amdgcn_update_dpp(0, iv, 0x164, 0xF, 0xF, false);   // row_xmask:4
+    else if constexpr (MASK == 8) r = __builtin_amdgcn_update_dpp(0, iv, 0x168, 0xF, 0xF, false);   // row_xmask:8
+    else                          r = __builtin_amdgcn_permlanex16(0, iv, 0x76543210u, 0xFEDCBA98u, false, false);   // lane ^ 16
+    return __int_as_float(r);
+#endif
+}
+
+template <int MASK, int EL>
+static __device__ __forceinline__ void fwht_stage_dpp(float (&reg)[EL], const int lane) {
+    const int sbit = (lane & MASK) ? (int) 0x80000000 : 0;
+#pragma unroll
+    for (int j = 0; j < EL; j++) {
+        const float val  = reg[j];
+        const float val2 = lane_xor_dpp<MASK>(val);
+
+        reg[j] = val2 + __int_as_float(__float_as_int(val) ^ sbit);
+    }
+}
+
+// T512: (int) roundf(t) as cvt(t + copysign(0.49999997f, t)); exhaustively identical to roundf over every float |t| <= 130, +-inf and NaN
+// (scratch/t512/rnd.hip, campaign flags): three instructions instead of seven.
+static __device__ __forceinline__ uint32_t n1_q1_fast(const float v, const float id) {
+    float t = v * id;
+    asm volatile("" : "+v"(t));   // keep the product rounded: without it `t + c` contracts to fma(v, id, c)
+    const float c = __int_as_float((__float_as_int(t) & (int) 0x80000000) | 0x3EFFFFFF);
+    return (uint32_t) (uint8_t) (int8_t) (int) (t + c);
+}
+
 template <int N, int WS>
-static __device__ __forceinline__ void fwht_net(float (&reg)[N / WS], const int lane) {
+static __device__ __forceinline__ void fwht_net(float (&reg)[N / WS], const int lane, const int dpp = 0) {
 #pragma clang fp reassociate(off)
 #pragma clang fp contract(off)
     constexpr int el_w = N / WS;
+    if (WS == 32 && (dpp & 1)) {   // T512: the same stages on DPP/permlane (see lane_xor_dpp)
+        fwht_stage_dpp<1, el_w>(reg, lane);
+        fwht_stage_dpp<2, el_w>(reg, lane);
+        fwht_stage_dpp<4, el_w>(reg, lane);
+        fwht_stage_dpp<8, el_w>(reg, lane);
+        fwht_stage_dpp<16, el_w>(reg, lane);
+    } else {
 #pragma unroll
     for (int h = 1; h < WS; h *= 2) {
 #pragma unroll
@@ -25,6 +71,7 @@ static __device__ __forceinline__ void fwht_net(float (&reg)[N / WS], const int 
 
             reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
         }
+    }
     }
 
 #pragma unroll
@@ -102,9 +149,9 @@ __launch_bounds__(1024, 1)
 __global__ void fwht_quant_n1t(const float * __restrict__ src, const float * __restrict__ up, const int64_t s_src, const int64_t s_up,
                                float * __restrict__ dst, const float scale,
                                const float * __restrict__ signs, int8_t * __restrict__ X, float * __restrict__ sx,
-                               const int S, const int perm_hd = 0, const int perm_nk = 0, const int perm_rep = 0) {
+                               const int S, const int perm_hd = 0, const int perm_nk = 0, const int perm_rep = 0, const int rev = 0) {
     constexpr int N = 1024, warp_size = 32, el_w = N / warp_size;
-    const int tok = blockIdx.x, w = threadIdx.y, lane = threadIdx.x;
+    const int tok = rev ? (int) gridDim.x - 1 - (int) blockIdx.x : (int) blockIdx.x, w = threadIdx.y, lane = threadIdx.x;
     const int K = blockDim.y * N;
     extern __shared__ __align__(16) char smem[];
     float  * red = (float *) smem;
@@ -287,7 +334,7 @@ __global__ void add_norm_fwht_quant_n1t(const float * __restrict__ xa, const flo
                                         const int ntok, const float eps, const float * __restrict__ mulw,
                                         const float * __restrict__ signs, const float fscale,
                                         void * __restrict__ norm_dst, float * __restrict__ fwht_dst,
-                                        int8_t * __restrict__ X, float * __restrict__ sx, const int S) {
+                                        int8_t * __restrict__ X, float * __restrict__ sx, const int S, const int rev = 0, const int dpp = 0) {
     constexpr int N = 1024, warp_size = 32, el_w = N / warp_size, NT = 256, NJ = 1024 / NT, ncols = NB * N;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     extern __shared__ __align__(16) char smem[];
@@ -300,12 +347,12 @@ __global__ void add_norm_fwht_quant_n1t(const float * __restrict__ xa, const flo
     // current token's reduction / transform / quantize, so the memory pipe stays busy while the block computes.
     float ca[NJ][NB], cb[NJ][NB];
     int tok = blockIdx.x;
-    if (tok < ntok) {
+    if (tok < ntok) {   // T512 rev: logical token tok is stored row (ntok - 1 - tok)
 #pragma unroll
         for (int j = 0; j < NJ; ++j) {
 #pragma unroll
             for (int k = 0; k < NB; ++k) {
-                const size_t o = (size_t) tok * ncols + tid + NT * j + k * 1024;
+                const size_t o = (size_t) (rev ? ntok - 1 - tok : tok) * ncols + tid + NT * j + k * 1024;
                 ca[j][k] = xa[o];
                 if (HB) {
                     cb[j][k] = xb[o];
@@ -314,7 +361,8 @@ __global__ void add_norm_fwht_quant_n1t(const float * __restrict__ xa, const flo
         }
     }
     for (; tok < ntok; tok += gridDim.x) {
-        const size_t row = (size_t) tok * ncols;
+        const int rtok = rev ? ntok - 1 - tok : tok;
+        const size_t row = (size_t) rtok * ncols;
         // This block has NT = 256 threads where rms_norm_f32<1024> has 1024: thread `tid` carries the partial sums of the
         // reference threads t = tid + NT * j (j < NJ), each over its own strided columns in ascending order, so every partial
         // sum and, below, the per-warp tree and the final 32-way tree are the reference's (reference warp w + 8 * j lives in
@@ -340,7 +388,7 @@ __global__ void add_norm_fwht_quant_n1t(const float * __restrict__ xa, const flo
             for (int j = 0; j < NJ; ++j) {
 #pragma unroll
                 for (int k = 0; k < NB; ++k) {
-                    const size_t o = (size_t) tn * ncols + tid + NT * j + k * 1024;
+                    const size_t o = (size_t) (rev ? ntok - 1 - tn : tn) * ncols + tid + NT * j + k * 1024;
                     ca[j][k] = xa[o];
                     if (HB) {
                         cb[j][k] = xb[o];
@@ -387,7 +435,7 @@ __global__ void add_norm_fwht_quant_n1t(const float * __restrict__ xa, const flo
                 v *= sg[idx];
                 reg[i] = v;
             }
-            fwht_net<N, warp_size>(reg, lane);
+            fwht_net<N, warp_size>(reg, lane, dpp);
 #pragma unroll
             for (int i = 0; i < el_w; ++i) {
                 asm volatile("" : "+v"(reg[i]));
@@ -420,12 +468,12 @@ __global__ void add_norm_fwht_quant_n1t(const float * __restrict__ xa, const flo
         const float d  = n1_scale(amax);
         const float id = n1_recip(d);
         if (tid == 0) {
-            sx[tok] = d;
+            sx[rtok] = d;
         }
         if (w < NB) {
 #pragma unroll
             for (int i = 0; i < el_w; ++i) {
-                qs[w * N + i * warp_size + lane] = (int8_t) (d > 0.f ? (uint8_t) n1_q1(reg[i], id) : 0);
+                qs[w * N + i * warp_size + lane] = (int8_t) (d > 0.f ? (uint8_t) ((dpp & 2) ? n1_q1_fast(reg[i], id) : n1_q1(reg[i], id)) : 0);
             }
         }
         __syncthreads();
@@ -433,7 +481,7 @@ __global__ void add_norm_fwht_quant_n1t(const float * __restrict__ xa, const flo
 #pragma unroll
             for (int m = 0; m < N / 4 / warp_size; ++m) {
                 const int jj = lane + warp_size * m;
-                *(uint32_t *) (X + n1_off(tok, w * N + 4 * jj, S)) = *(const uint32_t *) (qs + w * N + 4 * jj);
+                *(uint32_t *) (X + n1_off(rtok, w * N + 4 * jj, S)) = *(const uint32_t *) (qs + w * N + 4 * jj);
             }
         }
     }
@@ -453,9 +501,9 @@ __launch_bounds__(32 * NB)
 __global__ void gn_perm_fwht_quant_n1t(const float * __restrict__ x, const float * __restrict__ z, const float * __restrict__ nw,
                                        const float eps, const float fscale, const float * __restrict__ signs,
                                        int8_t * __restrict__ X, float * __restrict__ sx, const int S,
-                                       const int perm_nk, const int perm_rep, float * __restrict__ dbg) {
+                                       const int perm_nk, const int perm_rep, float * __restrict__ dbg, const int rev = 0) {
     constexpr int N = 1024, warp_size = 32, el_w = N / warp_size, K = NB * N, HD = 128, LDQ = 33, WSTRIDE = 4224;
-    const int tok = blockIdx.x, w = threadIdx.y, lane = threadIdx.x;
+    const int tok = rev ? (int) gridDim.x - 1 - (int) blockIdx.x : (int) blockIdx.x, w = threadIdx.y, lane = threadIdx.x;
     extern __shared__ __align__(16) char smem[];
     float  * red = (float *) smem;
     float  * sqw = (float *) (smem + 128 + (size_t) w * WSTRIDE);   // 32 x 33 squares, then (after the barrier below) 1024 int8
@@ -584,9 +632,9 @@ template <int NB>
 __launch_bounds__(32 * NB)
 __global__ void attn_gate_fwht_quant_n1t(const float * __restrict__ cur, const float * __restrict__ gate, const int64_t g_s1, const int64_t g_s2,
                                          const int hd, const float fscale, const float * __restrict__ signs,
-                                         int8_t * __restrict__ X, float * __restrict__ sx, const int S) {
+                                         int8_t * __restrict__ X, float * __restrict__ sx, const int S, const int rev = 0) {
     constexpr int N = 1024, warp_size = 32, el_w = N / warp_size, K = NB * N;
-    const int tok = blockIdx.x, w = threadIdx.y, lane = threadIdx.x;
+    const int tok = rev ? (int) gridDim.x - 1 - (int) blockIdx.x : (int) blockIdx.x, w = threadIdx.y, lane = threadIdx.x;
     extern __shared__ __align__(16) char smem[];
     float  * red = (float *) smem;
     int8_t * qs  = (int8_t *) (smem + 128 + (size_t) w * N);
@@ -641,6 +689,335 @@ __global__ void attn_gate_fwht_quant_n1t(const float * __restrict__ cur, const f
     for (int m = 0; m < N / 4 / warp_size; ++m) {
         const int j = lane + warp_size * m;
         *(uint32_t *) (X + n1_off(tok, w * N + 4 * j, S)) = *(const uint32_t *) (qs + 4 * j);
+    }
+}
+
+// T512 GGML_CUDA_B2_PROD_V4: the same butterfly network with a 16-byte-load element mapping. Lane L holds idx = 4 * (L + 32 * m) + c
+// (m < 8, c < 4) in reg[4 * m + c]: index bits 0-1 live in registers, bits 2-6 across the lanes, bits 7-9 in registers. Every stage
+// pairs the same two indices (bit h of idx) in the same ascending-h order as fwht_net, lower + upper / lower - upper, so each output
+// is the identical sequence of fp32 operations and the result is bit-identical; only which lane holds an element differs.
+static __device__ __forceinline__ void fwht_net_v4(float (&reg)[32], const int lane, const int fl) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+    const bool dpp = (fl & 1) != 0;
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        const float a = reg[4 * m], b = reg[4 * m + 1], c = reg[4 * m + 2], d = reg[4 * m + 3];
+        const float a1 = a + b, b1 = a - b, c1 = c + d, d1 = c - d;   // h = 1
+        reg[4 * m]     = a1 + c1;                                      // h = 2
+        reg[4 * m + 2] = a1 - c1;
+        reg[4 * m + 1] = b1 + d1;
+        reg[4 * m + 3] = b1 - d1;
+    }
+    if (dpp) {   // idx bits 2..6 = lane bits 0..4
+        fwht_stage_dpp<1, 32>(reg, lane);
+        fwht_stage_dpp<2, 32>(reg, lane);
+        fwht_stage_dpp<4, 32>(reg, lane);
+        fwht_stage_dpp<8, 32>(reg, lane);
+        fwht_stage_dpp<16, 32>(reg, lane);
+    } else {
+#pragma unroll
+    for (int h = 1; h < 32; h *= 2) {
+#pragma unroll
+        for (int j = 0; j < 32; j++) {
+            const float val  = reg[j];
+            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, 32);
+
+            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+        }
+    }
+    }
+#pragma unroll
+    for (int s = 1; s < 8; s *= 2) {    // idx bits 7..9 = m bits 0..2
+#pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            if ((m & s) == 0) {
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    const float x = reg[4 * m + c];
+                    const float y = reg[4 * (m + s) + c];
+
+                    reg[4 * m + c]       = x + y;
+                    reg[4 * (m + s) + c] = x - y;
+                }
+            }
+        }
+    }
+}
+
+static __device__ __forceinline__ uint32_t prod_pack4(const float (&reg)[32], const int m, const float id, const bool nz, const bool fast) {
+    uint32_t q0, q1, q2, q3;
+    if (fast) {
+        q0 = nz ? n1_q1_fast(reg[4 * m], id) : 0u; q1 = nz ? n1_q1_fast(reg[4 * m + 1], id) : 0u;
+        q2 = nz ? n1_q1_fast(reg[4 * m + 2], id) : 0u; q3 = nz ? n1_q1_fast(reg[4 * m + 3], id) : 0u;
+    } else {
+        q0 = nz ? n1_q1(reg[4 * m], id) : 0u; q1 = nz ? n1_q1(reg[4 * m + 1], id) : 0u;
+        q2 = nz ? n1_q1(reg[4 * m + 2], id) : 0u; q3 = nz ? n1_q1(reg[4 * m + 3], id) : 0u;
+    }
+    return (q0 & 0xFFu) | ((q1 & 0xFFu) << 8) | ((q2 & 0xFFu) << 16) | ((q3 & 0xFFu) << 24);
+}
+
+// T512 fwht_quant_n1t (glu = false, perm = false) with 16-byte loads of the row and the signs, the int8 bytes packed in registers and
+// stored as one u32 per (lane, m) (no LDS staging), and an optional reversed token order (the producing GEMM writes token tiles fastest,
+// feature blocks slowest, so the newest data is the high tokens' high columns). Same bytes as fwht_quant_n1t<write_fp32, false>.
+template <bool write_fp32>
+__launch_bounds__(1024, 1)
+__global__ void fwht_quant_n1t_v4(const float * __restrict__ src, const int64_t s_src, float * __restrict__ dst, const float scale,
+                                  const float * __restrict__ signs, int8_t * __restrict__ X, float * __restrict__ sx, const int S,
+                                  const int rev, const int dpp) {
+    constexpr int N = 1024, warp_size = 32;
+    const int tok = rev ? (int) gridDim.x - 1 - (int) blockIdx.x : (int) blockIdx.x;
+    const int w = threadIdx.y, lane = threadIdx.x;
+    const int K = blockDim.y * N;
+    extern __shared__ __align__(16) char smem[];
+    float * red = (float *) smem;
+
+    const float4 * s4 = (const float4 *) (src + (size_t) tok * s_src + (size_t) w * N);
+    const float4 * g4 = (const float4 *) (signs + (size_t) w * N);
+    float reg[32];
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        const float4 v = s4[lane + warp_size * m];
+        const float4 g = g4[lane + warp_size * m];
+        reg[4 * m]     = v.x * scale * g.x;
+        reg[4 * m + 1] = v.y * scale * g.y;
+        reg[4 * m + 2] = v.z * scale * g.z;
+        reg[4 * m + 3] = v.w * scale * g.w;
+    }
+    fwht_net_v4(reg, lane, dpp);
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        asm volatile("" : "+v"(reg[i]));
+    }
+    if (write_fp32) {
+        float4 * d4 = (float4 *) (dst + (size_t) tok * K + (size_t) w * N);
+#pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            d4[lane + warp_size * m] = make_float4(reg[4 * m], reg[4 * m + 1], reg[4 * m + 2], reg[4 * m + 3]);
+        }
+    }
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        amax = fmaxf(amax, fabsf(reg[i]));
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, o, 32));
+    }
+    if (lane == 0) {
+        red[w] = amax;
+    }
+    __syncthreads();
+    amax = 0.f;
+    for (int i = 0; i < (int) blockDim.y; ++i) {
+        amax = fmaxf(amax, red[i]);
+    }
+    const float d  = n1_scale(amax);
+    const float id = n1_recip(d);
+    if (w == 0 && lane == 0) {
+        sx[tok] = d;
+    }
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        const int j = lane + warp_size * m;
+        *(uint32_t *) (X + n1_off(tok, w * N + 4 * j, S)) = prod_pack4(reg, m, id, d > 0.f, (dpp & 2) != 0);
+    }
+}
+
+// T512 gn_perm_fwht_quant_n1t with 16-byte loads (x, z, weight, signs): lane L holds columns 4L..4L+3 of head hh (the m index of the
+// v4 mapping: flat transform index 128 * hh + 4L + c). The squares go to the same LDS slots as before (row hh*4 + col/32, column col%32),
+// so every partial sum, tree and rounding is the original's.
+template <int NB>
+__launch_bounds__(32 * NB)
+__global__ void gn_perm_fwht_quant_n1t_v4(const float * __restrict__ x, const float * __restrict__ z, const float * __restrict__ nw,
+                                          const float eps, const float fscale, const float * __restrict__ signs,
+                                          int8_t * __restrict__ X, float * __restrict__ sx, const int S,
+                                          const int perm_nk, const int perm_rep, const int rev, const int dpp) {
+    constexpr int N = 1024, warp_size = 32, K = NB * N, HD = 128, LDQ = 33, WSTRIDE = 4224;
+    const int tok = rev ? (int) gridDim.x - 1 - (int) blockIdx.x : (int) blockIdx.x;
+    const int w = threadIdx.y, lane = threadIdx.x;
+    extern __shared__ __align__(16) char smem[];
+    float * red = (float *) smem;
+    float * sqw = (float *) (smem + 128 + (size_t) w * WSTRIDE);
+
+    const float * xr = x + (size_t) tok * K;
+    const float * zr = z + (size_t) tok * K;
+    const float4 * g4 = (const float4 *) (signs + (size_t) w * N);
+    float4 xv[8], zv[8];
+#pragma unroll
+    for (int hh = 0; hh < 8; ++hh) {
+        const int t   = w * 8 + hh;
+        const int src = HD * (t / perm_rep + perm_nk * (t % perm_rep));
+        xv[hh] = ((const float4 *) (xr + src))[lane];
+        zv[hh] = ((const float4 *) (zr + src))[lane];
+    }
+    const float4 wv = ((const float4 *) nw)[lane];
+#pragma unroll
+    for (int hh = 0; hh < 8; ++hh) {
+        float sq0 = xv[hh].x * xv[hh].x, sq1 = xv[hh].y * xv[hh].y, sq2 = xv[hh].z * xv[hh].z, sq3 = xv[hh].w * xv[hh].w;
+        asm volatile("" : "+v"(sq0));
+        asm volatile("" : "+v"(sq1));
+        asm volatile("" : "+v"(sq2));
+        asm volatile("" : "+v"(sq3));
+        float * row = sqw + (hh * 4 + (lane >> 3)) * LDQ + 4 * (lane & 7);
+        row[0] = sq0;
+        row[1] = sq1;
+        row[2] = sq2;
+        row[3] = sq3;
+    }
+    __syncthreads();
+    float a[16], b[8], c[4];
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        a[k] = sqw[lane * LDQ + k] + sqw[lane * LDQ + k + 16];
+        asm volatile("" : "+v"(a[k]));
+    }
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        b[k] = a[k] + a[k + 8];
+        asm volatile("" : "+v"(b[k]));
+    }
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        c[k] = b[k] + b[k + 4];
+        asm volatile("" : "+v"(c[k]));
+    }
+    float d0 = c[0] + c[2], d1 = c[1] + c[3];
+    asm volatile("" : "+v"(d0));
+    asm volatile("" : "+v"(d1));
+    const float tq = d0 + d1;
+    const int   hb = lane & ~3;
+    const float t0 = __shfl_sync(0xFFFFFFFF, tq, hb + 0, 32), t1 = __shfl_sync(0xFFFFFFFF, tq, hb + 1, 32);
+    const float t2 = __shfl_sync(0xFFFFFFFF, tq, hb + 2, 32), t3 = __shfl_sync(0xFFFFFFFF, tq, hb + 3, 32);
+    float s02 = t0 + t2, s13 = t1 + t3;
+    asm volatile("" : "+v"(s02));
+    asm volatile("" : "+v"(s13));
+    const float tot = s02 + s13;
+    float reg[32];
+#pragma unroll
+    for (int hh = 0; hh < 8; ++hh) {
+        const float th    = __shfl_sync(0xFFFFFFFF, tot, hh * 4, 32);
+        const float mean  = th / HD;
+        const float scale = rsqrtf(mean + eps);
+        const float4 sg   = g4[lane + warp_size * hh];
+        const float xs[4] = {xv[hh].x, xv[hh].y, xv[hh].z, xv[hh].w};
+        const float zs[4] = {zv[hh].x, zv[hh].y, zv[hh].z, zv[hh].w};
+        const float ws[4] = {wv.x, wv.y, wv.z, wv.w};
+        const float gs[4] = {sg.x, sg.y, sg.z, sg.w};
+#pragma unroll
+        for (int c4 = 0; c4 < 4; ++c4) {
+            float normed = scale * xs[c4];
+            asm volatile("" : "+v"(normed));
+            normed = normed * ws[c4];
+            asm volatile("" : "+v"(normed));
+            float g = ggml_cuda_op_silu_single(zs[c4]) * normed;
+            asm volatile("" : "+v"(g));
+            float v = g;
+            v *= fscale;
+            v *= gs[c4];
+            reg[hh * 4 + c4] = v;
+        }
+    }
+    fwht_net_v4(reg, lane, dpp);
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        asm volatile("" : "+v"(reg[i]));
+    }
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        amax = fmaxf(amax, fabsf(reg[i]));
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, o, 32));
+    }
+    if (lane == 0) {
+        red[w] = amax;
+    }
+    __syncthreads();
+    amax = 0.f;
+    for (int i = 0; i < NB; ++i) {
+        amax = fmaxf(amax, red[i]);
+    }
+    const float d  = n1_scale(amax);
+    const float id = n1_recip(d);
+    if (w == 0 && lane == 0) {
+        sx[tok] = d;
+    }
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        const int j = lane + warp_size * m;
+        *(uint32_t *) (X + n1_off(tok, w * N + 4 * j, S)) = prod_pack4(reg, m, id, d > 0.f, (dpp & 2) != 0);
+    }
+}
+
+// T512 attn_gate_fwht_quant_n1t with 16-byte loads of cur, the gate view (needs 16-byte aligned rows: checked on the host) and signs.
+template <int NB>
+__launch_bounds__(32 * NB)
+__global__ void attn_gate_fwht_quant_n1t_v4(const float * __restrict__ cur, const float * __restrict__ gate, const int64_t g_s1, const int64_t g_s2,
+                                            const int hd, const float fscale, const float * __restrict__ signs,
+                                            int8_t * __restrict__ X, float * __restrict__ sx, const int S, const int rev, const int dpp) {
+    constexpr int N = 1024, warp_size = 32, K = NB * N;
+    const int tok = rev ? (int) gridDim.x - 1 - (int) blockIdx.x : (int) blockIdx.x;
+    const int w = threadIdx.y, lane = threadIdx.x;
+    extern __shared__ __align__(16) char smem[];
+    float * red = (float *) smem;
+    const float * cr = cur + (size_t) tok * K;
+    const float * gt = gate + (size_t) tok * g_s2;
+    const float4 * g4 = (const float4 *) (signs + (size_t) w * N);
+    float reg[32];
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        const int ob   = w * N + 128 * m + 4 * lane;   // 4 consecutive flat features never cross a head (32 | hd)
+        const int head = ob / hd, d0 = ob % hd;
+        const float4 gv = *(const float4 *) (gt + (size_t) head * g_s1 + d0);
+        const float4 cv = *(const float4 *) (cr + ob);
+        const float4 sg = g4[lane + warp_size * m];
+        const float gs[4] = {gv.x, gv.y, gv.z, gv.w};
+        const float cs[4] = {cv.x, cv.y, cv.z, cv.w};
+        const float ss[4] = {sg.x, sg.y, sg.z, sg.w};
+#pragma unroll
+        for (int c4 = 0; c4 < 4; ++c4) {
+            float v = (1.0f / (1.0f + expf(-gs[c4]))) * cs[c4];
+            asm volatile("" : "+v"(v));
+            v *= fscale;
+            v *= ss[c4];
+            reg[4 * m + c4] = v;
+        }
+    }
+    fwht_net_v4(reg, lane, dpp);
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        asm volatile("" : "+v"(reg[i]));
+    }
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        amax = fmaxf(amax, fabsf(reg[i]));
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, o, 32));
+    }
+    if (lane == 0) {
+        red[w] = amax;
+    }
+    __syncthreads();
+    amax = 0.f;
+    for (int i = 0; i < NB; ++i) {
+        amax = fmaxf(amax, red[i]);
+    }
+    const float d  = n1_scale(amax);
+    const float id = n1_recip(d);
+    if (w == 0 && lane == 0) {
+        sx[tok] = d;
+    }
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        const int j = lane + warp_size * m;
+        *(uint32_t *) (X + n1_off(tok, w * N + 4 * j, S)) = prod_pack4(reg, m, id, d > 0.f, (dpp & 2) != 0);
     }
 }
 
@@ -818,6 +1195,63 @@ bool ggml_cuda_op_fwht_signed(ggml_backend_cuda_context & ctx, const ggml_tensor
     return fwht_dispatch(ctx, src, dst, signs);
 }
 
+// T512 GGML_CUDA_B2_PROD_CHECK=1: after every producer launch that uses a T512 variant, re-run the original kernel (rev 0, scalar loads, shuffles,
+// roundf) into scratch copies of the outputs and compare them word for word; the totals print when the process exits. Verification only.
+__global__ void prod_cmp_words(const uint32_t * __restrict__ a, const uint32_t * __restrict__ b, const size_t n, unsigned long long * cnt) {
+    unsigned long long bad = 0;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        bad += a[i] != b[i];
+    }
+    if (bad) {
+        atomicAdd(cnt, bad);
+    }
+}
+struct prod_check_stats {
+    unsigned long long calls = 0, bad_calls = 0, bad_words = 0;
+    ~prod_check_stats() {
+        if (calls) {
+            fprintf(stderr, "[T512 check] %llu producer buffers compared with the reference kernel: %llu with mismatches (%llu words)\n", calls, bad_calls, bad_words);
+        }
+    }
+};
+static prod_check_stats g_prod_check;
+static bool prod_check_on() {
+    static const bool on = [] { const char * v = getenv("GGML_CUDA_B2_PROD_CHECK"); return v && atoi(v) != 0; }();
+    return on;
+}
+static void prod_check_cmp(cudaStream_t st, const void * a, const void * b, const size_t bytes, const char * tag) {
+    static unsigned long long * cnt = nullptr;
+    if (!cnt) {
+        CUDA_CHECK(cudaMalloc((void **) &cnt, sizeof(unsigned long long)));
+    }
+    CUDA_CHECK(cudaMemsetAsync(cnt, 0, sizeof(unsigned long long), st));
+    prod_cmp_words<<<1024, 256, 0, st>>>((const uint32_t *) a, (const uint32_t *) b, bytes / 4, cnt);
+    unsigned long long h = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&h, cnt, sizeof(h), cudaMemcpyDeviceToHost, st));
+    CUDA_CHECK(cudaStreamSynchronize(st));
+    g_prod_check.calls++;
+    if (h) {
+        g_prod_check.bad_calls++;
+        g_prod_check.bad_words += h;
+        if (g_prod_check.bad_calls <= 8) {
+            fprintf(stderr, "[T512 check] MISMATCH %s: %llu of %zu words differ\n", tag, h, bytes / 4);
+        }
+    }
+}
+
+// T512 activation-producer knobs (bit-identical; bitmasks, default 0 = the T508 release behaviour):
+// GGML_CUDA_B2_PROD_V4 : 1 = FFN-down producer (fwht_quant_n1t), 2 = GNQ, 4 = AGQ use the 16-byte-load kernels; 8 = their FWHT lane exchanges on DPP,
+//                        16 = ADDNORM's lane exchanges on DPP; 32 = the 3-instruction roundf in those kernels, 64 = in ADDNORM
+// GGML_CUDA_B2_PROD_REV: 1 = FFN-down producer, 2 = ADDNORM, 4 = GNQ, 8 = AGQ process tokens last-to-first
+static int prod_mask(const char * name, const int def) {
+    const char * v = getenv(name);
+    return v ? atoi(v) : def;
+}
+// bit 8 -> DPP exchanges (fl bit 0), 32 -> the 3-instruction round (fl bit 1); ADDNORM reads the same two bits shifted by 1 (16, 64)
+static int prod_fl(const int m) { return ((m & 8) ? 1 : 0) | ((m & 32) ? 2 : 0); }
+#define PROD_V4  ([] { static const int m = prod_mask("GGML_CUDA_B2_PROD_V4", 0);  return m; }())
+#define PROD_REV ([] { static const int m = prod_mask("GGML_CUDA_B2_PROD_REV", 0); return m; }())
+
 bool ggml_cuda_op_fwht_signed_quant_n1t(ggml_backend_cuda_context & ctx, const ggml_tensor * src, const ggml_tensor * up,
                                         const ggml_tensor * signs, ggml_tensor * dst, bool write_fp32, void * y,
                                         int perm_hd, int perm_nk, int perm_rep) {
@@ -860,8 +1294,9 @@ bool ggml_cuda_op_fwht_signed_quant_n1t(ggml_backend_cuda_context & ctx, const g
     float *       d = (float *) dst->data;
     const float * g = (const float *) signs->data;
     const int     S = (int) (K / 128);
-#define FQ(WF, GL) ggml_cuda_kernel_launch(fwht_quant_n1t<WF, GL>, lp, a, b, s_src, s_up, d, scale, g, X, sx, S, 0, 0, 0)
-#define FQP(WF) ggml_cuda_kernel_launch(fwht_quant_n1t<WF, false, true>, lp, a, b, s_src, s_up, d, scale, g, X, sx, S, perm_hd, perm_nk, perm_rep)
+    const int rev_fq = (PROD_REV & 1) ? 1 : 0;
+#define FQ(WF, GL) ggml_cuda_kernel_launch(fwht_quant_n1t<WF, GL>, lp, a, b, s_src, s_up, d, scale, g, X, sx, S, 0, 0, 0, rev_fq)
+#define FQP(WF) ggml_cuda_kernel_launch(fwht_quant_n1t<WF, false, true>, lp, a, b, s_src, s_up, d, scale, g, X, sx, S, perm_hd, perm_nk, perm_rep, 0)
     static const bool glu_pf = [] { const char * v = getenv("GGML_CUDA_B2_GLUPF"); return !v || atoi(v) != 0; }();   // default ON, =0 disables
     if (glu && glu_pf) {
         static const int pf_bps = [] { const char * v = getenv("GGML_CUDA_B2_GLUPF_BPS"); return v ? atoi(v) : 2; }();
@@ -877,8 +1312,31 @@ bool ggml_cuda_op_fwht_signed_quant_n1t(ggml_backend_cuda_context & ctx, const g
         if (write_fp32) FQP(true); else FQP(false);
     } else if (glu) {
         if (write_fp32) FQ(true, true); else FQ(false, true);
+    } else if ((PROD_V4 & 1) && ((uintptr_t) a | (uintptr_t) g | (uintptr_t) d) % 16 == 0 && s_src % 4 == 0) {
+        const ggml_cuda_kernel_launch_params vlp(grid, block, 128, ctx.stream());
+        const int dpp_on = prod_fl(PROD_V4);
+        if (write_fp32) ggml_cuda_kernel_launch(fwht_quant_n1t_v4<true>, vlp, a, s_src, d, scale, g, X, sx, S, rev_fq, dpp_on);
+        else            ggml_cuda_kernel_launch(fwht_quant_n1t_v4<false>, vlp, a, s_src, d, scale, g, X, sx, S, rev_fq, dpp_on);
     } else {
         if (write_fp32) FQ(true, false); else FQ(false, false);
+    }
+    if (!glu && !perm && prod_check_on() && ((PROD_V4 & 1) || rev_fq) && !(write_fp32 && d == a)) {
+        const size_t ybytes = n1_act_bytes(K, ntok);
+        ggml_cuda_pool_alloc<char> y2(ctx.pool(), ybytes);
+        ggml_cuda_pool_alloc<float> d2(ctx.pool(), write_fp32 ? (size_t) (ntok * K) : 1);
+        int8_t * X2  = (int8_t *) y2.get();
+        float *  sx2 = (float *) (y2.get() + (size_t) Npad * K);
+        CUDA_CHECK(cudaMemcpyAsync(y2.get(), y, ybytes, cudaMemcpyDeviceToDevice, ctx.stream()));
+        if (write_fp32) {
+            CUDA_CHECK(cudaMemcpyAsync(d2.get(), d, (size_t) ntok * K * sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream()));
+            ggml_cuda_kernel_launch(fwht_quant_n1t<true, false>, lp, a, b, s_src, s_up, d2.get(), scale, g, X2, sx2, S, 0, 0, 0, 0);
+        } else {
+            ggml_cuda_kernel_launch(fwht_quant_n1t<false, false>, lp, a, b, s_src, s_up, d2.get(), scale, g, X2, sx2, S, 0, 0, 0, 0);
+        }
+        prod_check_cmp(ctx.stream(), y, y2.get(), ybytes, "FQ");
+        if (write_fp32) {
+            prod_check_cmp(ctx.stream(), d, d2.get(), (size_t) ntok * K * sizeof(float), "FQ-dst");
+        }
     }
 #undef FQ
 #undef FQP
@@ -915,24 +1373,50 @@ bool ggml_cuda_op_add_norm_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const
     const ggml_cuda_kernel_launch_params lp(grid, block, shmem, ctx.stream());
     const float fscale = 1 / sqrtf(1024.f);
     const int   S      = (int) (ncols / 128);
+    const int   rev_an = (PROD_REV & 2) ? 1 : 0, dpp_an = prod_fl(PROD_V4 >> 1);
+    auto run_an = [&](const int rv, const int dp, float * o_sum, void * o_norm, float * o_mm, int8_t * o_X, float * o_sx) {
 #define AQ(NB, WN, WF) do { if (xb) ggml_cuda_kernel_launch(add_norm_fwht_quant_n1t<NB, WN, WF, true>, lp, (const float *) xa->data, (const float *) xb->data, \
-        (float *) sum->data, (int) ntok, eps, (const float *) mulw->data, (const float *) signs->data, fscale, \
-        norm_bf16 ? norm_bf16 : norm_dst ? (void *) norm_dst->data : (void *) nullptr, (float *) mm->data, X, sx, S); \
+        o_sum, (int) ntok, eps, (const float *) mulw->data, (const float *) signs->data, fscale, o_norm, o_mm, o_X, o_sx, S, rv, dp); \
     else if constexpr (NB == 5) ggml_cuda_kernel_launch(add_norm_fwht_quant_n1t<NB, WN, WF, false>, lp, (const float *) xa->data, (const float *) nullptr, \
-        (float *) sum->data, (int) ntok, eps, (const float *) mulw->data, (const float *) signs->data, fscale, \
-        norm_bf16 ? norm_bf16 : norm_dst ? (void *) norm_dst->data : (void *) nullptr, (float *) mm->data, X, sx, S); } while (0)
+        o_sum, (int) ntok, eps, (const float *) mulw->data, (const float *) signs->data, fscale, o_norm, o_mm, o_X, o_sx, S, rv, dp); } while (0)
 #define AQN(NB) \
     if (norm_bf16)     { if (write_fp32) AQ(NB, 2, true); else AQ(NB, 2, false); } \
     else if (norm_dst) { if (write_fp32) AQ(NB, 1, true); else AQ(NB, 1, false); } \
     else               { if (write_fp32) AQ(NB, 0, true); else AQ(NB, 0, false); }
-    switch (nblk) {
-        case 4: AQN(4) break;
-        case 5: AQN(5) break;
-        case 6: AQN(6) break;
-        default: AQN(8) break;
-    }
+        switch (nblk) {
+            case 4: AQN(4) break;
+            case 5: AQN(5) break;
+            case 6: AQN(6) break;
+            default: AQN(8) break;
+        }
 #undef AQN
 #undef AQ
+    };
+    void * normp = norm_bf16 ? norm_bf16 : norm_dst ? (void *) norm_dst->data : (void *) nullptr;
+    run_an(rev_an, dpp_an, (float *) sum->data, normp, (float *) mm->data, X, sx);
+    if (prod_check_on() && (rev_an || dpp_an) && (!xb || ((const void *) sum->data != (const void *) xa->data && (const void *) sum->data != (const void *) xb->data)) &&
+        (const void *) mm->data != (const void *) xa->data) {
+        const size_t ybytes = n1_act_bytes(ncols, ntok), nel = (size_t) ntok * ncols, nbytes = norm_bf16 ? nel * 2 : nel * 4;
+        ggml_cuda_pool_alloc<char> y2(ctx.pool(), ybytes);
+        ggml_cuda_pool_alloc<float> sum2(ctx.pool(), xb ? nel : 1), mm2(ctx.pool(), write_fp32 ? nel : 1);
+        ggml_cuda_pool_alloc<char> norm2(ctx.pool(), normp ? nbytes : 4);
+        CUDA_CHECK(cudaMemcpyAsync(y2.get(), y, ybytes, cudaMemcpyDeviceToDevice, ctx.stream()));
+        if (xb) {
+            CUDA_CHECK(cudaMemcpyAsync(sum2.get(), sum->data, nel * 4, cudaMemcpyDeviceToDevice, ctx.stream()));
+        }
+        if (write_fp32) {
+            CUDA_CHECK(cudaMemcpyAsync(mm2.get(), mm->data, nel * 4, cudaMemcpyDeviceToDevice, ctx.stream()));
+        }
+        if (normp) {
+            CUDA_CHECK(cudaMemcpyAsync(norm2.get(), normp, nbytes, cudaMemcpyDeviceToDevice, ctx.stream()));
+        }
+        run_an(0, 0, xb ? sum2.get() : (float *) sum->data, normp ? (void *) norm2.get() : nullptr, write_fp32 ? mm2.get() : (float *) mm->data,
+               (int8_t *) y2.get(), (float *) (y2.get() + (size_t) Npad * ncols));
+        prod_check_cmp(ctx.stream(), y, y2.get(), ybytes, "ADDNORM");
+        if (xb) prod_check_cmp(ctx.stream(), sum->data, sum2.get(), nel * 4, "ADDNORM-sum");
+        if (write_fp32) prod_check_cmp(ctx.stream(), mm->data, mm2.get(), nel * 4, "ADDNORM-fwht");
+        if (normp) prod_check_cmp(ctx.stream(), normp, norm2.get(), nbytes, "ADDNORM-norm");
+    }
     return true;
 }
 
@@ -960,8 +1444,12 @@ bool ggml_cuda_op_gn_perm_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const 
     const ggml_cuda_kernel_launch_params lp(grid, block, shmem, ctx.stream());
     const float fscale = 1 / sqrtf(1024.f);
     const int   S      = (int) (K / 128);
-#define GQ(NB) ggml_cuda_kernel_launch(gn_perm_fwht_quant_n1t<NB>, lp, (const float *) x->data, (const float *) z->data, (const float *) nw->data, \
-        eps, fscale, (const float *) signs->data, X, sx, S, perm_nk, perm_rep, dbg)
+    const int rev_gn = (PROD_REV & 4) ? 1 : 0, dpp_on = prod_fl(PROD_V4);
+    const bool v4_gn = (PROD_V4 & 2) && !dbg && perm_rep > 0 && ((uintptr_t) x->data | (uintptr_t) z->data | (uintptr_t) nw->data | (uintptr_t) signs->data) % 16 == 0;
+#define GQ(NB) do { if (v4_gn) ggml_cuda_kernel_launch(gn_perm_fwht_quant_n1t_v4<NB>, lp, (const float *) x->data, (const float *) z->data, (const float *) nw->data, \
+        eps, fscale, (const float *) signs->data, X, sx, S, perm_nk, perm_rep, rev_gn, dpp_on); \
+    else ggml_cuda_kernel_launch(gn_perm_fwht_quant_n1t<NB>, lp, (const float *) x->data, (const float *) z->data, (const float *) nw->data, \
+        eps, fscale, (const float *) signs->data, X, sx, S, perm_nk, perm_rep, dbg, rev_gn); } while (0)
     switch (nblk) {
         case 4: GQ(4); break;
         case 5: GQ(5); break;
@@ -969,6 +1457,23 @@ bool ggml_cuda_op_gn_perm_fwht_quant_n1t(ggml_backend_cuda_context & ctx, const 
         default: GQ(8); break;
     }
 #undef GQ
+    if (prod_check_on() && (v4_gn || rev_gn) && !dbg) {
+        const size_t ybytes = n1_act_bytes(K, ntok);
+        ggml_cuda_pool_alloc<char> y2(ctx.pool(), ybytes);
+        int8_t * X2  = (int8_t *) y2.get();
+        float *  sx2 = (float *) (y2.get() + (size_t) Npad * K);
+        CUDA_CHECK(cudaMemcpyAsync(y2.get(), y, ybytes, cudaMemcpyDeviceToDevice, ctx.stream()));
+#define GQR(NB) ggml_cuda_kernel_launch(gn_perm_fwht_quant_n1t<NB>, lp, (const float *) x->data, (const float *) z->data, (const float *) nw->data, \
+        eps, fscale, (const float *) signs->data, X2, sx2, S, perm_nk, perm_rep, (float *) nullptr, 0)
+        switch (nblk) {
+            case 4: GQR(4); break;
+            case 5: GQR(5); break;
+            case 6: GQR(6); break;
+            default: GQR(8); break;
+        }
+#undef GQR
+        prod_check_cmp(ctx.stream(), y, y2.get(), ybytes, "GNQ");
+    }
     return true;
 }
 
@@ -996,8 +1501,13 @@ bool ggml_cuda_op_attn_gate_fwht_quant_n1t(ggml_backend_cuda_context & ctx, cons
     const float fscale = 1 / sqrtf(1024.f);
     const int   S      = (int) (K / 128);
     const int64_t s1 = gview->nb[1] / sizeof(float), s2 = gview->nb[2] / sizeof(float);
-#define AG(NB) ggml_cuda_kernel_launch(attn_gate_fwht_quant_n1t<NB>, lp, (const float *) cur->data, (const float *) gview->data, s1, s2, \
-        (int) gview->ne[0], fscale, (const float *) signs->data, X, sx, S)
+    const int rev_ag = (PROD_REV & 8) ? 1 : 0, dpp_on = prod_fl(PROD_V4);
+    const bool v4_ag = (PROD_V4 & 4) && s1 % 4 == 0 && s2 % 4 == 0 && gview->ne[0] % 4 == 0 &&
+                       ((uintptr_t) cur->data | (uintptr_t) gview->data | (uintptr_t) signs->data) % 16 == 0;
+#define AG(NB) do { if (v4_ag) ggml_cuda_kernel_launch(attn_gate_fwht_quant_n1t_v4<NB>, lp, (const float *) cur->data, (const float *) gview->data, s1, s2, \
+        (int) gview->ne[0], fscale, (const float *) signs->data, X, sx, S, rev_ag, dpp_on); \
+    else ggml_cuda_kernel_launch(attn_gate_fwht_quant_n1t<NB>, lp, (const float *) cur->data, (const float *) gview->data, s1, s2, \
+        (int) gview->ne[0], fscale, (const float *) signs->data, X, sx, S, rev_ag); } while (0)
     switch (nblk) {
         case 4: AG(4); break;
         case 5: AG(5); break;
@@ -1005,6 +1515,23 @@ bool ggml_cuda_op_attn_gate_fwht_quant_n1t(ggml_backend_cuda_context & ctx, cons
         default: AG(8); break;
     }
 #undef AG
+    if (prod_check_on() && (v4_ag || rev_ag)) {
+        const size_t ybytes = n1_act_bytes(K, ntok);
+        ggml_cuda_pool_alloc<char> y2(ctx.pool(), ybytes);
+        int8_t * X2  = (int8_t *) y2.get();
+        float *  sx2 = (float *) (y2.get() + (size_t) Npad * K);
+        CUDA_CHECK(cudaMemcpyAsync(y2.get(), y, ybytes, cudaMemcpyDeviceToDevice, ctx.stream()));
+#define AGR(NB) ggml_cuda_kernel_launch(attn_gate_fwht_quant_n1t<NB>, lp, (const float *) cur->data, (const float *) gview->data, s1, s2, \
+        (int) gview->ne[0], fscale, (const float *) signs->data, X2, sx2, S, 0)
+        switch (nblk) {
+            case 4: AGR(4); break;
+            case 5: AGR(5); break;
+            case 6: AGR(6); break;
+            default: AGR(8); break;
+        }
+#undef AGR
+        prod_check_cmp(ctx.stream(), y, y2.get(), ybytes, "AGQ");
+    }
     return true;
 }
 
