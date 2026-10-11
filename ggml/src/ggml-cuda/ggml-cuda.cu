@@ -63,6 +63,7 @@
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
+#include "ggml-cuda/gdn-abproj.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -4257,6 +4258,40 @@ static int ggml_cuda_find_mmvq_group(const ggml_cgraph * cgraph, int i, int cc, 
     return g.n;
 }
 
+// T491 GGML_CUDA_B2_ABPAIR (default OFF): the prefill-sized twin of the pair above. Two MUL_MATs on one fp32 activation
+// (ssm_beta / ssm_alpha, BF16 48x5120, N >= 64 tokens) run as ONE WMMA launch that converts the activation in registers,
+// replacing the shared fp32->bf16 conversion and the two small GEMMs. Returns the partner node index or -1.
+static int ggml_cuda_find_ab_pair(const ggml_cgraph * cgraph, int i, int cc) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_B2_ABPAIR"); return e != nullptr && atoi(e) != 0; }();
+    if (!enabled) {
+        return -1;
+    }
+    const ggml_tensor * a = cgraph->nodes[i];
+    if (a->op != GGML_OP_MUL_MAT || a->src[2] != nullptr || (a->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            a->src[0]->type != GGML_TYPE_BF16 || a->src[1]->ne[1] < 64) {
+        return -1;
+    }
+    auto overlaps = [](const ggml_tensor * x, const ggml_tensor * y) {
+        if (!x || !y || !x->data || !y->data) return true;
+        const char * xs = (const char *) x->data;
+        const char * ys = (const char *) y->data;
+        return xs < ys + ggml_nbytes(y) && ys < xs + ggml_nbytes(x);
+    };
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * b = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(b)) {
+            continue;
+        }
+        if (b->op != GGML_OP_MUL_MAT || b->src[1] != a->src[1] || b->src[2] != nullptr || (b->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+                b->src[0] == a->src[0] || !ggml_cuda_gdn_ab_proj_supported(a, b, cc) ||
+                overlaps(a, a->src[1]) || overlaps(a, b->src[0]) || overlaps(a, b) || overlaps(b, a->src[1]) || overlaps(b, a->src[0])) {
+            return -1;
+        }
+        return j;
+    }
+    return -1;
+}
+
 // T430 GGML_CUDA_MMVF_PAIR (default OFF): two ADJACENT single-token BF16 MUL_MATs reading the same activation with identical
 // weight geometry (Bonsai 2's ssm_beta / ssm_alpha, 48x5120 each: ~3.5 us launch-bound kernels the Q2_0 matrix-table group
 // cannot take) run as ONE mmvf launch over both row sets, same per-row arithmetic. Returns the partner node index or -1.
@@ -6548,8 +6583,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             const bool act_fuse = ggml_cuda_act_fuse_mask() != 0;
 
+            // T491 diagnostic (GGML_CUDA_B2_NODEGAP_DIAG=<us>): report host stalls between consecutive node visits
+            static const int nodegap_us = [] { const char * e = getenv("GGML_CUDA_B2_NODEGAP_DIAG"); return e ? atoi(e) : 0; }();
+            int64_t nodegap_t = nodegap_us ? ggml_time_us() : 0;
+            int     nodegap_prev = -1;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (nodegap_us) {
+                    const int64_t now = ggml_time_us();
+                    if (now - nodegap_t >= nodegap_us && nodegap_prev >= 0) {
+                        const ggml_tensor * pn = cgraph->nodes[nodegap_prev];
+                        fprintf(stderr, "[T491] host stall %lld us after node %d (%s %s) before node %d (%s %s)\n", (long long) (now - nodegap_t),
+                                nodegap_prev, ggml_op_name(pn->op), pn->name, i, ggml_op_name(node->op), node->name);
+                    }
+                    nodegap_t = now;
+                    nodegap_prev = i;
+                }
                 if (act_fuse) {
                     // [TAG_ACT_FUSE] a pending (unmaterialized) GLU must be consumed by the very next node
                     if (cuda_ctx->act_pending && !(node->op == GGML_OP_MUL_MAT && node->src[1] == cuda_ctx->act_pending)) {
@@ -6701,6 +6750,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         for (int k = 1; k < ng; ++k) {
                             mmvq_pair_done[gidx[k]] = true;
                         }
+                        try_launch_concurrent_event(node);
+                        continue;
+                    }
+                }
+
+                // T491 GGML_CUDA_B2_ABPAIR: the prefill-sized pair -> one WMMA launch
+                if (!is_concurrent_event_active) {
+                    const int aj = ggml_cuda_find_ab_pair(cgraph, i, ggml_cuda_info().devices[cuda_ctx->device].cc);
+                    if (aj > i) {
+                        ggml_cuda_gdn_ab_proj(*cuda_ctx, node, cgraph->nodes[aj]);
+                        mmvq_pair_done[aj] = true;
                         try_launch_concurrent_event(node);
                         continue;
                     }
