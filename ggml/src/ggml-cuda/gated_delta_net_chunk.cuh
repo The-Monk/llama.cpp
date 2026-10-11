@@ -619,11 +619,12 @@ static int gdn_chunk_min_tokens() {
     return m ? atoi(m) : 64;
 }
 
-// T490: GGML_GDN_CHUNK_OPT bitmask, default 0 = the T405 kernels unchanged; 1 = scan staging without bank conflicts
-// (bit-exact), 2 (implies 1) = single-f16 output path (not bit-exact), 4 = prep L table (not bit-exact)
+// T490: GGML_GDN_CHUNK_OPT bitmask, default 1 (GGML_GDN_CHUNK_OPT=0 restores the T405 kernels unchanged):
+// 1 = scan staging without bank conflicts (bit-exact), 2 (implies 1) = single-f16 output path (not bit-exact, opt-in),
+// 4 = prep L table (not bit-exact, opt-in)
 static int gdn_chunk_opt() {
     const char * e = getenv("GGML_GDN_CHUNK_OPT");
-    const int v = e ? atoi(e) : 0;
+    const int v = e ? atoi(e) : 1;
     return v < 0 ? 0 : ((v & 2) ? 2 : 0) | ((v & 3) ? 1 : 0) | (v & 4);
 }
 
