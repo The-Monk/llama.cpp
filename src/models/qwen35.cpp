@@ -450,8 +450,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // branch (rollback active) passes gate/beta straight into the base
     // ggml_gated_delta_net call with explicit nullptr,nullptr for ssm_dt/
     // ssm_a, so raw unactivated values must never reach that path.
-    const bool gdn_fused_ba = gdn_rung_default_on("GGML_GDN_FUSED_BA") && gdn_layer_on_cuda_like(model, il) &&
-                              n_seq_tokens == 1 && cparams.n_rs_seq == 0;
+    // GGML_GDN_FUSED_BA_PF (T491, default off): the same fold for prefill-sized ubatches. The chunked GDN prep stage already
+    // implements FusedBA (sigmoid(beta), softplus(alpha+ssm_dt)*ssm_a per token), so the four elementwise launches
+    // (ADD, SOFTPLUS, MUL, SIGMOID: ~3.45 us dependent-dispatch gap + ~2 us each, per GDN layer and ubatch) disappear.
+    const bool gdn_fused_ba_pf = []() { const char * e = getenv("GGML_GDN_FUSED_BA_PF"); return e != nullptr && atoi(e) != 0; }() &&
+                                 gdn_layer_on_cuda_like(model, il) && n_seq_tokens >= 64 && cparams.n_rs_seq == 0;
+    const bool gdn_fused_ba = (gdn_rung_default_on("GGML_GDN_FUSED_BA") && gdn_layer_on_cuda_like(model, il) &&
+                               n_seq_tokens == 1 && cparams.n_rs_seq == 0) || gdn_fused_ba_pf;
 
     // GGML_GDN_FUSED_L2NORM (T180 follow-on): fold the two upstream
     // GGML_OP_L2_NORM dispatches (q_conv, k_conv) into the GDN kernel,
