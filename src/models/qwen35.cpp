@@ -286,16 +286,28 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
         return !e || atoi(e) != 0 || (g && atoi(g) != 0);   // ADDNORM default ON, =0 disables
     }();
     const bool pin_order = hfuse_pin || (b2_order && ubatch.n_tokens > 1);
-    if (pin_order) {
-        ggml_build_forward_expand(gf, qkv_mixed);
-    }
+    // T508 GGML_GDN_CONV_ZFIRST (default off): emit the z matmul BEFORE the qkv matmul so the GDN conv that reads qkv runs right behind it.
+    // With qkv first (the T439 order) the z GEMM (25 MB output + its weight stream) sits between the qkv GEMM and the conv: the conv kernel went
+    // 145 -> 175 us per call (wrx90 kernel trace; ADDNORM_FUSE=0 gives 148, the T483 tap order gives no change). The mechanism (the z GEMM
+    // evicting the qkv output from the MALL) is INFERRED. Same nodes, same math; only the order of independent nodes changes.
+    static const bool z_first = [] {
+        const char * e = getenv("GGML_GDN_CONV_ZFIRST");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    ggml_tensor * qkv_raw = qkv_mixed;
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     cb(z, "z", il);
     if (pin_order) {
-        ggml_build_forward_expand(gf, z);
+        if (z_first && !hfuse_pin && ubatch.n_tokens > 32) {   // small verify batches keep the T439 order
+            ggml_build_forward_expand(gf, z);
+            ggml_build_forward_expand(gf, qkv_raw);
+        } else {
+            ggml_build_forward_expand(gf, qkv_raw);
+            ggml_build_forward_expand(gf, z);
+        }
     }
 
     return { qkv_mixed, z };
