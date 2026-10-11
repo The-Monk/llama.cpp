@@ -10089,6 +10089,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128,  512, 1, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  130, 2, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128, 2048, 1));
+    // T490: Bonsai-like head layout (k-heads x3 v-heads), partial last chunk, several sequences
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1000, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   65, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  333, 2, 3));
     // T405 phase 2, snapshot mode (K > 1): chunked over the first n_tokens - K tokens, sequential tail
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  512, 1, 1, false, false, /*K=*/8));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  512, 2, 1, false, false, /*K=*/8));
@@ -10509,6 +10513,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1024, 1)); // PP-1024
+    // T490: Bonsai-like (16 k-heads, 3 v-heads each = 48 scan workgroups) and workgroup-count sweeps
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1, 3)); // 48 v-heads
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1, 1)); // 16 v-heads
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1, 2)); // 32 v-heads
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1, 4)); // 64 v-heads
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1, 6)); // 96 v-heads
     // Small model configs (fewer heads = less GPU occupancy for autoregressive)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1));   // 4h PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1));  // 4h PP-256

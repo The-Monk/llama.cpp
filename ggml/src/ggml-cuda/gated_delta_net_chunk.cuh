@@ -35,6 +35,7 @@
 #define GDN_CHUNK_AVAILABLE 1
 typedef _Float16 gdn_h8 __attribute__((ext_vector_type(8)));
 typedef float    gdn_f8 __attribute__((ext_vector_type(8)));
+typedef _Float16 gdn_h4 __attribute__((ext_vector_type(4)));
 
 template <typename X>
 static __device__ __forceinline__ void gdn_split8(const X & x, gdn_h8 & hi, gdn_h8 & lo) {
@@ -74,7 +75,10 @@ static __device__ __forceinline__ void gdn_load8(const float * p, float (&a)[8],
 #endif // defined(GGML_USE_HIP) && defined(RDNA4)
 
 // meta per (seq, v-head, chunk, token): [0] k scale, [1] q scale, [2] b = cumsum(log g), [3] beta
-template <bool FusedBA, bool L2Norm>
+// LPRE (T490, GGML_GDN_CHUNK_OPT&4): L[r][j] = beta_r exp(b_r - b_j) G[r][j] is computed once into LDS instead of being
+// re-evaluated (with an expf) at every use of the triangular solve. Not bit-exact vs the per-use form: the build uses
+// -funsafe-math-optimizations, which reassociates the product chain differently at each inlined use (KLD at the 1-ulp floor).
+template <bool FusedBA, bool L2Norm, bool LPRE>
 __global__ void __launch_bounds__(256, 1)
 gdn_chunk_prep(const float * q, const float * k, const float * g, const float * beta,
                float * Tbuf, float * Pbuf, float * meta,
@@ -103,6 +107,7 @@ gdn_chunk_prep(const float * q, const float * k, const float * g, const float * 
     __shared__ float sP[C][C + 1];   // Q K^T (scaled)
     __shared__ float sT[C][C + 1];   // (I + L)^-1
     __shared__ float sM[C / 16][16][17];
+    __shared__ float sL[LPRE ? C : 1][LPRE ? C + 1 : 1];
     __shared__ float s_sk[C], s_sq[C], s_beta[C], s_gl[C], s_b[C];
     constexpr int NT = C / 16;                 // token tiles per chunk
     constexpr int NJOB = NT * (NT + 1);        // lower tiles of G and of P
@@ -173,7 +178,7 @@ gdn_chunk_prep(const float * q, const float * k, const float * g, const float * 
     }
     __syncthreads();
 
-#define GDN_L(R, J) (s_beta[R] * expf(s_b[R] - s_b[J]) * sG[R][J])
+#define GDN_L(R, J) (LPRE ? sL[R][J] : (s_beta[R] * expf(s_b[R] - s_b[J]) * sG[R][J]))
 
     const int64_t rep = H / HK;
     for (int64_t m = 0; m < rep; m++) {
@@ -205,6 +210,16 @@ gdn_chunk_prep(const float * q, const float * k, const float * g, const float * 
             s_b[tid] = acc;
         }
         __syncthreads();
+
+        if constexpr (LPRE) {
+            for (int e = tid; e < C * C; e += 256) {
+                const int R = e / C, J = e % C;
+                if (J < R) {
+                    sL[R][J] = s_beta[R] * expf(s_b[R] - s_b[J]) * sG[R][J];
+                }
+            }
+            __syncthreads();
+        }
 
         // diagonal blocks: X_bb = (I + L_bb)^-1, one column per thread
         if (tid < C) {
@@ -281,7 +296,14 @@ gdn_chunk_prep(const float * q, const float * k, const float * g, const float * 
 }
 
 // grid (H, n_seqs, D / (16 * GDN_CH_WAVES)), one wave per 16-column tile
-template <int PREC>
+// OPT (T490, GGML_GDN_CHUNK_OPT), bitmask:
+//   1 = staging with one token per lane and 8-byte LDS stores. The transposed K^T stores (row = key index, column =
+//       token) of the old lane-per-column mapping were 320 B apart per lane = 8-way bank conflicts, ~55 us per call
+//       (ablation with the stores removed: 318 -> 262 us); with lanes over tokens they are consecutive halves.
+//       Bit-exact (same arithmetic, different thread mapping).
+//   2 = (with 1) the output path, Qn S0 and Pm U, runs single f16 instead of the hi/lo triple: no Q/Pm lo parts
+//       (-38 of 162 WMMA per chunk and wave, -10.7 KB LDS). Not bit-exact; it only feeds the layer output, never the state.
+template <int PREC, int OPT>
 __global__ void __launch_bounds__(GDN_CH_WAVES * 32, 1)
 gdn_chunk_scan(const float * q, const float * k, const float * v, const float * curr_state,
                const float * Tbuf, const float * Pbuf, const float * meta,
@@ -350,6 +372,73 @@ gdn_chunk_scan(const float * q, const float * k, const float * v, const float * 
             m_eb[tid]  = expf(bt);
             m_ebc[tid] = expf(bC - bt);
         }
+        if constexpr ((OPT & 1) != 0) {
+            // K, Q rows (scaled by their per-token norm scale): lane = token, wave w = float4 columns 4w..4w+3
+            constexpr int NKQ = C * D / 4 / NTH;
+#pragma unroll
+            for (int jq = 0; jq < NKQ; jq++) {
+                const int     tl = lane;
+                const int     i4 = (w * NKQ + jq) * 4;
+                const int64_t t  = gdn_min64(t0 + tl, tmax);
+                const float4 kx = *reinterpret_cast<const float4 *>(kb + t * sq2 + i4);
+                const float4 qx = *reinterpret_cast<const float4 *>(qb + t * sq2 + i4);
+                const float  skv = Mg[tl * 4 + 0];
+                const float  sqv = Mg[tl * 4 + 1];
+                const float ka[4] = { skv * kx.x, skv * kx.y, skv * kx.z, skv * kx.w };
+                const float qa[4] = { sqv * qx.x, sqv * qx.y, sqv * qx.z, sqv * qx.w };
+                const int ip = swz(tl, i4);
+                gdn_h4 kh4, kl4, qh4, ql4;
+#pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    const _Float16 khr = (_Float16) ka[r];
+                    const _Float16 qhr = (_Float16) qa[r];
+                    kh4[r] = khr;
+                    kl4[r] = (_Float16) (ka[r] - gdn_opaque((float) khr));
+                    qh4[r] = qhr;
+                    if constexpr ((OPT & 2) == 0) {
+                        ql4[r] = (_Float16) (qa[r] - gdn_opaque((float) qhr));
+                    }
+                    sKTh[i4 + r][tl] = khr;
+                    sKTl[i4 + r][tl] = kl4[r];
+                }
+                *reinterpret_cast<gdn_h4 *>(&sKh[tl][ip]) = kh4;
+                *reinterpret_cast<gdn_h4 *>(&sKl[tl][ip]) = kl4;
+                *reinterpret_cast<gdn_h4 *>(&sQh[tl][ip]) = qh4;
+                if constexpr ((OPT & 2) == 0) {
+                    *reinterpret_cast<gdn_h4 *>(&sQl[tl][ip]) = ql4;
+                }
+            }
+            // T, Pm (lower 16x16 blocks only; the others are never read)
+            {
+                const int tl = tid / (C / 4);
+                const int j4 = (tid % (C / 4)) * 4;
+                if (j4 / 16 <= tl / 16) {
+                    const float4 tx = *reinterpret_cast<const float4 *>(Tg + tl * C + j4);
+                    const float4 px = *reinterpret_cast<const float4 *>(Pg + tl * C + j4);
+                    const float ta[4] = { tx.x, tx.y, tx.z, tx.w };
+                    const float pa[4] = { px.x, px.y, px.z, px.w };
+                    gdn_h4 th4, tl4, ph4, pl4;
+#pragma unroll
+                    for (int r = 0; r < 4; r++) {
+                        const _Float16 thr = (_Float16) ta[r];
+                        const _Float16 phr = (_Float16) pa[r];
+                        th4[r] = thr;
+                        tl4[r] = (_Float16) (ta[r] - gdn_opaque((float) thr));
+                        ph4[r] = phr;
+                        if constexpr ((OPT & 2) == 0) {
+                            pl4[r] = (_Float16) (pa[r] - gdn_opaque((float) phr));
+                        }
+                    }
+                    *reinterpret_cast<gdn_h4 *>(&sTh[tl][j4]) = th4;
+                    *reinterpret_cast<gdn_h4 *>(&sTl[tl][j4]) = tl4;
+                    *reinterpret_cast<gdn_h4 *>(&sPh[tl][j4]) = ph4;
+                    if constexpr ((OPT & 2) == 0) {
+                        *reinterpret_cast<gdn_h4 *>(&sPl[tl][j4]) = pl4;
+                    }
+                }
+            }
+        } else {
+        // OPT&1 == 0: the T405 staging, unchanged (lane = column)
         // K, Q rows (scaled by their per-token norm scale), coalesced float4
         for (int e = tid; e < C * D / 4; e += NTH) {
             const int     tl = e / (D / 4);
@@ -396,6 +485,7 @@ gdn_chunk_scan(const float * q, const float * k, const float * v, const float * 
                 sPl[tl][j4 + r] = (_Float16) (pa[r] - gdn_opaque((float) phr));
             }
         }
+        }
         __syncthreads();
         const float * eb  = m_eb;
         const float * ebc = m_ebc;
@@ -417,8 +507,13 @@ gdn_chunk_scan(const float * q, const float * k, const float * v, const float * 
                 const int i0 = swz(tl, ks * 16 + lh);
                 KS[tt] = gdn_mma<PREC>(KS[tt], *reinterpret_cast<const gdn_h8 *>(&sKh[tl][i0]),
                                        *reinterpret_cast<const gdn_h8 *>(&sKl[tl][i0]), bh, bl);
-                QS[tt] = gdn_mma<PREC>(QS[tt], *reinterpret_cast<const gdn_h8 *>(&sQh[tl][i0]),
-                                       *reinterpret_cast<const gdn_h8 *>(&sQl[tl][i0]), bh, bl);
+                if constexpr ((OPT & 2) != 0) {
+                    const gdn_h8 qh = *reinterpret_cast<const gdn_h8 *>(&sQh[tl][i0]);
+                    QS[tt] = gdn_mma<1>(QS[tt], qh, qh, bh, bh);
+                } else {
+                    QS[tt] = gdn_mma<PREC>(QS[tt], *reinterpret_cast<const gdn_h8 *>(&sQh[tl][i0]),
+                                           *reinterpret_cast<const gdn_h8 *>(&sQl[tl][i0]), bh, bl);
+                }
             }
         }
 
@@ -458,8 +553,13 @@ gdn_chunk_scan(const float * q, const float * k, const float * v, const float * 
             gdn_f8 acc = {};
 #pragma unroll
             for (int jt = 0; jt <= tt; jt++) {
-                acc = gdn_mma<PREC>(acc, *reinterpret_cast<const gdn_h8 *>(&sPh[tt * 16 + ln][jt * 16 + lh]),
-                                    *reinterpret_cast<const gdn_h8 *>(&sPl[tt * 16 + ln][jt * 16 + lh]), Bh[jt], Bl[jt]);
+                if constexpr ((OPT & 2) != 0) {
+                    const gdn_h8 ph = *reinterpret_cast<const gdn_h8 *>(&sPh[tt * 16 + ln][jt * 16 + lh]);
+                    acc = gdn_mma<1>(acc, ph, ph, Bh[jt], Bh[jt]);
+                } else {
+                    acc = gdn_mma<PREC>(acc, *reinterpret_cast<const gdn_h8 *>(&sPh[tt * 16 + ln][jt * 16 + lh]),
+                                        *reinterpret_cast<const gdn_h8 *>(&sPl[tt * 16 + ln][jt * 16 + lh]), Bh[jt], Bl[jt]);
+                }
             }
 #pragma unroll
             for (int r = 0; r < 8; r++) {
@@ -519,6 +619,14 @@ static int gdn_chunk_min_tokens() {
     return m ? atoi(m) : 64;
 }
 
+// T490: GGML_GDN_CHUNK_OPT bitmask, default 0 = the T405 kernels unchanged; 1 = scan staging without bank conflicts
+// (bit-exact), 2 (implies 1) = single-f16 output path (not bit-exact), 4 = prep L table (not bit-exact)
+static int gdn_chunk_opt() {
+    const char * e = getenv("GGML_GDN_CHUNK_OPT");
+    const int v = e ? atoi(e) : 0;
+    return v < 0 ? 0 : ((v & 2) ? 2 : 0) | ((v & 3) ? 1 : 0) | (v & 4);
+}
+
 static int gdn_chunk_prec() {
     const char * e = getenv("GGML_GDN_CHUNK_PREC");
     return e && atoi(e) == 1 ? 1 : 3;
@@ -545,6 +653,8 @@ static bool gdn_chunk_launch(ggml_backend_cuda_context & ctx, cudaStream_t strea
     }
     static const bool trace = getenv("GGML_GDN_CHUNK_TRACE") != nullptr;
     const int prec = gdn_chunk_prec();
+    const int opt  = gdn_chunk_opt();
+    const int sopt = prec == 1 ? 0 : (opt & 3);
     if (trace) {
         GGML_LOG_INFO("gdn_chunk: n_tokens=%lld of %lld K=%d H=%lld n_seqs=%lld fused_ba=%d l2norm=%d prec=%d\n",
             (long long) n_tokens, (long long) dst_tokens, K, (long long) H, (long long) n_seqs, (int) fused_ba,
@@ -559,22 +669,27 @@ static bool gdn_chunk_launch(ggml_backend_cuda_context & ctx, cudaStream_t strea
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
 
     const dim3 pgrid(n_chunks, neqk1, n_seqs);
-#define GDN_PREP(FB, L2) gdn_chunk_prep<FB, L2><<<pgrid, 256, 0, stream>>>(q_d, k_d, g_d, b_d, \
+#define GDN_PREP_L(FB, L2, LP) gdn_chunk_prep<FB, L2, LP><<<pgrid, 256, 0, stream>>>(q_d, k_d, g_d, b_d, \
         Tbuf.get(), Pbuf.get(), meta.get(), H, neqk1, n_tokens, n_chunks, sq1, sq2, sq3, sb1, sb2, sb3, \
         rq3_magic, ssm_dt_d, ssm_a_d, l2norm_eps)
+#define GDN_PREP(FB, L2) if ((opt & 4) != 0) { GDN_PREP_L(FB, L2, true); } else { GDN_PREP_L(FB, L2, false); }
     if (fused_ba) {
         if (l2norm_qk) { GDN_PREP(true, true); } else { GDN_PREP(true, false); }
     } else {
         if (l2norm_qk) { GDN_PREP(false, true); } else { GDN_PREP(false, false); }
     }
 #undef GDN_PREP
+#undef GDN_PREP_L
     CUDA_CHECK(cudaGetLastError());
 
     const dim3 sgrid(H, n_seqs, GDN_CH_D / (16 * GDN_CH_WAVES));
-#define GDN_SCAN(P) gdn_chunk_scan<P><<<sgrid, GDN_CH_WAVES * 32, 0, stream>>>(q_d, k_d, v_d, s_d, \
+#define GDN_SCAN(P, O) gdn_chunk_scan<P, O><<<sgrid, GDN_CH_WAVES * 32, 0, stream>>>(q_d, k_d, v_d, s_d, \
         Tbuf.get(), Pbuf.get(), meta.get(), dst_d, state_d, H, n_tokens, dst_tokens, n_chunks, \
         sq1, sq2, sq3, sv1, sv2, sv3, neqk1_magic, rq3_magic, scale)
-    if (prec == 1) { GDN_SCAN(1); } else { GDN_SCAN(3); }
+    if (prec == 1) { GDN_SCAN(1, 0); }
+    else if (sopt == 3) { GDN_SCAN(3, 3); }
+    else if (sopt == 1) { GDN_SCAN(3, 1); }
+    else { GDN_SCAN(3, 0); }
 #undef GDN_SCAN
     CUDA_CHECK(cudaGetLastError());
     return true;
