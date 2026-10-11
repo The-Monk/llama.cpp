@@ -47,10 +47,51 @@ static bool eval_once(const char * path, int ngl, int load_mode, std::vector<flo
     const llama_vocab * v = llama_model_get_vocab(model);
     const int nv = llama_vocab_n_tokens(v);
     nv_out = nv;
+    // varied, non-repeating prose (an exactly repeating prompt makes the model near-deterministic and the KLD of a perturbed run unrepresentative)
+    static const char * S[] = {
+        "The committee met on Tuesday to review the proposed changes to the municipal water supply contract. ",
+        "Chlorophyll absorbs light most strongly in the blue and red parts of the spectrum, which is why leaves look green. ",
+        "After three weeks of rain the river burst its banks and flooded the lower fields near the mill. ",
+        "A binary search tree keeps its keys ordered, so lookups take time proportional to the height of the tree. ",
+        "She opened the letter slowly, afraid of what her brother might have written from the front. ",
+        "The central bank raised interest rates by a quarter of a percentage point, citing persistent inflation in services. ",
+        "Mount Kilimanjaro, the highest peak in Africa, has lost most of its glaciers over the past century. ",
+        "To make the sauce, melt the butter, whisk in the flour, and add the milk a little at a time. ",
+        "Early telescopes suffered from chromatic aberration, which smeared the image of bright stars with coloured halos. ",
+        "The defence argued that the evidence had been collected without a proper warrant and should be excluded. ",
+        "Honeybees communicate the location of flowers to their hive mates through a dance performed on the comb. ",
+        "When the train finally pulled into the station, the platform was empty except for an old man with a violin case. ",
+        "Quantum error correction encodes one logical qubit into many physical qubits so that local noise can be detected. ",
+        "The museum's new wing, designed by a Danish architect, opens to the public in the spring of next year. ",
+        "In 1859 a solar storm set telegraph offices on fire and produced auroras visible as far south as the Caribbean. ",
+        "He had never liked the city, with its crowds and its noise, but the job paid well and the flat was cheap. ",
+        "Sourdough starter is a living culture of wild yeast and lactic acid bacteria that must be fed regularly. ",
+        "The expedition ran out of fresh water on the ninth day and was forced to turn back toward the coast. ",
+        "A well-written unit test fails for exactly one reason and tells you which behaviour has stopped working. ",
+        "Volcanic islands rise from the sea floor over millions of years, then slowly erode and sink beneath the waves. ",
+        "The orchestra tuned to the oboe, and a hush fell over the hall as the conductor raised his baton. ",
+        "Researchers found that sleep deprivation impairs the consolidation of memories formed earlier in the day. ",
+        "The village council voted to repair the bridge rather than build a new one, to the relief of the farmers. ",
+        "Prime numbers become sparser as they grow, yet there are infinitely many of them, as Euclid proved. ",
+        "On the last night of the festival the streets filled with lanterns, drums, and the smell of roasting chestnuts. ",
+        "The compiler inlines small functions, unrolls short loops, and removes code that can never be reached. ",
+        "Her grandmother kept bees, grew beans along the fence, and could name every bird by its song alone. ",
+        "Tides are caused mainly by the gravitational pull of the moon, with a smaller contribution from the sun. ",
+        "The negotiators worked through the night, but by morning the two delegations were still far apart on fishing quotas. ",
+        "Copper conducts electricity well, resists corrosion, and has been worked by humans for roughly ten thousand years. ",
+        "A heavy fog settled over the moor, and the shepherd followed the stone wall home by touch alone. ",
+        "The library reduced its opening hours in winter, which drew complaints from students preparing for examinations. ",
+        "Neural networks trained on large corpora can complete sentences, translate languages, and summarise long documents. ",
+        "He folded the map along its worn creases and tucked it into his coat before climbing the last ridge. ",
+        "Glaciers carve broad U-shaped valleys, leaving behind moraines, lakes, and long ridges of gravel when they retreat. ",
+        "The bakery on the corner sells out of rye bread by nine o'clock, so regulars arrive before the doors open. ",
+        "A sudden gust scattered the papers across the courtyard, and the clerks chased them between the fountains. ",
+        "Economists disagree about whether the minimum wage reduces employment, and the evidence depends on the region studied. ",
+        "The astronaut described the silence of space as unlike any silence on Earth, full of the hum of the machines. ",
+        "Rust forms when iron reacts with oxygen and water, and salt in the air speeds the reaction considerably. ",
+    };
     std::string text;
-    for (int i = 0; i < 40; ++i)
-        text += "In the old harbour town the lighthouse keeper counted ships, wrote letters to his sister, and "
-                "repaired the lamp every evening while storms rolled in from the grey northern sea. ";
+    for (const char * s : S) text += s;
     auto all = tok(v, text);
     if (all.size() < 256 + 16 + 8) { fprintf(stderr, "FAIL: text too short\n"); return false; }
     auto cp = llama_context_default_params();
@@ -78,9 +119,10 @@ static bool load(const char * f, int & nv, std::vector<float> & rows) {
 }
 
 // mean KLD(P_a || P_b) over rows (a = base) and top-1 agreement
-static void kld(const std::vector<float> & a, const std::vector<float> & b, int nv, double & mean, double & top1) {
+static void kld(const std::vector<float> & a, const std::vector<float> & b, int nv, double & mean, double & top1, std::vector<double> * per_row = nullptr) {
     const size_t R = a.size() / nv;
     mean = 0; top1 = 0;
+    if (per_row) per_row->assign(R, 0.0);
     for (size_t r = 0; r < R; ++r) {
         const float * la = &a[r * nv], * lb = &b[r * nv];
         double ma = -1e300, mb = -1e300;
@@ -91,6 +133,7 @@ static void kld(const std::vector<float> & a, const std::vector<float> & b, int 
         const double lza = std::log(za) + ma, lzb = std::log(zb) + mb;
         double k = 0;
         for (int i = 0; i < nv; ++i) { const double pa = std::exp(la[i] - lza); if (pa > 0) k += pa * ((la[i] - lza) - (lb[i] - lzb)); }
+        if (per_row) (*per_row)[r] = k;
         mean += k; top1 += ia == ib;
     }
     mean /= R; top1 /= R;
@@ -105,8 +148,12 @@ int main(int argc, char ** argv) {
         if (argc < 5 || !load(argv[2], nva, a) || !load(argv[3], nvb, b) || nva != nvb || a.size() != b.size() || a.empty()) { printf("FAIL cmp: cannot read the inputs\n"); return 1; }
         const bool same = memcmp(a.data(), b.data(), a.size() * 4) == 0;
         double mk, t1;
-        kld(a, b, nva, mk, t1);
+        std::vector<double> pr;
+        kld(a, b, nva, mk, t1, &pr);
         printf("CMP mean_kld=%.6f top1=%.4f bit_identical=%d (%zu positions)\n", mk, t1, (int) same, a.size() / nva);
+        auto seg = [&](const char * n, size_t lo, size_t hi) { double m = 0; for (size_t i = lo; i < hi && i < pr.size(); ++i) m += pr[i]; printf("  %s kld=%.6f", n, m / (hi - lo)); };
+        seg("prefill-tail[0..16)", 0, 16); seg("decode N=1[16..32)", 16, 32); seg("verify N=4[32..40)", 32, 40);
+        printf("\n");
         const std::string mode = argv[4];
         if (mode == "equal") return same ? 0 : (printf("FAIL expected bit-identical\n"), 1);
         if (mode == "close") { const double mx = argc >= 6 ? atof(argv[5]) : 1.0; return mk <= mx ? 0 : (printf("FAIL mean KLD %.6f > %.6f\n", mk, mx), 1); }
