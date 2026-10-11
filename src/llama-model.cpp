@@ -1537,6 +1537,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the input layer
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // T491 (LLAMA_INPUT_ON_GPU, default off): with every repeating layer offloaded, keep the input layer (token embedding) on layer 0's device.
+    // On the CPU, the embedding rows are produced on the host and copied to the device as a 21 MB non-input split, which
+    // forces a full device synchronization and a pageable H2D copy at the start of EVERY ubatch while the GPU sits idle
+    // (~1.9 ms per ubatch, measured); on the device the only user inputs are the 4 KB token ids.
+    {
+        const char * e = getenv("LLAMA_INPUT_ON_GPU");
+        if (e != nullptr && atoi(e) != 0 && act_gpu_layers >= (int) n_layer_all && n_layer_all > 0 && n_devices() > 0) {
+            pimpl->dev_input = get_layer_buft_list(0);
+        }
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
