@@ -286,13 +286,13 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
         return !e || atoi(e) != 0 || (g && atoi(g) != 0);   // ADDNORM default ON, =0 disables
     }();
     const bool pin_order = hfuse_pin || (b2_order && ubatch.n_tokens > 1);
-    // T508 GGML_GDN_CONV_ZFIRST (default off): emit the z matmul BEFORE the qkv matmul so the GDN conv that reads qkv runs right behind it.
+    // T508 GGML_GDN_CONV_ZFIRST (default ON, =0 disables): emit the z matmul BEFORE the qkv matmul so the GDN conv that reads qkv runs right behind it.
     // With qkv first (the T439 order) the z GEMM (25 MB output + its weight stream) sits between the qkv GEMM and the conv: the conv kernel went
     // 145 -> 175 us per call (wrx90 kernel trace; ADDNORM_FUSE=0 gives 148, the T483 tap order gives no change). The mechanism (the z GEMM
     // evicting the qkv output from the MALL) is INFERRED. Same nodes, same math; only the order of independent nodes changes.
     static const bool z_first = [] {
         const char * e = getenv("GGML_GDN_CONV_ZFIRST");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;   // default ON, =0 disables
     }();
     ggml_tensor * qkv_raw = qkv_mixed;
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
@@ -582,9 +582,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         cb(conv_state, "conv_state_inplace_view", il);
 
         const int32_t l2_n = gdn_glue_l2 ? (int32_t) (2 * head_k_dim * num_k_heads) : 0;
-        // T508 GGML_GDN_CONV_SEQ=1 (default off): the conv overwrites its input (qkv_mixed has no other reader on this path) with a
+        // T508 GGML_GDN_CONV_SEQ (default ON, =0 disables): the conv overwrites its input (qkv_mixed has no other reader on this path) with a
         // one-thread-per-channel sequential kernel; the 84 MB read+write footprint becomes 42 MB. d_conv == 4, no L2 fold.
-        const bool gdn_conv_seq = gdn_env_on("GGML_GDN_CONV_SEQ") && l2_n == 0 && conv_kernel_size == 4 && ggml_is_contiguous(qkv_mixed);
+        const char * conv_seq_env = getenv("GGML_GDN_CONV_SEQ");   // default ON, =0 disables
+        const bool gdn_conv_seq = (conv_seq_env == nullptr || atoi(conv_seq_env) != 0) && l2_n == 0 && conv_kernel_size == 4 && ggml_is_contiguous(qkv_mixed);
         conv_output_silu = gdn_conv_seq ?
             ggml_ssm_conv_update_ext_inplace(ctx0, conv_state, qkv_mixed, conv_kernel, true, inp->mctx->get_rs_z() >= 0) :
             ggml_ssm_conv_update_ext(ctx0, conv_state, qkv_mixed, conv_kernel, true,
