@@ -4262,7 +4262,7 @@ static int ggml_cuda_find_mmvq_group(const ggml_cgraph * cgraph, int i, int cc, 
 // (ssm_beta / ssm_alpha, BF16 48x5120, N >= 64 tokens) run as ONE WMMA launch that converts the activation in registers,
 // replacing the shared fp32->bf16 conversion and the two small GEMMs. Returns the partner node index or -1.
 static int ggml_cuda_find_ab_pair(const ggml_cgraph * cgraph, int i, int cc) {
-    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_B2_ABPAIR"); return e == nullptr || atoi(e) != 0; }();   // default ON, =0 disables
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_B2_ABPAIR"); return e != nullptr && atoi(e) != 0; }();   // default OFF: +0.3% over the T492 NORM_BF16 path, not bit-exact (KLD 0.00054 = the ulp floor)
     if (!enabled) {
         return -1;
     }
@@ -4571,14 +4571,17 @@ static int ggml_cuda_try_addnorm(ggml_backend_cuda_context * cuda_ctx, ggml_cgra
             na.pre_added = cuda_ctx->res_done && cuda_ctx->res_add == add;
             if (norm_shared && ggml_cuda_b2_norm_bf16_enabled() && !(mulw->flags & GGML_TENSOR_FLAG_OUTPUT)) {
                 // every other reader of the normalized row must be a BF16-weight MUL_MAT on it (GDN ssm_beta / ssm_alpha), so no fp32 copy is needed
-                int n = 0, last = 0;
+                int n = 0, first = -1, last = 0;
                 for (int j = i + 6; j < cgraph->n_nodes && j <= i + 96; ++j) {
                     const ggml_tensor * nd = cgraph->nodes[j];
                     if (nd->op == GGML_OP_MUL_MAT && nd->src[1] == mulw && nd->src[0]->type == GGML_TYPE_BF16 && nd->src[2] == nullptr) {
+                        if (first < 0) { first = j; }
                         n++; last = j;
                     }
                 }
-                if (n > 0 && n == ggml_node_get_use_count(cgraph, i + 2) - 1 && mulw->ne[1] >= 64 && mulw->ne[2] == 1 && mulw->ne[3] == 1) {
+                // T491: the GGML_CUDA_B2_ABPAIR launch reads the FP32 normalized row (it converts in registers), so the fp32 copy must stay when it takes the siblings
+                const bool ab_takes = first > 0 && ggml_cuda_find_ab_pair(cgraph, first, ggml_cuda_info().devices[cuda_ctx->device].cc) > first;
+                if (n > 0 && !ab_takes && n == ggml_node_get_use_count(cgraph, i + 2) - 1 && mulw->ne[1] >= 64 && mulw->ne[2] == 1 && mulw->ne[3] == 1) {
                     na.bf16_n = n; na.bf16_end = last;
                 }
             }
