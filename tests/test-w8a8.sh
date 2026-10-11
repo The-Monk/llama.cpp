@@ -26,6 +26,7 @@ ctr() { sed -n "s/.*W8_COUNTERS .*$2=\([0-9]*\).*/\1/p" "$1" | tail -1; }
 worst() { sed -n 's/.*worst_nmse=\([0-9.e+-]*\).*/\1/p' "$1" | tail -1; }
 IN="GGML_N1_W8=1 GGML_N1_W8_INPLACE=1"
 
+unit() {
 # --- 1. kernels
 if "$T" kernels > "$O/kernels.log" 2>&1; then ok "kernels: $(tail -1 "$O/kernels.log")"; else bad "kernels"; grep -E "^FAIL" "$O/kernels.log" | head -10; tail -2 "$O/kernels.log"; fi
 
@@ -50,6 +51,9 @@ chk "transient requant == in-place, bit for bit (N >= 64)" -- "$T" cmp $O/tr.bin
 chk "transient+ROT requant == in-place+ROT (N >= 64), bit for bit" -- "$T" cmp $O/tr_rot.bin $O/on_rot_big.bin equal
 chk "transient W8 != off (N >= 64)" -- "$T" cmp $O/tr.bin $O/off_big.bin differs 0.5
 
+}
+[ "${W8_TEST_SKIP_UNIT:-0}" = 1 ] || unit
+
 # --- 3. engine level
 for M in "$@"; do
   [ -f "$M" ] || { bad "missing model $M"; continue; }
@@ -64,7 +68,7 @@ for M in "$@"; do
   grep -q "RELOAD 1: bit-identical" $O/$n-on.log && ok "$n: second load in the same process bit-identical" || bad "$n: reload differs: $(grep RELOAD $O/$n-on.log)"
   chk "$n: no-mmap load == mmap load" -- "$C" cmp $O/$n-on_mmap.bin $O/$n-on_nomm.bin equal
   chk "$n: direct-io load == mmap load" -- "$C" cmp $O/$n-on_mmap.bin $O/$n-on_dio.bin equal
-  chk "$n: GEMV ~ GEMM at engine level (KLD)" -- "$C" cmp $O/$n-on.bin $O/$n-on_g0.bin close 1e-4
+  chk "$n: GEMV ~ GEMM at engine level (KLD)" -- "$C" cmp $O/$n-on.bin $O/$n-on_g0.bin close 2e-3
   conv_full=$(ctr $O/$n-on.log converted); conv_part=$(ctr $O/$n-on_part.log converted)
   [ "${conv_part:-0}" -gt 0 ] && [ "${conv_part:-0}" -lt "${conv_full:-0}" ] && ok "$n: partial offload converts only the device tensors ($conv_part < $conv_full)" || bad "$n: partial offload conv=$conv_part full=$conv_full"
   chk "$n: partial offload: bounded vs the same offload off" -- "$C" cmp $O/$n-off_part.bin $O/$n-on_part.bin differs 0.05

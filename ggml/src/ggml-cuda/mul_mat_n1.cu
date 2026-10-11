@@ -1159,12 +1159,15 @@ const w8_w * w8_cached(const ggml_tensor * src0, bool rot) {
 // T513 refusals, every one static (a tensor's answer never changes, the fusions and the router must agree): only a whole tensor in a plain
 // device buffer is rewritten (never a view: the write covers F*K + 4F bytes from data and would clobber the neighbours; never a split-buffer
 // tensor, whose data pointer is not real; never host / mmap'd / pinned memory, so the GGUF on disk and host copies are never touched),
-// and never the embedding table (GET_ROWS reads it as Q8_0; tied output heads share it).
+// and never the embedding table (GET_ROWS reads it as Q8_0; tied output heads share it). Only buffers the model loader marked USAGE_WEIGHTS: with
+// partial / no offload the scheduler copies a CPU-resident weight into a reused device COMPUTE buffer for large batches, and an address-keyed
+// "already converted" table would then treat the next weight copied to that address as converted (garbage, measured KLD 11.9). Those copies take
+// the transient (per-call requant) route instead.
 bool w8_eligible(const ggml_tensor * t) {
     return env().on && env().w8 && env().w8_inplace && t->type == GGML_TYPE_Q8_0 && t->ne[2] == 1 && t->ne[3] == 1 &&
         t->ne[0] % 128 == 0 && t->ne[1] % N1_BF == 0 && ggml_is_contiguous(t) && strstr(t->name, "token_embd") == nullptr &&
         t->view_src == nullptr && t->extra == nullptr && t->buffer && !ggml_backend_buffer_is_host(t->buffer) &&
-        ggml_cuda_buffer_is_plain_device(t->buffer);
+        ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && ggml_cuda_buffer_is_plain_device(t->buffer);
 }
 
 // Converts the Q8_0 tensor in place to [tiled int8 stream F*K][fp32 row scales F] (never larger than the Q8_0 bytes, K >= 64):

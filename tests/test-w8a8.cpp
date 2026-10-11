@@ -116,6 +116,7 @@ static int run_op(const char * outf, const std::vector<int> & Ns) {
         ggml_tensor * w = ggml_new_tensor_2d(c, GGML_TYPE_Q8_0, K, F);
         ggml_set_name(w, "blk.0.ffn_up.weight");
         ggml_backend_buffer_t wb = ggml_backend_alloc_ctx_tensors(c, be);
+        ggml_backend_buffer_set_usage(wb, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);   // what the model loader does; the in-place route requires it
         std::vector<float> wf((size_t) F * K);
         for (auto & v : wf) v = 0.02f * nd(rng);
         std::vector<uint8_t> wq(ggml_row_size(GGML_TYPE_Q8_0, K) * F);
