@@ -6156,26 +6156,62 @@ static bool ggml_cuda_m3_fwht_quant_impl(ggml_backend_cuda_context * ctx, ggml_c
         return false;
     }
     // use lists of this graph evaluation (tensor -> indices of the nodes that read it, one entry per src slot), built once per
-    // evaluation: the per-site forward scans cost ~10 ms of host time per 1024-token graph at 257 sites
-    static thread_local struct { uint64_t gen = ~0ull; const ggml_cgraph * cg = nullptr; std::unordered_map<const ggml_tensor *, std::vector<int>> users; } ug;
+    // evaluation: the per-site forward scans cost ~10 ms of host time per 1024-token graph at 257 sites.
+    // T491: built into flat arrays with an open-addressing pointer table instead of unordered_map<ptr, vector<int>> (the first call of
+    // every ubatch happens while the device is idle, and the map build cost ~350 us there). GGML_CUDA_B2_USERS_FAST=0 restores the map.
+    static const bool users_fast = [] { const char * e = getenv("GGML_CUDA_B2_USERS_FAST"); return e == nullptr || atoi(e) != 0; }();
+    static thread_local struct {
+        uint64_t gen = ~0ull; const ggml_cgraph * cg = nullptr; std::unordered_map<const ggml_tensor *, std::vector<int>> users;
+        std::vector<const ggml_tensor *> key; std::vector<int32_t> head, next, node; size_t mask = 0;
+    } ug;
     if (ug.gen != ctx->act_eval_gen || ug.cg != cgraph) {
-        ug.gen = ctx->act_eval_gen; ug.cg = cgraph; ug.users.clear();
-        ug.users.reserve(cgraph->n_nodes * 2);
-        for (int j = 0; j < cgraph->n_nodes; ++j) {
-            const ggml_tensor * nd = cgraph->nodes[j];
-            for (int k = 0; k < GGML_MAX_SRC; ++k) {
-                if (nd->src[k]) {
-                    ug.users[nd->src[k]].push_back(j);
+        ug.gen = ctx->act_eval_gen; ug.cg = cgraph;
+        if (users_fast) {
+            size_t cap = 1;
+            while (cap < (size_t) cgraph->n_nodes * 4) { cap <<= 1; }
+            ug.key.assign(cap, nullptr); ug.head.assign(cap, -1); ug.mask = cap - 1;
+            ug.next.clear(); ug.node.clear(); ug.next.reserve((size_t) cgraph->n_nodes * 4); ug.node.reserve((size_t) cgraph->n_nodes * 4);
+            // descending (node, slot) insertion at the list head: traversal yields the original ascending order
+            for (int j = cgraph->n_nodes - 1; j >= 0; --j) {
+                const ggml_tensor * nd = cgraph->nodes[j];
+                for (int k = GGML_MAX_SRC - 1; k >= 0; --k) {
+                    const ggml_tensor * t = nd->src[k];
+                    if (!t) { continue; }
+                    size_t h = (size_t) (((uintptr_t) t >> 4) * 0x9E3779B97F4A7C15ull >> 20) & ug.mask;
+                    while (ug.key[h] != nullptr && ug.key[h] != t) { h = (h + 1) & ug.mask; }
+                    ug.key[h] = t;
+                    ug.next.push_back(ug.head[h]);
+                    ug.node.push_back(j);
+                    ug.head[h] = (int32_t) ug.next.size() - 1;
+                }
+            }
+        } else {
+            ug.users.clear();
+            ug.users.reserve(cgraph->n_nodes * 2);
+            for (int j = 0; j < cgraph->n_nodes; ++j) {
+                const ggml_tensor * nd = cgraph->nodes[j];
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    if (nd->src[k]) {
+                        ug.users[nd->src[k]].push_back(j);
+                    }
                 }
             }
         }
     }
-    const auto find_users = [&](const ggml_tensor * t) -> const std::vector<int> & {
-        static const std::vector<int> none;
+    const auto find_users = [&](const ggml_tensor * t) -> std::vector<int> {
+        if (users_fast) {
+            std::vector<int> r;
+            size_t h = (size_t) (((uintptr_t) t >> 4) * 0x9E3779B97F4A7C15ull >> 20) & ug.mask;
+            while (ug.key[h] != nullptr && ug.key[h] != t) { h = (h + 1) & ug.mask; }
+            if (ug.key[h] == t) {
+                for (int32_t e = ug.head[h]; e >= 0; e = ug.next[e]) { r.push_back(ug.node[e]); }
+            }
+            return r;
+        }
         const auto it = ug.users.find(t);
-        return it == ug.users.end() ? none : it->second;
+        return it == ug.users.end() ? std::vector<int>() : it->second;
     };
-    const std::vector<int> & mm_users = find_users(mm);
+    const std::vector<int> mm_users = find_users(mm);
     int jrs = -1;
     for (const int j : mm_users) {
         const ggml_tensor * nd = cgraph->nodes[j];
