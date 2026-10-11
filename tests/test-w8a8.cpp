@@ -32,7 +32,7 @@ struct shape { int K, F; const char * why; };
 static const shape SHAPES[] = {
     {5120, 5120, "q8 qwen38 attn"}, {5120, 1024, "qwen38 kv"}, {5120, 17408, "qwen38 ffn up/gate"}, {17408, 5120, "qwen38 ffn down"},
     {6144, 6144, "qwen38 6144"}, {4096, 4096, "8B attn"}, {4096, 1024, "8B kv"}, {4096, 14336, "llama8b ffn"}, {14336, 4096, "llama8b down"},
-    {12288, 4096, "qwen3-8b down"}, {13824, 5120, "qwen2.5-14b down (K % 1024 != 0)"}, {128, 128, "minimum"}, {256, 384, "tiny odd tiles"},
+    {12288, 4096, "qwen3-8b down"}, {13824, 5120, "qwen2.5-14b down (512-block rotation)"}, {3584, 3584, "qwen2.5-7b hidden (512-block)"}, {18944, 3584, "qwen2.5-7b ffn down (256-block, 74 blocks)"}, {2688, 1024, "128-block (K = 21 x 128)"}, {128, 128, "minimum"}, {256, 384, "tiny odd tiles"},
 };
 static const int NS[] = {1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 63, 64, 65, 100, 127, 128, 129, 255, 256, 257, 384};
 
@@ -159,7 +159,7 @@ static int run_op(const char * outf, const std::vector<int> & Ns) {
             }
             const double nmse = num / den;
             worst_all = std::max(worst_all, nmse);
-            if (K % 1024 == 0) worst = std::max(worst, nmse);   // the rotation needs K % 1024 == 0
+            worst = std::max(worst, nmse);
             fwrite(yo.data(), sizeof(float), yo.size(), fo);
             printf("op K=%-5d F=%-5d N=%-4d nmse_vs_double=%.3e\n", K, F, N, nmse);
             ggml_backend_buffer_free(gb);

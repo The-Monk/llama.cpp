@@ -82,7 +82,7 @@ struct n1_env {
     bool    w8 = false;        // GGML_N1_W8=1 (T505, default OFF, DIFFERENT MATH, KLD-gated): Q8_0 prefill MUL_MATs on the per-channel W8A8 GEMM
                                // (Q8_0 requantised to ONE int8 scale per output row + per-token int8 activation, full-K int32 accumulation)
     int     w8_kernel = 1;     // GGML_N1_W8_KERNEL: 0 = gemm_iu8<RS=0,FL=0> (the ROW kernel), 1 = gemm_fold W8 variant (M3 class)
-    bool    w8_rot = false;      // GGML_N1_W8_ROT=1: signed 1024-block Hadamard rotation of the activation, folded into the int8 weights (QuaRot-style, data-free; K % 1024 == 0)
+    bool    w8_rot = false;      // GGML_N1_W8_ROT=1: signed Hadamard rotation (blocks of 1024, else 512 / 256 / 128 when K is not a multiple of 1024) of the activation, folded into the int8 weights (QuaRot-style, data-free)
     char    w8_iso = 0;         // GGML_N1_W8_ISO=w|a: KLD isolation arms (weights-only / activations-only error through the stock mmq path); transient mode only
     int     w8_check_every = 1; // GGML_N1_W8_CHECK_EVERY=<m>: check one call in m
     int     w8_check = 0;     // GGML_N1_W8_CHECK=<n>: debug, compare both W8 kernels against an integer reference on the first n calls
@@ -451,7 +451,7 @@ struct w8_w { void * w = nullptr; void * rs = nullptr; size_t bytes = 0; };
 std::unordered_map<const void *, w8_w> g_w8;
 std::unordered_set<const void *> g_w8_refused;
 size_t g_w8_bytes = 0;
-std::unordered_map<const void *, bool> g_w8_inpl;   // GGML_N1_W8_INPLACE: tensors converted in place (data pointer -> converted with the Hadamard rotation)
+std::unordered_map<const void *, int> g_w8_inpl;   // GGML_N1_W8_INPLACE: tensors converted in place (data pointer -> rotation block they were converted with, 0 = none)
 
 void n1_invalidate(const void * base, size_t size) {
     std::lock_guard<std::mutex> lk(g_mtx);
@@ -1120,12 +1120,196 @@ __global__ void k_w8_rot_quant_act(const char * __restrict__ src, size_t nb1, in
     }
 }
 
-void w8_requant(const ggml_tensor * src0, void * wout, float * rs, hipStream_t st, bool rot = false) {
+// ---- T513: the same rotation on smaller blocks for K % 1024 != 0 (Qwen2.5: ffn 13824 = 27 x 512, 18944 = 74 x 256, hidden 3584 = 7 x 512).
+// rb in {512, 256, 128}: one warp per rb-block, lane j holds the R = rb / 32 consecutive elements j*R..j*R+R-1 (all inside one Q8_0 block), butterflies
+// over the low log2(R) bits in the lane and the five lane bits through shuffles, scaled by 1/sqrt(rb). rb = 1024 keeps the kernels above untouched.
+template <int R>
+__device__ __forceinline__ void w8_fwhtb(float (&reg)[R], const int lane) {
+#pragma unroll
+    for (int h = 1; h < R; h *= 2) {
+#pragma unroll
+        for (int j = 0; j < R; j += 2 * h) {
+#pragma unroll
+            for (int k = 0; k < h; ++k) {
+                const float x = reg[j + k], y = reg[j + k + h];
+                reg[j + k] = x + y;
+                reg[j + k + h] = x - y;
+            }
+        }
+    }
+#define W8B_LANE_STAGE(B)                                                                          \
+    _Pragma("unroll") for (int j = 0; j < R; ++j) {                                                \
+        const float val = reg[j], val2 = __shfl_xor(val, B, 32);                                   \
+        reg[j] = (lane & (B)) == 0 ? val + val2 : val2 - val;                                      \
+    }
+    W8B_LANE_STAGE(1) W8B_LANE_STAGE(2) W8B_LANE_STAGE(4) W8B_LANE_STAGE(8) W8B_LANE_STAGE(16)
+#undef W8B_LANE_STAGE
+    constexpr float sc = R == 16 ? 0.044194174f : (R == 8 ? 0.0625f : 0.088388348f);   // 1 / sqrt(32 R)
+#pragma unroll
+    for (int j = 0; j < R; ++j) reg[j] *= sc;
+}
+
+template <int R>
+__device__ __forceinline__ void w8b_load_w(const char * rw, int b, const int lane, float (&reg)[R]) {
+    constexpr int RB = 32 * R;
+    const int k0 = b * RB + lane * R;
+    const char * blk = rw + (size_t) (k0 >> 5) * sizeof(block_q8_0);
+    __half dh; memcpy(&dh, blk, sizeof(dh));
+    const float d = __half2float(dh);
+    const uint16_t * q16 = (const uint16_t *) (blk + 2 + (k0 & 31));
+#pragma unroll
+    for (int i = 0; i < R / 2; ++i) {
+        const uint32_t p = q16[i];
+        reg[2 * i]     = d * (float) (int8_t) (p & 0xFFu) * w8_sgn(k0 + 2 * i);
+        reg[2 * i + 1] = d * (float) (int8_t) (p >> 8) * w8_sgn(k0 + 2 * i + 1);
+    }
+    w8_fwhtb<R>(reg, lane);
+}
+
+template <int R>
+__global__ void k_w8b_rowscale(const char * __restrict__ w, size_t nb01, int K, float * __restrict__ rowS) {
+    constexpr int RB = 32 * R;
+    const char * rw = w + (size_t) blockIdx.x * nb01;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    float amax = 0.f;
+    for (int b = warp; b < K / RB; b += nw) {
+        float reg[R];
+        w8b_load_w<R>(rw, b, lane, reg);
+#pragma unroll
+        for (int j = 0; j < R; ++j) amax = fmaxf(amax, fabsf(reg[j]));
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor(amax, o, 32));
+    __shared__ float red[32];
+    if (lane == 0) red[warp] = amax;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = 0.f;
+        for (int i = 0; i < nw; ++i) m = fmaxf(m, red[i]);
+        rowS[blockIdx.x] = m > 0.f ? m * (1.0f / 127.0f) : 1.0f;
+    }
+}
+
+template <int R>
+__global__ void k_w8b_pack(const char * __restrict__ w, size_t nb01, int K, const float * __restrict__ rowS, char * __restrict__ out) {
+    constexpr int RB = 32 * R;
+    const int row = blockIdx.x, S = K / 128;
+    const char * rw = w + (size_t) row * nb01;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    const float inv = 1.0f / rowS[row];
+    for (int b = warp; b < K / RB; b += nw) {
+        float reg[R];
+        w8b_load_w<R>(rw, b, lane, reg);
+        const int k0 = b * RB + lane * R;
+#pragma unroll
+        for (int i = 0; i < R / 4; ++i) {
+            uint32_t v = 0;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float x = rintf(reg[4 * i + e] * inv);
+                v |= ((uint32_t) (uint8_t) (int8_t) (int) fminf(127.f, fmaxf(-127.f, x))) << (8 * e);
+            }
+            *(uint32_t *) (out + n1_off(row, k0 + 4 * i, S)) = v;
+        }
+    }
+}
+
+template <int R>
+__device__ __forceinline__ void w8b_rot_act(const char * __restrict__ src, size_t nb1, int t, int N, int b, const int lane, float (&reg)[R]) {
+    constexpr int RB = 32 * R;
+    const int k0 = b * RB + lane * R;
+    if (t < N) {
+        const float4 * p = (const float4 *) (src + (size_t) t * nb1) + (size_t) k0 / 4;
+#pragma unroll
+        for (int i = 0; i < R / 4; ++i) {
+            const float4 v = p[i];
+            const int k = k0 + 4 * i;
+            reg[4 * i] = v.x * w8_sgn(k); reg[4 * i + 1] = v.y * w8_sgn(k + 1); reg[4 * i + 2] = v.z * w8_sgn(k + 2); reg[4 * i + 3] = v.w * w8_sgn(k + 3);
+        }
+        w8_fwhtb<R>(reg, lane);
+    } else {
+#pragma unroll
+        for (int j = 0; j < R; ++j) reg[j] = 0.f;
+    }
+}
+
+// one CTA (min(K / rb, 32) warps) per token; a warp takes every nw-th rb-block; two passes (amax, then quantise) so any number of blocks fits
+template <int R>
+__global__ void k_w8b_quant_act(const char * __restrict__ src, size_t nb1, int N, int K, int8_t * __restrict__ X, float * __restrict__ sx) {
+    constexpr int RB = 32 * R;
+    const int t = blockIdx.x, S = K / 128, nb = K / RB;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    float amax = 0.f;
+    for (int b = warp; b < nb; b += nw) {
+        float reg[R];
+        w8b_rot_act<R>(src, nb1, t, N, b, lane, reg);
+#pragma unroll
+        for (int j = 0; j < R; ++j) amax = fmaxf(amax, fabsf(reg[j]));
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor(amax, o, 32));
+    __shared__ float red[32];
+    if (lane == 0) red[warp] = amax;
+    __syncthreads();
+    amax = 0.f;
+    for (int i = 0; i < nw; ++i) amax = fmaxf(amax, red[i]);
+    const float d = n1_scale(amax);
+    if (threadIdx.x == 0) sx[t] = d;
+    for (int b = warp; b < nb; b += nw) {
+        float reg[R];
+        w8b_rot_act<R>(src, nb1, t, N, b, lane, reg);
+        const int k0 = b * RB + lane * R;
+#pragma unroll
+        for (int i = 0; i < R / 4; ++i) {
+            const uint32_t p = (t < N && d > 0.f) ? n1_quant4(make_float4(reg[4 * i], reg[4 * i + 1], reg[4 * i + 2], reg[4 * i + 3]), d) : 0u;
+            *(uint32_t *) (X + n1_off(t, k0 + 4 * i, S)) = p;
+        }
+    }
+}
+
+// rotation block for a K (0 = no rotation): the largest of 1024 / 512 / 256 / 128 dividing K (1024 only up to 32 blocks, its kernel keeps one block per warp)
+int w8_rot_block(int K) {
+    for (int rb = 1024; rb >= 128; rb /= 2) {
+        if (K % rb == 0 && (rb != 1024 || K / rb <= 32)) return rb;
+    }
+    return 0;
+}
+
+void launch_w8_rot_quant(const char * src, size_t nb1, int N, int nq, int K, int rb, int8_t * X, float * sx, hipStream_t st) {
+    const int thr = 32 * (K / rb < 32 ? K / rb : 32);
+    switch (rb) {
+        case 1024: k_w8_rot_quant_act<<<nq, thr, 0, st>>>(src, nb1, N, K, X, sx); break;
+        case 512:  k_w8b_quant_act<16><<<nq, thr, 0, st>>>(src, nb1, N, K, X, sx); break;
+        case 256:  k_w8b_quant_act<8><<<nq, thr, 0, st>>>(src, nb1, N, K, X, sx); break;
+        default:   k_w8b_quant_act<4><<<nq, thr, 0, st>>>(src, nb1, N, K, X, sx); break;
+    }
+}
+
+// rb = rotation block (0 = none)
+void w8_requant(const ggml_tensor * src0, void * wout, float * rs, hipStream_t st, int rb = 0) {
     const int F = (int) src0->ne[1], K = (int) src0->ne[0];
-    if (rot) {
-        const int thr = 32 * (K / 1024 < 8 ? K / 1024 : 8);
-        k_w8_rot_rowscale<<<F, thr, 0, st>>>((const char *) src0->data, src0->nb[1], K, rs);
-        k_w8_rot_pack<<<F, thr, 0, st>>>((const char *) src0->data, src0->nb[1], K, rs, (uint4 *) wout);
+    if (rb) {
+        const int thr = 32 * (K / rb < 8 ? K / rb : 8);
+        const char * d = (const char *) src0->data;
+        const size_t nb1 = src0->nb[1];
+        switch (rb) {
+            case 1024:
+                k_w8_rot_rowscale<<<F, thr, 0, st>>>(d, nb1, K, rs);
+                k_w8_rot_pack<<<F, thr, 0, st>>>(d, nb1, K, rs, (uint4 *) wout);
+                break;
+            case 512:
+                k_w8b_rowscale<16><<<F, thr, 0, st>>>(d, nb1, K, rs);
+                k_w8b_pack<16><<<F, thr, 0, st>>>(d, nb1, K, rs, (char *) wout);
+                break;
+            case 256:
+                k_w8b_rowscale<8><<<F, thr, 0, st>>>(d, nb1, K, rs);
+                k_w8b_pack<8><<<F, thr, 0, st>>>(d, nb1, K, rs, (char *) wout);
+                break;
+            default:
+                k_w8b_rowscale<4><<<F, thr, 0, st>>>(d, nb1, K, rs);
+                k_w8b_pack<4><<<F, thr, 0, st>>>(d, nb1, K, rs, (char *) wout);
+                break;
+        }
         return;
     }
     k_w8_rowscale<<<F, 256, 0, st>>>((const char *) src0->data, src0->nb[1], K, rs);
@@ -1134,7 +1318,7 @@ void w8_requant(const ggml_tensor * src0, void * wout, float * rs, hipStream_t s
 }
 
 // resident per-channel copy if the budget and VRAM allow (built once on the conversion stream), else nullptr (caller requantises per call)
-const w8_w * w8_cached(const ggml_tensor * src0, bool rot) {
+const w8_w * w8_cached(const ggml_tensor * src0, int rot) {
     std::lock_guard<std::mutex> lk(g_mtx);
     auto it = g_w8.find(src0->data);
     if (it != g_w8.end()) return &it->second;
@@ -1172,7 +1356,7 @@ bool w8_eligible(const ggml_tensor * t) {
 
 // Converts the Q8_0 tensor in place to [tiled int8 stream F*K][fp32 row scales F] (never larger than the Q8_0 bytes, K >= 64):
 // requant into a scratch buffer on the compute stream, copy back over the Q8_0 blocks. The Q8_0 data is gone afterwards.
-void w8_inplace_get(const ggml_tensor * src0, hipStream_t st, bool rot, const void ** W, const float ** RS) {
+void w8_inplace_get(const ggml_tensor * src0, hipStream_t st, int rot, const void ** W, const float ** RS) {
     const size_t F = (size_t) src0->ne[1], K = (size_t) src0->ne[0], nbytes = F * K + F * sizeof(float);
     std::lock_guard<std::mutex> lk(g_mtx);
     auto it = g_w8_inpl.find(src0->data);
@@ -1191,7 +1375,7 @@ void w8_inplace_get(const ggml_tensor * src0, hipStream_t st, bool rot, const vo
         g_w8_inpl[src0->data] = rot;
         g_stats.w8_conv++;
     } else if (it->second != rot) {
-        GGML_ABORT("W8 in-place: %s was converted %s the rotation but this MUL_MAT wants %s", src0->name, it->second ? "with" : "without", rot ? "it" : "none");
+        GGML_ABORT("W8 in-place: %s was converted with rotation block %d but this MUL_MAT wants %d (does the same weight see both a rotation-folded and a plain activation?)", src0->name, it->second, rot);
     }
     *W = src0->data; *RS = (const float *) ((const char *) src0->data + F * K);
 }
@@ -1344,7 +1528,7 @@ bool n1_w8_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, co
     ggml_cuda_pool_alloc<int8_t> tw(ctx.pool());
     ggml_cuda_pool_alloc<float>  trs(ctx.pool());
     // rotation (GGML_N1_W8_ROT): not for activations that are already a Hadamard FWHT output (rotation-folded models)
-    const bool rot = env().w8_rot && K % 1024 == 0 && !n1_hada_act(src1);
+    const int rot = env().w8_rot && !n1_hada_act(src1) ? w8_rot_block(K) : 0;   // rotation block of this weight (0 = none)
     if (inpl) {
         w8_inplace_get(src0, st, rot, &Wp, &RSp);
     } else if (const w8_w * c = w8_cached(src0, rot)) {
@@ -1380,7 +1564,7 @@ bool n1_w8_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, co
     const bool gemv = N <= env().w8_gemv_max;
     const int  nq   = gemv ? N : Npad;
     if (!act_hit) {
-        if (rot) k_w8_rot_quant_act<<<nq, 32 * (K / 1024), 0, st>>>((const char *) src1->data, src1->nb[1], N, K, X, sx);
+        if (rot) launch_w8_rot_quant((const char *) src1->data, src1->nb[1], N, nq, K, rot, X, sx, st);
         else     k_n1_quant_act<<<dim3(1, nq), 256, 0, st>>>((const char *) src1->data, src1->nb[1], N, K, K, Npad, X, sx);
     }
     if (gemv) {
